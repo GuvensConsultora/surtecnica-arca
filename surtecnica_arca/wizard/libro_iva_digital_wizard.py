@@ -48,13 +48,16 @@ class LibroIvaDigitalWizard(models.TransientModel):
 
     # Mapeo alícuota IVA por monto del tax → código AFIP
     # Por qué: Fallback si l10n_ar_vat_afip_code no está disponible en tax.group
+    # Los códigos son single-digit porque así los almacena l10n_ar en Odoo 17
+    # El zero-padding a 4 dígitos (0005) se hace al formatear la línea con _fmt_num
     IVA_AMOUNT_MAP = {
-        0: '0003', 2.5: '0009', 5: '0008',
-        10.5: '0004', 21: '0005', 27: '0006',
+        0: '3', 2.5: '9', 5: '8',
+        10.5: '4', 21: '5', 27: '6',
     }
 
     # Códigos AFIP que son alícuotas de IVA gravado (van al archivo de alícuotas)
-    IVA_GRAVADO_CODES = ('0003', '0004', '0005', '0006', '0008', '0009')
+    # Por qué: l10n_ar_vat_afip_code en Odoo 17 usa códigos sin zero-pad ('5', no '0005')
+    IVA_GRAVADO_CODES = ('3', '4', '5', '6', '8', '9')
 
     # Códigos moneda AFIP - fallback si no existe l10n_ar_afip_code en currency
     MONEDA_MAP = {
@@ -91,7 +94,9 @@ class LibroIvaDigitalWizard(models.TransientModel):
             'compras_cbte_name': 'LIBRO_IVA_DIGITAL_COMPRAS_CBTE.txt',
             'compras_alic_file': self._encode_lines(c_alic),
             'compras_alic_name': 'LIBRO_IVA_DIGITAL_COMPRAS_ALICUOTAS.txt',
-            'resumen': self._generar_resumen(ventas, compras, v_cbte, c_cbte),
+            'resumen': self._generar_resumen(
+                ventas, compras, v_cbte, c_cbte, v_alic, c_alic
+            ),
         }
         self.write(vals)
 
@@ -238,7 +243,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
                     iva_by_code[vat_code] = {'code': vat_code, 'base': 0.0, 'amount': 0.0}
                 iva_by_code[vat_code]['base'] += abs(line.tax_base_amount) * sign
                 iva_by_code[vat_code]['amount'] += abs(line.balance) * sign
-            elif vat_code in ('0001', '0002'):
+            elif vat_code in ('1', '2'):
                 # No gravado / exento ya computados en paso 1
                 pass
             else:
@@ -257,9 +262,9 @@ class LibroIvaDigitalWizard(models.TransientModel):
         """
         for tax in line.tax_ids:
             code = self._get_vat_afip_code(tax)
-            if code == '0002':
+            if code == '2':
                 return 'exento'
-            elif code == '0001':
+            elif code == '1':
                 return 'no_gravado'
             elif code in self.IVA_GRAVADO_CODES:
                 return 'gravado'
@@ -592,7 +597,8 @@ class LibroIvaDigitalWizard(models.TransientModel):
         content = '\r\n'.join(lines)
         return base64.b64encode(content.encode('latin-1', errors='replace'))
 
-    def _generar_resumen(self, ventas, compras, v_lines, c_lines):
+    def _generar_resumen(self, ventas, compras, v_lines, c_lines,
+                         v_alic=None, c_alic=None):
         """Genera texto de resumen para mostrar en el wizard."""
         return (
             f'Período: {self.date_from.strftime("%d/%m/%Y")} - '
@@ -601,8 +607,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
             f'CUIT: {self.env.company.vat or "Sin configurar"}\n\n'
             f'VENTAS:\n'
             f'  Comprobantes: {len(ventas)}\n'
-            f'  Líneas cabecera: {len(v_lines)}\n\n'
+            f'  Líneas cabecera: {len(v_lines)}\n'
+            f'  Líneas alícuotas: {len(v_alic or [])}\n\n'
             f'COMPRAS:\n'
             f'  Comprobantes: {len(compras)}\n'
-            f'  Líneas cabecera: {len(c_lines)}'
+            f'  Líneas cabecera: {len(c_lines)}\n'
+            f'  Líneas alícuotas: {len(c_alic or [])}'
         )
