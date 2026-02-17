@@ -256,6 +256,47 @@ Permite cruzar el CSV de errores de validación de ARCA con los comprobantes gen
 
 Esto evita tener que contar líneas manualmente en los archivos TXT para encontrar qué factura tiene el error.
 
+## Carga en el portal ARCA — Paso obligatorio: Apertura de otros conceptos
+
+Después de importar los 4 archivos TXT en el portal de ARCA, el sistema valida los datos y muestra los totales en las secciones "Libro IVA Ventas", "Libro IVA Compras" e "Información Consolidada". Sin embargo, **ARCA no transfiere automáticamente estos totales a la DDJJ**. Requiere un paso manual adicional.
+
+### Síntoma
+
+Al intentar finalizar la registración, ARCA muestra:
+
+```
+Debe ingresar importes en la Apertura de otros conceptos - Operaciones que generan Crédito Fiscal
+Debe ingresar importes en la Apertura de otros conceptos - Operaciones que generan Restitución de Crédito Fiscal
+Debe ingresar importes en la Apertura de otros conceptos - Operaciones que generan Débito Fiscal
+Debe ingresar importes en la Apertura de otros conceptos - Operaciones que generan Restitución de Débito Fiscal
+```
+
+Y en "Datos para la Declaración Jurada" el **Total del Crédito Fiscal muestra 0,00** aunque los datos están correctamente cargados en el Libro IVA Compras.
+
+### Causa
+
+El formulario F.2002 tiene una sección **"Apertura de otros conceptos"** donde se debe confirmar la clasificación de los comprobantes en 4 categorías. Hasta que no se complete, ARCA no calcula los totales finales de la DDJJ.
+
+### Qué ingresar en cada categoría
+
+Los importes se obtienen del reporte DDJJ IVA del wizard (pestaña "DDJJ IVA") o del Excel/PDF incluido en el ZIP:
+
+| Categoría en ARCA | Origen de datos | Campos a completar |
+|---|---|---|
+| Operaciones que generan **Débito Fiscal** | Comprobantes emitidos (facturas de venta) | Neto Gravado, Exento/No Gravado, Débito Fiscal |
+| Restitución de **Débito Fiscal** | NC de venta | Neto Gravado, Exento/No Gravado, Débito Fiscal (negativos) |
+| Operaciones que generan **Crédito Fiscal** | Comprobantes recibidos (facturas de compra) | Neto Gravado, Exento/No Gravado, Crédito Fiscal |
+| Restitución de **Crédito Fiscal** | NC de compra | Neto Gravado, Exento/No Gravado, Crédito Fiscal (negativos) |
+
+### Flujo completo en el portal
+
+1. Importar los 4 archivos TXT en ARCA
+2. Verificar que no haya errores de validación (usar pestaña "Errores ARCA" del wizard si los hay)
+3. Ir a la sección **"Apertura de otros conceptos"** del F.2002
+4. Ingresar los importes de las 4 categorías usando los datos del reporte
+5. ARCA recalcula los totales → el Crédito Fiscal y Débito Fiscal se completan
+6. Finalizar la registración
+
 ## Bugs corregidos
 
 ### Percepciones clasificadas como IVA gravado (v1.1.0)
