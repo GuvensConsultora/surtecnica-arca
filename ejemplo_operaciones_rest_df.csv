@@ -1,0 +1,5 @@
+"Actividad";"Tipo de Operacion";"Tipo de sujeto comprador";"Codigo de Alicuota";"Monto Neto Gravado";"Debito Fiscal a Restituir";"Monto Neto Exento o No Gravado"
+241009;1;1;5;100;21
+241009;1;2;5;200;42
+241009;1;3;5;300;63
+241009;2;;;;;1234,56

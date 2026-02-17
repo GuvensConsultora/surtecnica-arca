@@ -1929,18 +1929,41 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 'IVA_SIMPLE_REST_CREDITO_FISCAL.csv',
         }
 
+    # Headers CSV IVA Simple — formato ARCA F.2051
+    # Por qué: ARCA exige fila de encabezado con nombres entre comillas dobles
+    _CSV_HEADER_DEBITO = (
+        '"Actividad";"Tipo de Operacion";"Tipo de sujeto comprador";'
+        '"Codigo de Alicuota";"Monto Neto Gravado";'
+        '"Debito Fiscal Facturado";"Debito Fiscal O.D.P.";'
+        '"Monto Neto Exento o No Gravado"'
+    )
+    _CSV_HEADER_REST_DEBITO = (
+        '"Actividad";"Tipo de Operacion";"Tipo de sujeto comprador";'
+        '"Codigo de Alicuota";"Monto Neto Gravado";'
+        '"Debito Fiscal a Restituir";'
+        '"Monto Neto Exento o No Gravado"'
+    )
+    _CSV_HEADER_CREDITO = (
+        '"Concepto";"Codigo de Alicuota";"Monto Neto Gravado";'
+        '"Credito Fiscal Facturado";"Credito Fiscal Computable"'
+    )
+    _CSV_HEADER_REST_CREDITO = (
+        '"Concepto";"Codigo de Alicuota";"Monto Neto Gravado";'
+        '"Credito Fiscal Facturado"'
+    )
+
     def _csv_debito_fiscal(self, moves, extracted):
         """CSV 1: Débito fiscal — facturas + ND de venta.
 
         Por qué: Agrupa por (actividad, tipo_sujeto, alícuota).
+        8 columnas según modelo ARCA. Alícuota = código AFIP (no tasa).
         tipo_op 1 = gravado, tipo_op 3 = exento/no gravado.
-        Formato línea gravado (7 campos):
-            actividad;1;tipo_sujeto;alicuota;neto;debito;dacion
-        Formato línea exento (7 campos):
-            actividad;3;;;;;monto_exento_no_gravado
+        Gravado (7 valores, col 8 vacía):
+            act;1;sujeto;code_afip;neto;debito;0
+        Exento (8 valores, cols 3-7 vacías):
+            act;3;;;;;;;monto
         """
         act = self.actividad_afip or '465320'
-        # {(act, tipo_op, sujeto, code): {'neto': 0, 'iva': 0}}
         acum = {}
         exento_ng = 0.0
 
@@ -1961,31 +1984,32 @@ class LibroIvaDigitalWizard(models.TransientModel):
             if abs(monto_exng) > 0.005:
                 exento_ng += monto_exng
 
-        # Generar líneas CSV
-        lines = []
+        # Generar líneas CSV con header
+        lines = [self._CSV_HEADER_DEBITO]
         fmt = self._fmt_csv_amount
         for key in sorted(acum.keys()):
             vals = acum[key]
             _, tipo_op, sujeto, code = key
-            rate = self.IVA_CODE_RATE.get(code, 0)
+            # Por qué: ARCA espera código AFIP de alícuota (5=21%), no la tasa
             lines.append(
-                f'{key[0]};{tipo_op};{sujeto};{fmt(rate)};'
+                f'{key[0]};{tipo_op};{sujeto};{code};'
                 f'{fmt(vals["neto"])};{fmt(vals["iva"])};0'
             )
 
-        # Exento/no gravado: tipo_op 3, campos 3-6 vacíos
+        # Exento/no gravado: tipo_op 3, cols 3-7 vacías, monto en col 8
         if abs(exento_ng) > 0.005:
-            lines.append(f'{act};3;;;;;{fmt(exento_ng)}')
+            lines.append(f'{act};3;;;;;;{fmt(exento_ng)}')
 
-        return self._encode_lines(lines) if lines else False
+        # Solo header = sin datos
+        return self._encode_lines(lines) if len(lines) > 1 else False
 
     def _csv_rest_debito_fiscal(self, moves, extracted):
         """CSV 2: Restitución débito fiscal — NC de venta.
 
-        Por qué: Mismo esquema que CSV 1 pero sin campo dación (6 campos)
-        y tipo_op 2 para exento/NG. Importes en valor absoluto.
-        Formato gravado: actividad;1;tipo_sujeto;alicuota;neto;debito
-        Formato exento:  actividad;2;;;;monto
+        Por qué: Mismo esquema que CSV 1 pero sin campo O.D.P. (7 cols).
+        tipo_op 3 para exento/NG. Importes en valor absoluto.
+        Gravado: act;1;sujeto;code_afip;neto;debito
+        Exento:  act;3;;;;;monto
         """
         act = self.actividad_afip or '465320'
         acum = {}
@@ -2007,33 +2031,31 @@ class LibroIvaDigitalWizard(models.TransientModel):
             if monto_exng > 0.005:
                 exento_ng += monto_exng
 
-        lines = []
+        lines = [self._CSV_HEADER_REST_DEBITO]
         fmt = self._fmt_csv_amount
         for key in sorted(acum.keys()):
             vals = acum[key]
             _, tipo_op, sujeto, code = key
-            rate = self.IVA_CODE_RATE.get(code, 0)
             lines.append(
-                f'{key[0]};{tipo_op};{sujeto};{fmt(rate)};'
+                f'{key[0]};{tipo_op};{sujeto};{code};'
                 f'{fmt(vals["neto"])};{fmt(vals["iva"])}'
             )
 
-        # Exento/no gravado: tipo_op 2, campos 3-5 vacíos
+        # Exento/no gravado: tipo_op 2, cols 3-6 vacías, monto en col 7
+        # Por qué: En restitución, ARCA usa tipo_op 2 para exento/NG (no 3)
         if abs(exento_ng) > 0.005:
-            lines.append(f'{act};2;;;;{fmt(exento_ng)}')
+            lines.append(f'{act};2;;;;;{fmt(exento_ng)}')
 
-        return self._encode_lines(lines) if lines else False
+        return self._encode_lines(lines) if len(lines) > 1 else False
 
-    def _csv_credito_fiscal(self, moves, extracted):
+    def _csv_credito_fiscal(self, moves, _extracted):
         """CSV 3: Crédito fiscal — facturas + ND de compra.
 
         Por qué: Agrupa por (concepto, alícuota). concepto = tipo de bien:
-        1=bienes, 3=servicios. Desglosa por concepto dentro de cada move
-        iterando invoice_line_ids.
-        Formato (5 campos):
-            concepto;alicuota;neto;credito_facturado;credito_computable
+        1=bienes, 3=servicios. Alícuota = código AFIP.
+        Formato (5 cols):
+            concepto;code_afip;neto;credito_facturado;credito_computable
         """
-        # {(concepto, code): {'neto': 0, 'iva': 0}}
         acum = {}
 
         for move in moves:
@@ -2044,26 +2066,25 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 acum[key]['neto'] += vals['base']
                 acum[key]['iva'] += vals['amount']
 
-        lines = []
+        lines = [self._CSV_HEADER_CREDITO]
         fmt = self._fmt_csv_amount
         for key in sorted(acum.keys()):
             concepto, code = key
             vals = acum[key]
-            rate = self.IVA_CODE_RATE.get(code, 0)
             # credito_computable = credito_facturado (sin prorrateo)
             lines.append(
-                f'{concepto};{fmt(rate)};{fmt(vals["neto"])};'
+                f'{concepto};{code};{fmt(vals["neto"])};'
                 f'{fmt(vals["iva"])};{fmt(vals["iva"])}'
             )
 
-        return self._encode_lines(lines) if lines else False
+        return self._encode_lines(lines) if len(lines) > 1 else False
 
-    def _csv_rest_credito_fiscal(self, moves, extracted):
+    def _csv_rest_credito_fiscal(self, moves, _extracted):
         """CSV 4: Restitución crédito fiscal — NC de compra.
 
-        Por qué: Igual que CSV 3 pero sin campo credito_computable (4 campos).
+        Por qué: Igual que CSV 3 pero sin campo credito_computable (4 cols).
         Importes en valor absoluto (NC tienen signo negativo en extracted).
-        Formato: concepto;alicuota;neto;credito_facturado
+        Formato: concepto;code_afip;neto;credito_facturado
         """
         acum = {}
 
@@ -2076,18 +2097,16 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 acum[key]['neto'] += abs(vals['base'])
                 acum[key]['iva'] += abs(vals['amount'])
 
-        lines = []
+        lines = [self._CSV_HEADER_REST_CREDITO]
         fmt = self._fmt_csv_amount
         for key in sorted(acum.keys()):
             concepto, code = key
             vals = acum[key]
-            rate = self.IVA_CODE_RATE.get(code, 0)
             lines.append(
-                f'{concepto};{fmt(rate)};{fmt(vals["neto"])};'
-                f'{fmt(vals["iva"])}'
+                f'{concepto};{code};{fmt(vals["neto"])};{fmt(vals["iva"])}'
             )
 
-        return self._encode_lines(lines) if lines else False
+        return self._encode_lines(lines) if len(lines) > 1 else False
 
     # -------------------------------------------------------------------------
     # UTILIDADES

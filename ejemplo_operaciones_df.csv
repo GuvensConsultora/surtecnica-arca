@@ -1,0 +1,7 @@
+"Actividad";"Tipo de Operacion";"Tipo de sujeto comprador";"Codigo de Alicuota";"Monto Neto Gravado";"Debito Fiscal Facturado";"Debito Fiscal O.D.P.";"Monto Neto Exento o No Gravado"
+241009;1;1;5;100;21;21
+241009;1;2;5;200;42;42
+241009;1;3;5;300;63;63
+241009;2;1;5;50;10,5;10,5
+241009;2;2;5;150;31,5;31,5
+241009;3;;;;;;1234,56
