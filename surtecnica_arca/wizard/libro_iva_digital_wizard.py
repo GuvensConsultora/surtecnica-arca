@@ -513,19 +513,22 @@ class LibroIvaDigitalWizard(models.TransientModel):
         for move in moves:
             try:
                 data = extracted_data[move.id] if extracted_data else self._extract_move_data(move)
+                # TXT: importes en moneda de factura (ARCA multiplica × TC)
+                # data queda en ARS para DDJJ/CSV; txt_data en moneda factura
+                txt_data = self._to_invoice_currency(data, move)
                 partner = move.commercial_partner_id
                 # Línea cabecera: nro 1-based
                 cbte_num = len(cbte_lines) + 1
 
                 if tipo == 'ventas':
-                    cbte_lines.append(self._fmt_ventas_cbte(move, data))
+                    cbte_lines.append(self._fmt_ventas_cbte(move, txt_data))
                     fmt_alic = self._fmt_ventas_alic
                 else:
-                    cbte_lines.append(self._fmt_compras_cbte(move, data))
+                    cbte_lines.append(self._fmt_compras_cbte(move, txt_data))
                     fmt_alic = self._fmt_compras_alic
 
                 # Alícuotas: línea TXT + mapa con detalle para diagnóstico
-                for alic in data['iva_alicuotas']:
+                for alic in txt_data['iva_alicuotas']:
                     alic_num = len(alic_lines) + 1
                     alic_lines.append(fmt_alic(move, alic))
                     alic_map[str(alic_num)] = {
@@ -610,16 +613,18 @@ class LibroIvaDigitalWizard(models.TransientModel):
         }
 
         # Paso 1: Clasificar líneas de producto → no_gravado / exento
-        # Por qué: En Odoo 17 display_type='product' para líneas de factura
-        # (no False). Filtrar por exclusión de sección/nota.
+        # Por qué: Usar abs(line.balance) (moneda empresa ARS) en vez de
+        # price_subtotal (moneda factura). Para facturas en moneda extranjera
+        # price_subtotal está en USD/EUR, causando importes mixtos.
+        # balance siempre está en ARS = moneda de la empresa.
         for line in move.invoice_line_ids.filtered(
             lambda l: l.display_type not in ('line_section', 'line_note')
         ):
             line_class = self._classify_line_iva(line)
             if line_class == 'no_gravado':
-                result['no_gravado'] += line.price_subtotal * sign
+                result['no_gravado'] += abs(line.balance) * sign
             elif line_class == 'exento':
-                result['exento'] += line.price_subtotal * sign
+                result['exento'] += abs(line.balance) * sign
 
         # Paso 2: IVA gravado desde tax lines → alícuotas
         iva_by_code = {}
@@ -958,6 +963,54 @@ class LibroIvaDigitalWizard(models.TransientModel):
                     move.invoice_date or fields.Date.today()
                 )
         return code, rate or 1.0
+
+    def _to_invoice_currency(self, data, move):
+        """Convierte importes extraídos (ARS) a moneda de factura para TXT.
+
+        Por qué: El Libro IVA Digital espera importes en moneda de factura.
+        ARCA multiplica importe × tipo_cambio para obtener ARS.
+        Si escribimos ARS y el TC es 1650, ARCA computa ARS × 1650 → error.
+        Para facturas en ARS (rate=1): no-op, retorna data sin modificar.
+        """
+        if move.currency_id == move.company_currency_id:
+            return data
+        _, rate = self._get_currency_info(move)
+        if rate <= 1.001:
+            return data
+
+        # Copiar para no modificar el original (usado en DDJJ y CSV en ARS)
+        conv = dict(data)
+        for field in ('total', 'no_gravado', 'exento', 'perc_no_categ',
+                      'perc_iva', 'perc_nacionales', 'perc_iibb',
+                      'perc_mun', 'imp_internos', 'otros_tributos'):
+            conv[field] = round(data[field] / rate, 2)
+
+        # Alícuotas: convertir base y recalcular IVA para consistencia ARCA
+        conv['iva_alicuotas'] = []
+        for a in data['iva_alicuotas']:
+            base_conv = round(a['base'] / rate, 2)
+            iva_rate = self.IVA_CODE_RATE.get(a['code'], 0)
+            # Recalcular IVA = base × tasa para que ARCA valide OK
+            amount_conv = round(base_conv * iva_rate / 100, 2) if iva_rate > 0 \
+                else round(a['amount'] / rate, 2)
+            conv['iva_alicuotas'].append({
+                'code': a['code'],
+                'base': base_conv,
+                'amount': amount_conv,
+            })
+
+        # Recalcular total desde partes (evita drift de redondeo)
+        gravado = sum(a['base'] for a in conv['iva_alicuotas'])
+        iva = sum(a['amount'] for a in conv['iva_alicuotas'])
+        conv['total'] = round(
+            gravado + iva
+            + conv['no_gravado'] + conv['exento']
+            + conv['perc_no_categ'] + conv['perc_iva']
+            + conv['perc_nacionales'] + conv['perc_iibb']
+            + conv['perc_mun'] + conv['imp_internos']
+            + conv['otros_tributos'],
+        2)
+        return conv
 
     def _get_operation_code(self, data):
         """Determina el código de operación AFIP.
@@ -1888,7 +1941,8 @@ class LibroIvaDigitalWizard(models.TransientModel):
                     key = (concepto, code)
                     if key not in result:
                         result[key] = {'base': 0.0, 'amount': 0.0}
-                    result[key]['base'] += line.price_subtotal * sign
+                    # abs(balance) = moneda empresa (ARS), no price_subtotal
+                    result[key]['base'] += abs(line.balance) * sign
                     break  # Una línea tiene una sola alícuota IVA
 
         # Recalcular IVA = base × tasa para consistencia con ARCA
