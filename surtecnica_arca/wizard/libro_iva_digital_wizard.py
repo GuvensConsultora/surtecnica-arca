@@ -1984,26 +1984,27 @@ class LibroIvaDigitalWizard(models.TransientModel):
         }
 
     # Headers CSV IVA Simple — formato ARCA F.2051
-    # Por qué: ARCA exige fila de encabezado con nombres entre comillas dobles
+    # Por qué: ARCA espera headers SIN comillas. Con comillas ARCA no los
+    # reconoce como cabecera y los parsea como datos → "Alícuota inválida".
     _CSV_HEADER_DEBITO = (
-        '"Actividad";"Tipo de Operacion";"Tipo de sujeto comprador";'
-        '"Codigo de Alicuota";"Monto Neto Gravado";'
-        '"Debito Fiscal Facturado";"Debito Fiscal O.D.P.";'
-        '"Monto Neto Exento o No Gravado"'
+        'Actividad;Tipo de Operacion;Tipo de sujeto comprador;'
+        'Codigo de Alicuota;Monto Neto Gravado;'
+        'Debito Fiscal Facturado;Debito Fiscal O.D.P.;'
+        'Monto Neto Exento o No Gravado'
     )
     _CSV_HEADER_REST_DEBITO = (
-        '"Actividad";"Tipo de Operacion";"Tipo de sujeto comprador";'
-        '"Codigo de Alicuota";"Monto Neto Gravado";'
-        '"Debito Fiscal a Restituir";'
-        '"Monto Neto Exento o No Gravado"'
+        'Actividad;Tipo de Operacion;Tipo de sujeto comprador;'
+        'Codigo de Alicuota;Monto Neto Gravado;'
+        'Debito Fiscal a Restituir;'
+        'Monto Neto Exento o No Gravado'
     )
     _CSV_HEADER_CREDITO = (
-        '"Concepto";"Codigo de Alicuota";"Monto Neto Gravado";'
-        '"Credito Fiscal Facturado";"Credito Fiscal Computable"'
+        'Concepto;Codigo de Alicuota;Monto Neto Gravado;'
+        'Credito Fiscal Facturado;Credito Fiscal Computable'
     )
     _CSV_HEADER_REST_CREDITO = (
-        '"Concepto";"Codigo de Alicuota";"Monto Neto Gravado";'
-        '"Credito Fiscal Facturado"'
+        'Concepto;Codigo de Alicuota;Monto Neto Gravado;'
+        'Credito Fiscal Facturado'
     )
 
     def _csv_debito_fiscal(self, moves, extracted):
