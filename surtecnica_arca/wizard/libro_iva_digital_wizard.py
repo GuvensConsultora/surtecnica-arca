@@ -68,10 +68,11 @@ class LibroIvaDigitalWizard(models.TransientModel):
         ('compras', 'Compras'),
         ('ventas', 'Ventas'),
     ], string='Archivo con error', default='compras')
-    errores_arca_csv = fields.Text(
-        string='Errores ARCA (CSV)',
-        help='Pegue aquí el contenido del CSV de errores de validación de ARCA',
+    # Por qué: Binary para subir el CSV directo desde disco, sin copiar/pegar
+    errores_arca_csv = fields.Binary(
+        string='Archivo CSV errores ARCA',
     )
+    errores_arca_csv_name = fields.Char(string='Nombre archivo CSV')
     errores_arca_html = fields.Html(
         string='Resultado', readonly=True, sanitize=False,
     )
@@ -230,10 +231,14 @@ class LibroIvaDigitalWizard(models.TransientModel):
         muestra nombre, proveedor, CUIT e importe con link al asiento.
         """
         self.ensure_one()
-        csv_text = self.errores_arca_csv
-        if not csv_text:
-            raise UserError(
-                'Pegue el contenido del CSV de errores de ARCA.')
+        if not self.errores_arca_csv:
+            raise UserError('Suba el archivo CSV de errores de ARCA.')
+        # Por qué: ARCA exporta CSV en latin-1; fallback a utf-8
+        raw = base64.b64decode(self.errores_arca_csv)
+        try:
+            csv_text = raw.decode('latin-1')
+        except Exception:
+            csv_text = raw.decode('utf-8', errors='replace')
 
         tipo = self.errores_arca_tipo or 'compras'
         line_map = json.loads(self.line_map_json or '{}')
@@ -982,12 +987,11 @@ class LibroIvaDigitalWizard(models.TransientModel):
         Args:
             extracted_data: dict {move_id: data} pre-calculado. Si es None,
                 extrae datos de cada move.
-        Por qué: El portal ARCA muestra totales agrupados por tipo de
-        comprobante (FA-A, FA-B, NC-A, etc.) y por alícuota de IVA.
+        Por qué: El portal ARCA separa la "Apertura de otros conceptos" en
+        secciones distintas para facturas (débito/crédito) y NC (restitución).
+        Se calculan totales separados para cada grupo.
         """
-        por_tipo = {}
-        alicuotas = {}
-        totales = {
+        _EMPTY_TOTALES = {
             'count': 0, 'gravado': 0.0, 'iva': 0.0,
             'no_gravado': 0.0, 'exento': 0.0, 'total': 0.0,
             'perc_iva': 0.0, 'perc_nacionales': 0.0,
@@ -995,11 +999,21 @@ class LibroIvaDigitalWizard(models.TransientModel):
             'imp_internos': 0.0, 'otros_tributos': 0.0,
             'perc_no_categ': 0.0,
         }
+        por_tipo = {}
+        alicuotas = {}
+        totales = dict(_EMPTY_TOTALES)
+        # Por qué: ARCA exige aperturas separadas para facturas y NC
+        # Facturas (+ ND) → Débito/Crédito Fiscal
+        # NC → Restitución del Débito/Crédito Fiscal
+        totales_fac = dict(_EMPTY_TOTALES)
+        totales_nc = dict(_EMPTY_TOTALES)
 
         for move in moves:
             data = extracted_data[move.id] if extracted_data else self._extract_move_data(move)
             doc_type = move.l10n_latam_document_type_id
             key = doc_type.id
+            # Por qué: out_refund/in_refund = NC → restitución en ARCA
+            es_nc = move.move_type in ('out_refund', 'in_refund')
 
             gravado = sum(a['base'] for a in data['iva_alicuotas'])
             iva = sum(a['amount'] for a in data['iva_alicuotas'])
@@ -1018,15 +1032,18 @@ class LibroIvaDigitalWizard(models.TransientModel):
             row['exento'] += data['exento']
             row['total'] += data['total']
 
-            # Acumular totales generales
-            for field in ('no_gravado', 'exento', 'perc_iva', 'perc_nacionales',
-                          'perc_iibb', 'perc_mun', 'imp_internos',
-                          'otros_tributos', 'perc_no_categ'):
-                totales[field] += data.get(field, 0.0)
-            totales['count'] += 1
-            totales['gravado'] += gravado
-            totales['iva'] += iva
-            totales['total'] += data['total']
+            # Acumular en totales generales + separados por tipo
+            target = totales_nc if es_nc else totales_fac
+            for bucket in (totales, target):
+                for field in ('no_gravado', 'exento', 'perc_iva',
+                              'perc_nacionales', 'perc_iibb', 'perc_mun',
+                              'imp_internos', 'otros_tributos',
+                              'perc_no_categ'):
+                    bucket[field] += data.get(field, 0.0)
+                bucket['count'] += 1
+                bucket['gravado'] += gravado
+                bucket['iva'] += iva
+                bucket['total'] += data['total']
 
             # Acumular por código de alícuota IVA
             for alic in data['iva_alicuotas']:
@@ -1040,6 +1057,8 @@ class LibroIvaDigitalWizard(models.TransientModel):
             'por_tipo': sorted(por_tipo.values(), key=lambda x: x['code']),
             'alicuotas': alicuotas,
             'totales': totales,
+            'totales_fac': totales_fac,  # facturas + ND
+            'totales_nc': totales_nc,     # notas de crédito
         }
 
     def _fmt_money(self, amount):
@@ -1274,58 +1293,130 @@ class LibroIvaDigitalWizard(models.TransientModel):
                  'identificar los comprobantes con problema.</p>')
         h.append('</div>')
 
-        # Paso 3: Apertura Ventas
-        v_apertura = [
-            ('Percepciones a no categorizados', vt.get('perc_no_categ', 0)),
+        # ---- Helper para renderizar tabla de apertura ----
+        def _render_apertura(items):
+            """Renderiza tabla campo/valor para una sección de apertura."""
+            lines = ['<table><tr><th>Campo en portal ARCA</th>'
+                     '<th>Valor a cargar</th></tr>']
+            for campo, valor in items:
+                css_cls = 'valor-llenar' if abs(valor) > 0.005 else 'valor-cero'
+                lines.append(f'<tr><td>{campo}</td>'
+                             f'<td class="{css_cls}">{fmt(valor)}</td></tr>')
+            lines.append('</table>')
+            return '\n'.join(lines)
+
+        # Por qué: ARCA exige aperturas separadas para facturas (débito/crédito)
+        # y NC (restitución). Si se mezclan, da error de validación.
+        vf = v_data['totales_fac']  # facturas/ND de venta
+        vnc = v_data['totales_nc']  # NC de venta
+        cf = c_data['totales_fac']  # facturas/ND de compra
+        cnc = c_data['totales_nc']  # NC de compra
+
+        # Paso 3: Apertura Ventas - Débito Fiscal (solo facturas + ND)
+        v_ap_fac = [
+            ('Percepciones a no categorizados', vf.get('perc_no_categ', 0)),
             ('Percepciones / Pagos a cta. Imp. Nacionales',
-             vt.get('perc_nacionales', 0)),
-            ('Percepcion de Ingresos Brutos', vt.get('perc_iibb', 0)),
-            ('Percepcion de Impuestos Municipales', vt.get('perc_mun', 0)),
-            ('Impuestos Internos', vt.get('imp_internos', 0)),
-            ('Otros Tributos', vt.get('otros_tributos', 0)),
+             vf.get('perc_nacionales', 0)),
+            ('Percepcion de Ingresos Brutos', vf.get('perc_iibb', 0)),
+            ('Percepcion de Impuestos Municipales', vf.get('perc_mun', 0)),
+            ('Impuestos Internos', vf.get('imp_internos', 0)),
+            ('Otros Tributos', vf.get('otros_tributos', 0)),
         ]
         h.append('<div class="step">')
         h.append('<div class="step-num">PASO 3 — Apertura de otros '
-                 'conceptos: VENTAS</div>')
-        h.append('<p>En <strong>"Comprobantes emitidos"</strong> &rarr; '
-                 'clic en <strong>"Apertura de otros conceptos"</strong>. '
-                 'Completar:</p>')
-        h.append('<table><tr><th>Campo en portal ARCA</th>'
-                 '<th>Valor a cargar</th></tr>')
-        for campo, valor in v_apertura:
-            css_cls = 'valor-llenar' if abs(valor) > 0.005 else 'valor-cero'
-            h.append(f'<tr><td>{campo}</td>'
-                     f'<td class="{css_cls}">{fmt(valor)}</td></tr>')
-        h.append('</table>')
+                 'conceptos: VENTAS (Debito Fiscal)</div>')
+        h.append('<p>En <strong>"Operaciones que generan Debito Fiscal"'
+                 '</strong> &rarr; clic en <strong>"Apertura de otros '
+                 'conceptos"</strong>. Cargar SOLO valores de facturas y '
+                 'notas de debito:</p>')
+        h.append(_render_apertura(v_ap_fac))
         h.append('</div>')
 
-        # Paso 4: Apertura Compras
-        c_apertura = [
-            ('Percepciones de IVA', ct.get('perc_iva', 0)),
+        # Paso 3b: Apertura Restitución Débito (solo NC de venta)
+        # Por qué: ARCA requiere apertura separada para NC de venta.
+        # Los importes son negativos porque son restituciones.
+        vnc_tiene_otros = any(abs(vnc.get(f, 0)) > 0.005 for f in (
+            'perc_no_categ', 'perc_nacionales', 'perc_iibb',
+            'perc_mun', 'imp_internos', 'otros_tributos'))
+        h.append('<div class="step">')
+        h.append('<div class="step-num">PASO 3b — Apertura de otros '
+                 'conceptos: RESTITUCION DEBITO FISCAL</div>')
+        h.append('<p>En <strong>"Operaciones que generan Restitucion del '
+                 'Debito Fiscal"</strong> &rarr; clic en <strong>"Apertura '
+                 'de otros conceptos"</strong>.</p>')
+        if vnc_tiene_otros:
+            v_ap_nc = [
+                ('Percepciones a no categorizados',
+                 vnc.get('perc_no_categ', 0)),
+                ('Percepciones / Pagos a cta. Imp. Nacionales',
+                 vnc.get('perc_nacionales', 0)),
+                ('Percepcion de Ingresos Brutos', vnc.get('perc_iibb', 0)),
+                ('Percepcion de Impuestos Municipales',
+                 vnc.get('perc_mun', 0)),
+                ('Impuestos Internos', vnc.get('imp_internos', 0)),
+                ('Otros Tributos', vnc.get('otros_tributos', 0)),
+            ]
+            h.append('<p>Cargar valores de notas de credito (negativos):</p>')
+            h.append(_render_apertura(v_ap_nc))
+        else:
+            h.append('<p>Las NC no tienen otros conceptos. Dejar todos los '
+                     'campos en <span class="valor-cero">0,00</span> y '
+                     'confirmar para que ARCA no devuelva error de '
+                     'validacion.</p>')
+        h.append('</div>')
+
+        # Paso 4: Apertura Compras - Crédito Fiscal (solo facturas + ND)
+        c_ap_fac = [
+            ('Percepciones de IVA', cf.get('perc_iva', 0)),
             ('Percepciones / Pagos a cta. Imp. Nacionales',
-             ct.get('perc_nacionales', 0)),
-            ('Percepcion de Ingresos Brutos', ct.get('perc_iibb', 0)),
-            ('Percepcion de Impuestos Municipales', ct.get('perc_mun', 0)),
-            ('Impuestos Internos', ct.get('imp_internos', 0)),
-            ('Otros Tributos', ct.get('otros_tributos', 0)),
+             cf.get('perc_nacionales', 0)),
+            ('Percepcion de Ingresos Brutos', cf.get('perc_iibb', 0)),
+            ('Percepcion de Impuestos Municipales', cf.get('perc_mun', 0)),
+            ('Impuestos Internos', cf.get('imp_internos', 0)),
+            ('Otros Tributos', cf.get('otros_tributos', 0)),
         ]
         h.append('<div class="step">')
         h.append('<div class="step-num">PASO 4 — Apertura de otros '
-                 'conceptos: COMPRAS</div>')
-        h.append('<p>En <strong>"Comprobantes recibidos"</strong> &rarr; '
-                 'clic en <strong>"Apertura de otros conceptos"</strong>. '
-                 'Completar:</p>')
-        h.append('<table><tr><th>Campo en portal ARCA</th>'
-                 '<th>Valor a cargar</th></tr>')
-        for campo, valor in c_apertura:
-            css_cls = 'valor-llenar' if abs(valor) > 0.005 else 'valor-cero'
-            h.append(f'<tr><td>{campo}</td>'
-                     f'<td class="{css_cls}">{fmt(valor)}</td></tr>')
-        h.append('</table>')
+                 'conceptos: COMPRAS (Credito Fiscal)</div>')
+        h.append('<p>En <strong>"Operaciones que generan Credito Fiscal"'
+                 '</strong> &rarr; clic en <strong>"Apertura de otros '
+                 'conceptos"</strong>. Cargar SOLO valores de facturas:</p>')
+        h.append(_render_apertura(c_ap_fac))
         h.append('<p class="importante">IMPORTANTE: Si no se completa este '
                  'paso, el Credito Fiscal aparecera en 0,00 en la '
                  'determinacion del impuesto.</p>')
         h.append('</div>')
+
+        # Paso 4b: Apertura Restitución Crédito (solo NC de compra)
+        cnc_tiene_otros = any(abs(cnc.get(f, 0)) > 0.005 for f in (
+            'perc_iva', 'perc_nacionales', 'perc_iibb',
+            'perc_mun', 'imp_internos', 'otros_tributos'))
+        if cnc.get('count', 0) > 0:
+            h.append('<div class="step">')
+            h.append('<div class="step-num">PASO 4b — Apertura de otros '
+                     'conceptos: RESTITUCION CREDITO FISCAL</div>')
+            h.append('<p>En <strong>"Credito Fiscal Computable a '
+                     'Restituir"</strong> &rarr; clic en <strong>"Apertura '
+                     'de otros conceptos"</strong>.</p>')
+            if cnc_tiene_otros:
+                c_ap_nc = [
+                    ('Percepciones de IVA', cnc.get('perc_iva', 0)),
+                    ('Percepciones / Pagos a cta. Imp. Nacionales',
+                     cnc.get('perc_nacionales', 0)),
+                    ('Percepcion de Ingresos Brutos',
+                     cnc.get('perc_iibb', 0)),
+                    ('Percepcion de Impuestos Municipales',
+                     cnc.get('perc_mun', 0)),
+                    ('Impuestos Internos', cnc.get('imp_internos', 0)),
+                    ('Otros Tributos', cnc.get('otros_tributos', 0)),
+                ]
+                h.append('<p>Cargar valores de NC de compra:</p>')
+                h.append(_render_apertura(c_ap_nc))
+            else:
+                h.append('<p>Las NC de compra no tienen otros conceptos. '
+                         'Dejar en <span class="valor-cero">0,00</span> y '
+                         'confirmar.</p>')
+            h.append('</div>')
 
         # Paso 5: Verificar determinación
         h.append('<div class="step">')
@@ -1696,64 +1787,133 @@ class LibroIvaDigitalWizard(models.TransientModel):
                  '"Errores ARCA" del wizard en Odoo.', wrap_fmt)
         row += 2
 
-        # ---- PASO 3: Apertura Ventas ----
+        # Helper para escribir tabla de apertura en Excel
+        def _write_apertura(ws, row, items, fmts, highlight_fmt):
+            ws.write(row, 0, 'Campo en portal ARCA', fmts['header'])
+            ws.write(row, 1, 'Valor a cargar', fmts['header'])
+            row += 1
+            for campo, valor in items:
+                ws.write(row, 0, campo, fmts['text'])
+                fmt_v = highlight_fmt if abs(valor) > 0.005 else fmts['money']
+                ws.write(row, 1, valor, fmt_v)
+                row += 1
+            return row
+
+        # Por qué: ARCA separa aperturas para facturas y NC
+        vf = v_data['totales_fac']
+        vnc = v_data['totales_nc']
+        cf = c_data['totales_fac']
+        cnc = c_data['totales_nc']
+
+        # ---- PASO 3: Apertura Ventas - Débito Fiscal ----
         ws.write(row, 0,
-                 'PASO 3 — Apertura de otros conceptos: VENTAS', step_fmt)
+                 'PASO 3 — Apertura otros conceptos: VENTAS '
+                 '(Debito Fiscal)', step_fmt)
         row += 1
         ws.write(row, 0,
-                 'En "Comprobantes emitidos" > clic "Apertura de otros '
-                 'conceptos". Completar:', wrap_fmt)
+                 'En "Operaciones que generan Debito Fiscal" > '
+                 '"Apertura de otros conceptos". Solo facturas y ND:',
+                 wrap_fmt)
         row += 1
-        ws.write(row, 0, 'Campo en portal ARCA', fmts['header'])
-        ws.write(row, 1, 'Valor a cargar', fmts['header'])
+        row = _write_apertura(ws, row, [
+            ('Percepciones a no categorizados', vf.get('perc_no_categ', 0)),
+            ('Percepciones / Pagos a cta. Imp. Nacionales',
+             vf.get('perc_nacionales', 0)),
+            ('Percepcion de Ingresos Brutos', vf.get('perc_iibb', 0)),
+            ('Percepcion de Impuestos Municipales', vf.get('perc_mun', 0)),
+            ('Impuestos Internos', vf.get('imp_internos', 0)),
+            ('Otros Tributos', vf.get('otros_tributos', 0)),
+        ], fmts, highlight_fmt)
         row += 1
 
-        v_apertura = [
-            ('Percepciones a no categorizados', vt.get('perc_no_categ', 0)),
-            ('Percepciones / Pagos a cta. Imp. Nacionales',
-             vt.get('perc_nacionales', 0)),
-            ('Percepcion de Ingresos Brutos', vt.get('perc_iibb', 0)),
-            ('Percepcion de Impuestos Municipales', vt.get('perc_mun', 0)),
-            ('Impuestos Internos', vt.get('imp_internos', 0)),
-            ('Otros Tributos', vt.get('otros_tributos', 0)),
-        ]
-        for campo, valor in v_apertura:
-            ws.write(row, 0, campo, fmts['text'])
-            fmt_val = highlight_fmt if abs(valor) > 0.005 else fmts['money']
-            ws.write(row, 1, valor, fmt_val)
+        # ---- PASO 3b: Apertura Restitución Débito ----
+        ws.write(row, 0,
+                 'PASO 3b — Apertura otros conceptos: RESTITUCION '
+                 'DEBITO FISCAL', step_fmt)
+        row += 1
+        vnc_tiene = any(abs(vnc.get(f, 0)) > 0.005 for f in (
+            'perc_no_categ', 'perc_nacionales', 'perc_iibb',
+            'perc_mun', 'imp_internos', 'otros_tributos'))
+        if vnc_tiene:
+            ws.write(row, 0,
+                     'En "Operaciones que generan Restitucion del Debito '
+                     'Fiscal" > "Apertura de otros conceptos". '
+                     'Valores de NC (negativos):', wrap_fmt)
+            row += 1
+            row = _write_apertura(ws, row, [
+                ('Percepciones a no categorizados',
+                 vnc.get('perc_no_categ', 0)),
+                ('Percepciones / Pagos a cta. Imp. Nacionales',
+                 vnc.get('perc_nacionales', 0)),
+                ('Percepcion de Ingresos Brutos', vnc.get('perc_iibb', 0)),
+                ('Percepcion de Impuestos Municipales',
+                 vnc.get('perc_mun', 0)),
+                ('Impuestos Internos', vnc.get('imp_internos', 0)),
+                ('Otros Tributos', vnc.get('otros_tributos', 0)),
+            ], fmts, highlight_fmt)
+        else:
+            ws.write(row, 0,
+                     'Las NC no tienen otros conceptos. Dejar en 0,00 y '
+                     'confirmar para evitar error de validacion.', wrap_fmt)
             row += 1
         row += 1
 
-        # ---- PASO 4: Apertura Compras ----
+        # ---- PASO 4: Apertura Compras - Crédito Fiscal ----
         ws.write(row, 0,
-                 'PASO 4 — Apertura de otros conceptos: COMPRAS', step_fmt)
+                 'PASO 4 — Apertura otros conceptos: COMPRAS '
+                 '(Credito Fiscal)', step_fmt)
         row += 1
         ws.write(row, 0,
-                 'En "Comprobantes recibidos" > clic "Apertura de otros '
-                 'conceptos". Completar:', wrap_fmt)
+                 'En "Operaciones que generan Credito Fiscal" > '
+                 '"Apertura de otros conceptos". Solo facturas:',
+                 wrap_fmt)
         row += 1
-        ws.write(row, 0, 'Campo en portal ARCA', fmts['header'])
-        ws.write(row, 1, 'Valor a cargar', fmts['header'])
-        row += 1
-
-        c_apertura = [
-            ('Percepciones de IVA', ct.get('perc_iva', 0)),
+        row = _write_apertura(ws, row, [
+            ('Percepciones de IVA', cf.get('perc_iva', 0)),
             ('Percepciones / Pagos a cta. Imp. Nacionales',
-             ct.get('perc_nacionales', 0)),
-            ('Percepcion de Ingresos Brutos', ct.get('perc_iibb', 0)),
-            ('Percepcion de Impuestos Municipales', ct.get('perc_mun', 0)),
-            ('Impuestos Internos', ct.get('imp_internos', 0)),
-            ('Otros Tributos', ct.get('otros_tributos', 0)),
-        ]
-        for campo, valor in c_apertura:
-            ws.write(row, 0, campo, fmts['text'])
-            fmt_val = highlight_fmt if abs(valor) > 0.005 else fmts['money']
-            ws.write(row, 1, valor, fmt_val)
-            row += 1
+             cf.get('perc_nacionales', 0)),
+            ('Percepcion de Ingresos Brutos', cf.get('perc_iibb', 0)),
+            ('Percepcion de Impuestos Municipales', cf.get('perc_mun', 0)),
+            ('Impuestos Internos', cf.get('imp_internos', 0)),
+            ('Otros Tributos', cf.get('otros_tributos', 0)),
+        ], fmts, highlight_fmt)
         ws.write(row, 0,
                  'IMPORTANTE: Si no se completa este paso, el Credito '
                  'Fiscal aparecera en 0,00.', warn_fmt)
         row += 2
+
+        # ---- PASO 4b: Apertura Restitución Crédito ----
+        if cnc.get('count', 0) > 0:
+            ws.write(row, 0,
+                     'PASO 4b — Apertura otros conceptos: RESTITUCION '
+                     'CREDITO FISCAL', step_fmt)
+            row += 1
+            cnc_tiene = any(abs(cnc.get(f, 0)) > 0.005 for f in (
+                'perc_iva', 'perc_nacionales', 'perc_iibb',
+                'perc_mun', 'imp_internos', 'otros_tributos'))
+            if cnc_tiene:
+                ws.write(row, 0,
+                         'En "Credito Fiscal Computable a Restituir" > '
+                         '"Apertura de otros conceptos". Valores NC compra:',
+                         wrap_fmt)
+                row += 1
+                row = _write_apertura(ws, row, [
+                    ('Percepciones de IVA', cnc.get('perc_iva', 0)),
+                    ('Percepciones / Pagos a cta. Imp. Nacionales',
+                     cnc.get('perc_nacionales', 0)),
+                    ('Percepcion de Ingresos Brutos',
+                     cnc.get('perc_iibb', 0)),
+                    ('Percepcion de Impuestos Municipales',
+                     cnc.get('perc_mun', 0)),
+                    ('Impuestos Internos', cnc.get('imp_internos', 0)),
+                    ('Otros Tributos', cnc.get('otros_tributos', 0)),
+                ], fmts, highlight_fmt)
+            else:
+                ws.write(row, 0,
+                         'Las NC de compra no tienen otros conceptos. '
+                         'Dejar en 0,00 y confirmar.', wrap_fmt)
+                row += 1
+            row += 1
 
         # ---- PASO 5: Verificar Determinación ----
         ws.write(row, 0,
