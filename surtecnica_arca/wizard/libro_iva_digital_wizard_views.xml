@@ -15,22 +15,32 @@
                     </group>
                 </group>
 
-                <!-- Estado done: resumen + archivos -->
-                <group invisible="state != 'done'">
-                    <group string="Resumen">
-                        <field name="resumen" nolabel="1" colspan="2"/>
-                    </group>
-                    <group string="Archivos TXT Generados">
-                        <field name="ventas_cbte_file" filename="ventas_cbte_name"/>
-                        <field name="ventas_cbte_name" invisible="1"/>
-                        <field name="ventas_alic_file" filename="ventas_alic_name"/>
-                        <field name="ventas_alic_name" invisible="1"/>
-                        <field name="compras_cbte_file" filename="compras_cbte_name"/>
-                        <field name="compras_cbte_name" invisible="1"/>
-                        <field name="compras_alic_file" filename="compras_alic_name"/>
-                        <field name="compras_alic_name" invisible="1"/>
-                    </group>
-                </group>
+                <!-- Estado done: notebook con pestañas -->
+                <notebook invisible="state != 'done'">
+
+                    <!-- Pestaña 1: DDJJ IVA preview -->
+                    <page string="DDJJ IVA" name="page_ddjj">
+                        <field name="ddjj_iva_html" nolabel="1"/>
+                    </page>
+
+                    <!-- Pestaña 2: Archivos generados -->
+                    <page string="Archivos" name="page_archivos">
+                        <group string="Resumen">
+                            <field name="resumen" nolabel="1" colspan="2"/>
+                        </group>
+                        <group string="Archivos TXT Generados">
+                            <field name="ventas_cbte_file" filename="ventas_cbte_name"/>
+                            <field name="ventas_cbte_name" invisible="1"/>
+                            <field name="ventas_alic_file" filename="ventas_alic_name"/>
+                            <field name="ventas_alic_name" invisible="1"/>
+                            <field name="compras_cbte_file" filename="compras_cbte_name"/>
+                            <field name="compras_cbte_name" invisible="1"/>
+                            <field name="compras_alic_file" filename="compras_alic_name"/>
+                            <field name="compras_alic_name" invisible="1"/>
+                        </group>
+                    </page>
+
+                </notebook>
 
                 <field name="state" invisible="1"/>
 
