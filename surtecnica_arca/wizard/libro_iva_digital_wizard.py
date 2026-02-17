@@ -77,6 +77,28 @@ class LibroIvaDigitalWizard(models.TransientModel):
         string='Resultado', readonly=True, sanitize=False,
     )
 
+    # Configuración IVA Simple (F.2051)
+    # Por qué: Código de actividad AFIP principal para agrupar ventas en CSV
+    actividad_afip = fields.Char(
+        'Actividad AFIP', size=6, default='465320',
+        help='Código actividad principal AFIP (6 dígitos)',
+    )
+
+    # CSV IVA Simple — Apertura de otros conceptos (estado done)
+    # Por qué: Desde nov 2025, ARCA F.2051 importa apertura vía CSV
+    iva_simple_debito_csv = fields.Binary('CSV Débito Fiscal')
+    iva_simple_debito_csv_name = fields.Char(
+        default='IVA_SIMPLE_DEBITO_FISCAL.csv')
+    iva_simple_rest_debito_csv = fields.Binary('CSV Rest. Débito Fiscal')
+    iva_simple_rest_debito_csv_name = fields.Char(
+        default='IVA_SIMPLE_REST_DEBITO_FISCAL.csv')
+    iva_simple_credito_csv = fields.Binary('CSV Crédito Fiscal')
+    iva_simple_credito_csv_name = fields.Char(
+        default='IVA_SIMPLE_CREDITO_FISCAL.csv')
+    iva_simple_rest_credito_csv = fields.Binary('CSV Rest. Crédito Fiscal')
+    iva_simple_rest_credito_csv_name = fields.Char(
+        default='IVA_SIMPLE_REST_CREDITO_FISCAL.csv')
+
     # -------------------------------------------------------------------------
     # CONSTANTES AFIP
     # -------------------------------------------------------------------------
@@ -115,6 +137,19 @@ class LibroIvaDigitalWizard(models.TransientModel):
         '4': 10.5, '5': 21.0, '6': 27.0,
     }
 
+    # Mapeo responsabilidad AFIP → tipo sujeto CSV IVA Simple
+    # Por qué: ARCA IVA Simple agrupa ventas por tipo de comprador
+    RESP_TIPO_SUJETO = {
+        '1': '1',   # RI → Operaciones con RI
+        '6': '1',   # Resp. Acuerdo → igual que RI (recibe Factura A)
+        '3': '2',   # Monotributo → Operaciones con Monotributistas
+        '4': '3',   # Autónomo → CF/Exentos/NA
+        '5': '3',   # Consumidor Final → CF/Exentos/NA
+        '9': '3',   # Sujeto Exento → CF/Exentos/NA
+        '10': '3',  # Act. Exentas → CF/Exentos/NA
+        '13': '3',  # Sin categoría → CF/Exentos/NA
+    }
+
     # -------------------------------------------------------------------------
     # ACCIÓN PRINCIPAL
     # -------------------------------------------------------------------------
@@ -143,6 +178,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
         ddjj_html, v_ddjj, c_ddjj = self._compute_ddjj_iva_html(
             ventas, compras, v_extracted, c_extracted)
 
+        # Generar CSV IVA Simple (Apertura otros conceptos F.2051)
+        csv_data = self._generar_csvs_iva_simple(
+            ventas, compras, v_extracted, c_extracted)
+
         # Codificar archivos
         vals = {
             'state': 'done',
@@ -168,6 +207,8 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 'v_data': v_ddjj, 'c_data': c_ddjj,
             }),
         }
+        # Agregar CSV IVA Simple al write
+        vals.update(csv_data)
         self.write(vals)
 
         return {
@@ -190,6 +231,20 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 (self.ventas_alic_name, self.ventas_alic_file),
                 (self.compras_cbte_name, self.compras_cbte_file),
                 (self.compras_alic_name, self.compras_alic_file),
+            ]:
+                if fdata:
+                    zf.writestr(fname, base64.b64decode(fdata))
+
+            # 4 CSV IVA Simple (Apertura otros conceptos F.2051)
+            for fname, fdata in [
+                (self.iva_simple_debito_csv_name,
+                 self.iva_simple_debito_csv),
+                (self.iva_simple_rest_debito_csv_name,
+                 self.iva_simple_rest_debito_csv),
+                (self.iva_simple_credito_csv_name,
+                 self.iva_simple_credito_csv),
+                (self.iva_simple_rest_credito_csv_name,
+                 self.iva_simple_rest_credito_csv),
             ]:
                 if fdata:
                     zf.writestr(fname, base64.b64decode(fdata))
@@ -1269,7 +1324,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
         # en cada campo del portal F.2002 para que la DDJJ quede completa.
         # Sin la "Apertura de otros conceptos", el Crédito Fiscal queda en 0.
         h.append('<div class="section">')
-        h.append('<h2>GUIA PASO A PASO — CARGA EN PORTAL ARCA (F.2002)</h2>')
+        h.append('<h2>GUIA PASO A PASO — CARGA EN PORTAL ARCA (F.2051 IVA Simple)</h2>')
 
         # Paso 1: Subir archivos
         h.append('<div class="step">')
@@ -1293,134 +1348,42 @@ class LibroIvaDigitalWizard(models.TransientModel):
                  'identificar los comprobantes con problema.</p>')
         h.append('</div>')
 
-        # ---- Helper para renderizar tabla de apertura ----
-        def _render_apertura(items):
-            """Renderiza tabla campo/valor para una sección de apertura."""
-            lines = ['<table><tr><th>Campo en portal ARCA</th>'
-                     '<th>Valor a cargar</th></tr>']
-            for campo, valor in items:
-                css_cls = 'valor-llenar' if abs(valor) > 0.005 else 'valor-cero'
-                lines.append(f'<tr><td>{campo}</td>'
-                             f'<td class="{css_cls}">{fmt(valor)}</td></tr>')
-            lines.append('</table>')
-            return '\n'.join(lines)
+        # Por qué: ARCA F.2051 (IVA Simple) importa apertura vía CSV.
+        # Los 4 CSV se generan automáticamente y se importan en el portal.
 
-        # Por qué: ARCA exige aperturas separadas para facturas (débito/crédito)
-        # y NC (restitución). Si se mezclan, da error de validación.
-        vf = v_data['totales_fac']  # facturas/ND de venta
-        vnc = v_data['totales_nc']  # NC de venta
-        cf = c_data['totales_fac']  # facturas/ND de compra
-        cnc = c_data['totales_nc']  # NC de compra
-
-        # Paso 3: Apertura Ventas - Débito Fiscal (solo facturas + ND)
-        v_ap_fac = [
-            ('Percepciones a no categorizados', vf.get('perc_no_categ', 0)),
-            ('Percepciones / Pagos a cta. Imp. Nacionales',
-             vf.get('perc_nacionales', 0)),
-            ('Percepcion de Ingresos Brutos', vf.get('perc_iibb', 0)),
-            ('Percepcion de Impuestos Municipales', vf.get('perc_mun', 0)),
-            ('Impuestos Internos', vf.get('imp_internos', 0)),
-            ('Otros Tributos', vf.get('otros_tributos', 0)),
+        # Paso 3: Importar CSV Apertura otros conceptos
+        h.append('<div class="step">')
+        h.append('<div class="step-num">PASO 3 — Importar CSV Apertura '
+                 'de otros conceptos</div>')
+        h.append('<p>En el <strong>Portal IVA (F.2051)</strong>, importar '
+                 'los 4 archivos CSV generados en cada seccion '
+                 'correspondiente:</p>')
+        h.append('<table><tr><th>Seccion en portal ARCA</th>'
+                 '<th>Archivo CSV a importar</th></tr>')
+        csv_map = [
+            ('Operaciones que generan Debito Fiscal',
+             'IVA_SIMPLE_DEBITO_FISCAL.csv'),
+            ('Restitucion del Debito Fiscal',
+             'IVA_SIMPLE_REST_DEBITO_FISCAL.csv'),
+            ('Operaciones que generan Credito Fiscal',
+             'IVA_SIMPLE_CREDITO_FISCAL.csv'),
+            ('Credito Fiscal Computable a Restituir',
+             'IVA_SIMPLE_REST_CREDITO_FISCAL.csv'),
         ]
-        h.append('<div class="step">')
-        h.append('<div class="step-num">PASO 3 — Apertura de otros '
-                 'conceptos: VENTAS (Debito Fiscal)</div>')
-        h.append('<p>En <strong>"Operaciones que generan Debito Fiscal"'
-                 '</strong> &rarr; clic en <strong>"Apertura de otros '
-                 'conceptos"</strong>. Cargar SOLO valores de facturas y '
-                 'notas de debito:</p>')
-        h.append(_render_apertura(v_ap_fac))
+        for seccion, archivo in csv_map:
+            h.append(f'<tr><td>{seccion}</td>'
+                     f'<td><strong>{archivo}</strong></td></tr>')
+        h.append('</table>')
+        h.append('<p>En cada seccion: clic en <strong>"Importar"</strong> '
+                 '&rarr; seleccionar el CSV &rarr; confirmar.</p>')
+        h.append('<p class="importante">IMPORTANTE: Si no se importan los '
+                 'CSV de Credito Fiscal, el credito aparecera en 0,00 en '
+                 'la determinacion del impuesto.</p>')
         h.append('</div>')
 
-        # Paso 3b: Apertura Restitución Débito (solo NC de venta)
-        # Por qué: ARCA requiere apertura separada para NC de venta.
-        # Los importes son negativos porque son restituciones.
-        vnc_tiene_otros = any(abs(vnc.get(f, 0)) > 0.005 for f in (
-            'perc_no_categ', 'perc_nacionales', 'perc_iibb',
-            'perc_mun', 'imp_internos', 'otros_tributos'))
+        # Paso 4: Verificar determinación
         h.append('<div class="step">')
-        h.append('<div class="step-num">PASO 3b — Apertura de otros '
-                 'conceptos: RESTITUCION DEBITO FISCAL</div>')
-        h.append('<p>En <strong>"Operaciones que generan Restitucion del '
-                 'Debito Fiscal"</strong> &rarr; clic en <strong>"Apertura '
-                 'de otros conceptos"</strong>.</p>')
-        if vnc_tiene_otros:
-            v_ap_nc = [
-                ('Percepciones a no categorizados',
-                 vnc.get('perc_no_categ', 0)),
-                ('Percepciones / Pagos a cta. Imp. Nacionales',
-                 vnc.get('perc_nacionales', 0)),
-                ('Percepcion de Ingresos Brutos', vnc.get('perc_iibb', 0)),
-                ('Percepcion de Impuestos Municipales',
-                 vnc.get('perc_mun', 0)),
-                ('Impuestos Internos', vnc.get('imp_internos', 0)),
-                ('Otros Tributos', vnc.get('otros_tributos', 0)),
-            ]
-            h.append('<p>Cargar valores de notas de credito (negativos):</p>')
-            h.append(_render_apertura(v_ap_nc))
-        else:
-            h.append('<p>Las NC no tienen otros conceptos. Dejar todos los '
-                     'campos en <span class="valor-cero">0,00</span> y '
-                     'confirmar para que ARCA no devuelva error de '
-                     'validacion.</p>')
-        h.append('</div>')
-
-        # Paso 4: Apertura Compras - Crédito Fiscal (solo facturas + ND)
-        c_ap_fac = [
-            ('Percepciones de IVA', cf.get('perc_iva', 0)),
-            ('Percepciones / Pagos a cta. Imp. Nacionales',
-             cf.get('perc_nacionales', 0)),
-            ('Percepcion de Ingresos Brutos', cf.get('perc_iibb', 0)),
-            ('Percepcion de Impuestos Municipales', cf.get('perc_mun', 0)),
-            ('Impuestos Internos', cf.get('imp_internos', 0)),
-            ('Otros Tributos', cf.get('otros_tributos', 0)),
-        ]
-        h.append('<div class="step">')
-        h.append('<div class="step-num">PASO 4 — Apertura de otros '
-                 'conceptos: COMPRAS (Credito Fiscal)</div>')
-        h.append('<p>En <strong>"Operaciones que generan Credito Fiscal"'
-                 '</strong> &rarr; clic en <strong>"Apertura de otros '
-                 'conceptos"</strong>. Cargar SOLO valores de facturas:</p>')
-        h.append(_render_apertura(c_ap_fac))
-        h.append('<p class="importante">IMPORTANTE: Si no se completa este '
-                 'paso, el Credito Fiscal aparecera en 0,00 en la '
-                 'determinacion del impuesto.</p>')
-        h.append('</div>')
-
-        # Paso 4b: Apertura Restitución Crédito (solo NC de compra)
-        cnc_tiene_otros = any(abs(cnc.get(f, 0)) > 0.005 for f in (
-            'perc_iva', 'perc_nacionales', 'perc_iibb',
-            'perc_mun', 'imp_internos', 'otros_tributos'))
-        if cnc.get('count', 0) > 0:
-            h.append('<div class="step">')
-            h.append('<div class="step-num">PASO 4b — Apertura de otros '
-                     'conceptos: RESTITUCION CREDITO FISCAL</div>')
-            h.append('<p>En <strong>"Credito Fiscal Computable a '
-                     'Restituir"</strong> &rarr; clic en <strong>"Apertura '
-                     'de otros conceptos"</strong>.</p>')
-            if cnc_tiene_otros:
-                c_ap_nc = [
-                    ('Percepciones de IVA', cnc.get('perc_iva', 0)),
-                    ('Percepciones / Pagos a cta. Imp. Nacionales',
-                     cnc.get('perc_nacionales', 0)),
-                    ('Percepcion de Ingresos Brutos',
-                     cnc.get('perc_iibb', 0)),
-                    ('Percepcion de Impuestos Municipales',
-                     cnc.get('perc_mun', 0)),
-                    ('Impuestos Internos', cnc.get('imp_internos', 0)),
-                    ('Otros Tributos', cnc.get('otros_tributos', 0)),
-                ]
-                h.append('<p>Cargar valores de NC de compra:</p>')
-                h.append(_render_apertura(c_ap_nc))
-            else:
-                h.append('<p>Las NC de compra no tienen otros conceptos. '
-                         'Dejar en <span class="valor-cero">0,00</span> y '
-                         'confirmar.</p>')
-            h.append('</div>')
-
-        # Paso 5: Verificar determinación
-        h.append('<div class="step">')
-        h.append('<div class="step-num">PASO 5 — Verificar Determinacion '
+        h.append('<div class="step-num">PASO 4 — Verificar Determinacion '
                  'del Impuesto</div>')
         h.append('<p>El portal debe mostrar automaticamente:</p>')
         h.append('<table class="det-table">')
@@ -1449,9 +1412,9 @@ class LibroIvaDigitalWizard(models.TransientModel):
                  '</ul>')
         h.append('</div>')
 
-        # Paso 6: Presentar
+        # Paso 5: Presentar
         h.append('<div class="step">')
-        h.append('<div class="step-num">PASO 6 — Presentar DDJJ</div>')
+        h.append('<div class="step-num">PASO 5 — Presentar DDJJ</div>')
         h.append('<p>Verificar que los totales coincidan con este reporte '
                  'y hacer clic en <strong>"Presentar"</strong>.</p>')
         h.append('</div>')
@@ -1724,9 +1687,8 @@ class LibroIvaDigitalWizard(models.TransientModel):
                                  empresa, cuit, periodo):
         """Escribe la hoja Guía Carga Portal con el paso a paso.
 
-        Por qué: El usuario necesita saber exactamente qué valores cargar
-        en cada campo del portal ARCA (F.2002). Sin la "Apertura de otros
-        conceptos", el Crédito Fiscal aparece en 0,00.
+        Por qué: El usuario necesita saber qué archivos importar en el
+        portal ARCA (F.2051 IVA Simple) y verificar la determinación.
         """
         ws = wb.add_worksheet('Guia Carga Portal')
         ws.set_column('A:A', 50)
@@ -1756,7 +1718,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
 
         row = 0
         ws.write(row, 0,
-                 f'GUIA CARGA PORTAL ARCA (F.2002) | Periodo {periodo}',
+                 f'GUIA CARGA PORTAL ARCA (F.2051) | Periodo {periodo}',
                  fmts['title'])
         row += 1
         ws.write(row, 0, f'{empresa} | CUIT: {cuit}')
@@ -1787,137 +1749,41 @@ class LibroIvaDigitalWizard(models.TransientModel):
                  '"Errores ARCA" del wizard en Odoo.', wrap_fmt)
         row += 2
 
-        # Helper para escribir tabla de apertura en Excel
-        def _write_apertura(ws, row, items, fmts, highlight_fmt):
-            ws.write(row, 0, 'Campo en portal ARCA', fmts['header'])
-            ws.write(row, 1, 'Valor a cargar', fmts['header'])
+        # ---- PASO 3: Importar CSV Apertura otros conceptos ----
+        # Por qué: ARCA F.2051 importa apertura vía CSV (no carga manual)
+        ws.write(row, 0,
+                 'PASO 3 — Importar CSV Apertura de otros conceptos',
+                 step_fmt)
+        row += 1
+        ws.write(row, 0,
+                 'En el Portal IVA (F.2051), importar los 4 CSV en cada '
+                 'seccion correspondiente:', wrap_fmt)
+        row += 1
+        ws.write(row, 0, 'Seccion en portal ARCA', fmts['header'])
+        ws.write(row, 1, 'Archivo CSV a importar', fmts['header'])
+        row += 1
+        csv_map = [
+            ('Operaciones que generan Debito Fiscal',
+             'IVA_SIMPLE_DEBITO_FISCAL.csv'),
+            ('Restitucion del Debito Fiscal',
+             'IVA_SIMPLE_REST_DEBITO_FISCAL.csv'),
+            ('Operaciones que generan Credito Fiscal',
+             'IVA_SIMPLE_CREDITO_FISCAL.csv'),
+            ('Credito Fiscal Computable a Restituir',
+             'IVA_SIMPLE_REST_CREDITO_FISCAL.csv'),
+        ]
+        for seccion, archivo in csv_map:
+            ws.write(row, 0, seccion, fmts['text'])
+            ws.write(row, 1, archivo, highlight_fmt)
             row += 1
-            for campo, valor in items:
-                ws.write(row, 0, campo, fmts['text'])
-                fmt_v = highlight_fmt if abs(valor) > 0.005 else fmts['money']
-                ws.write(row, 1, valor, fmt_v)
-                row += 1
-            return row
-
-        # Por qué: ARCA separa aperturas para facturas y NC
-        vf = v_data['totales_fac']
-        vnc = v_data['totales_nc']
-        cf = c_data['totales_fac']
-        cnc = c_data['totales_nc']
-
-        # ---- PASO 3: Apertura Ventas - Débito Fiscal ----
         ws.write(row, 0,
-                 'PASO 3 — Apertura otros conceptos: VENTAS '
-                 '(Debito Fiscal)', step_fmt)
-        row += 1
-        ws.write(row, 0,
-                 'En "Operaciones que generan Debito Fiscal" > '
-                 '"Apertura de otros conceptos". Solo facturas y ND:',
-                 wrap_fmt)
-        row += 1
-        row = _write_apertura(ws, row, [
-            ('Percepciones a no categorizados', vf.get('perc_no_categ', 0)),
-            ('Percepciones / Pagos a cta. Imp. Nacionales',
-             vf.get('perc_nacionales', 0)),
-            ('Percepcion de Ingresos Brutos', vf.get('perc_iibb', 0)),
-            ('Percepcion de Impuestos Municipales', vf.get('perc_mun', 0)),
-            ('Impuestos Internos', vf.get('imp_internos', 0)),
-            ('Otros Tributos', vf.get('otros_tributos', 0)),
-        ], fmts, highlight_fmt)
-        row += 1
-
-        # ---- PASO 3b: Apertura Restitución Débito ----
-        ws.write(row, 0,
-                 'PASO 3b — Apertura otros conceptos: RESTITUCION '
-                 'DEBITO FISCAL', step_fmt)
-        row += 1
-        vnc_tiene = any(abs(vnc.get(f, 0)) > 0.005 for f in (
-            'perc_no_categ', 'perc_nacionales', 'perc_iibb',
-            'perc_mun', 'imp_internos', 'otros_tributos'))
-        if vnc_tiene:
-            ws.write(row, 0,
-                     'En "Operaciones que generan Restitucion del Debito '
-                     'Fiscal" > "Apertura de otros conceptos". '
-                     'Valores de NC (negativos):', wrap_fmt)
-            row += 1
-            row = _write_apertura(ws, row, [
-                ('Percepciones a no categorizados',
-                 vnc.get('perc_no_categ', 0)),
-                ('Percepciones / Pagos a cta. Imp. Nacionales',
-                 vnc.get('perc_nacionales', 0)),
-                ('Percepcion de Ingresos Brutos', vnc.get('perc_iibb', 0)),
-                ('Percepcion de Impuestos Municipales',
-                 vnc.get('perc_mun', 0)),
-                ('Impuestos Internos', vnc.get('imp_internos', 0)),
-                ('Otros Tributos', vnc.get('otros_tributos', 0)),
-            ], fmts, highlight_fmt)
-        else:
-            ws.write(row, 0,
-                     'Las NC no tienen otros conceptos. Dejar en 0,00 y '
-                     'confirmar para evitar error de validacion.', wrap_fmt)
-            row += 1
-        row += 1
-
-        # ---- PASO 4: Apertura Compras - Crédito Fiscal ----
-        ws.write(row, 0,
-                 'PASO 4 — Apertura otros conceptos: COMPRAS '
-                 '(Credito Fiscal)', step_fmt)
-        row += 1
-        ws.write(row, 0,
-                 'En "Operaciones que generan Credito Fiscal" > '
-                 '"Apertura de otros conceptos". Solo facturas:',
-                 wrap_fmt)
-        row += 1
-        row = _write_apertura(ws, row, [
-            ('Percepciones de IVA', cf.get('perc_iva', 0)),
-            ('Percepciones / Pagos a cta. Imp. Nacionales',
-             cf.get('perc_nacionales', 0)),
-            ('Percepcion de Ingresos Brutos', cf.get('perc_iibb', 0)),
-            ('Percepcion de Impuestos Municipales', cf.get('perc_mun', 0)),
-            ('Impuestos Internos', cf.get('imp_internos', 0)),
-            ('Otros Tributos', cf.get('otros_tributos', 0)),
-        ], fmts, highlight_fmt)
-        ws.write(row, 0,
-                 'IMPORTANTE: Si no se completa este paso, el Credito '
-                 'Fiscal aparecera en 0,00.', warn_fmt)
+                 'IMPORTANTE: Si no se importan los CSV de Credito Fiscal, '
+                 'el credito aparecera en 0,00.', warn_fmt)
         row += 2
 
-        # ---- PASO 4b: Apertura Restitución Crédito ----
-        if cnc.get('count', 0) > 0:
-            ws.write(row, 0,
-                     'PASO 4b — Apertura otros conceptos: RESTITUCION '
-                     'CREDITO FISCAL', step_fmt)
-            row += 1
-            cnc_tiene = any(abs(cnc.get(f, 0)) > 0.005 for f in (
-                'perc_iva', 'perc_nacionales', 'perc_iibb',
-                'perc_mun', 'imp_internos', 'otros_tributos'))
-            if cnc_tiene:
-                ws.write(row, 0,
-                         'En "Credito Fiscal Computable a Restituir" > '
-                         '"Apertura de otros conceptos". Valores NC compra:',
-                         wrap_fmt)
-                row += 1
-                row = _write_apertura(ws, row, [
-                    ('Percepciones de IVA', cnc.get('perc_iva', 0)),
-                    ('Percepciones / Pagos a cta. Imp. Nacionales',
-                     cnc.get('perc_nacionales', 0)),
-                    ('Percepcion de Ingresos Brutos',
-                     cnc.get('perc_iibb', 0)),
-                    ('Percepcion de Impuestos Municipales',
-                     cnc.get('perc_mun', 0)),
-                    ('Impuestos Internos', cnc.get('imp_internos', 0)),
-                    ('Otros Tributos', cnc.get('otros_tributos', 0)),
-                ], fmts, highlight_fmt)
-            else:
-                ws.write(row, 0,
-                         'Las NC de compra no tienen otros conceptos. '
-                         'Dejar en 0,00 y confirmar.', wrap_fmt)
-                row += 1
-            row += 1
-
-        # ---- PASO 5: Verificar Determinación ----
+        # ---- PASO 4: Verificar Determinación ----
         ws.write(row, 0,
-                 'PASO 5 — Verificar Determinacion del Impuesto', step_fmt)
+                 'PASO 4 — Verificar Determinacion del Impuesto', step_fmt)
         row += 1
         ws.write(row, 0, 'El portal debe mostrar automaticamente:')
         row += 1
@@ -1953,12 +1819,271 @@ class LibroIvaDigitalWizard(models.TransientModel):
         ws.write(row, 0, '  - Saldo a favor de periodos anteriores')
         row += 2
 
-        # ---- PASO 6: Presentar ----
-        ws.write(row, 0, 'PASO 6 — Presentar DDJJ', step_fmt)
+        # ---- PASO 5: Presentar ----
+        ws.write(row, 0, 'PASO 5 — Presentar DDJJ', step_fmt)
         row += 1
         ws.write(row, 0,
                  'Verificar que los totales coincidan con este reporte '
                  'y hacer clic en "Presentar".', wrap_fmt)
+
+    # -------------------------------------------------------------------------
+    # CSV IVA SIMPLE — APERTURA OTROS CONCEPTOS (F.2051)
+    # -------------------------------------------------------------------------
+
+    def _get_tipo_sujeto(self, partner):
+        """Tipo sujeto comprador desde responsabilidad AFIP.
+
+        Por qué: ARCA IVA Simple agrupa ventas por tipo de comprador.
+        Fallback: '3' (CF/Exentos/NA) si no tiene responsabilidad configurada.
+        """
+        resp = partner.l10n_ar_afip_responsibility_type_id
+        code = str(resp.code) if resp else ''
+        return self.RESP_TIPO_SUJETO.get(code, '3')
+
+    def _fmt_csv_amount(self, amount):
+        """Importe para CSV ARCA: coma decimal, sin padding.
+
+        Por qué: ARCA IVA Simple espera formato numérico simple con coma
+        como separador decimal. Sin ceros trailing ni zero-padding.
+        Ejemplos: 100.00 → '100', 10.50 → '10,5', 1234.56 → '1234,56'
+        """
+        if abs(amount) < 0.005:
+            return '0'
+        rounded = round(amount, 2)
+        if rounded == int(rounded):
+            return str(int(rounded))
+        s = f'{rounded:.2f}'.rstrip('0')
+        return s.replace('.', ',')
+
+    def _extract_move_data_by_concepto(self, move):
+        """Desglosa base+IVA por concepto (bienes/servicios) y alícuota.
+
+        Por qué: CSV Crédito Fiscal de IVA Simple requiere separar neto e IVA
+        por tipo de bien (bienes=1, servicios=3) dentro de cada comprobante.
+
+        Returns:
+            dict: {(concepto, alicuota_code): {'base': float, 'amount': float}}
+        """
+        sign = -1 if move.move_type in ('out_refund', 'in_refund') else 1
+        result = {}
+
+        for line in move.invoice_line_ids.filtered(
+            lambda l: not l.display_type
+        ):
+            # Concepto: bienes ('1') si producto físico, servicios ('3') si no
+            product = line.product_id
+            if product and product.type in ('consu', 'product'):
+                concepto = '1'
+            else:
+                concepto = '3'
+
+            # Buscar alícuota IVA gravado en los taxes de la línea
+            for tax in line.tax_ids:
+                code = self._get_vat_afip_code(tax)
+                if code and code in self.IVA_GRAVADO_CODES:
+                    key = (concepto, code)
+                    if key not in result:
+                        result[key] = {'base': 0.0, 'amount': 0.0}
+                    result[key]['base'] += line.price_subtotal * sign
+                    break  # Una línea tiene una sola alícuota IVA
+
+        # Recalcular IVA = base × tasa para consistencia con ARCA
+        for key, data in result.items():
+            rate = self.IVA_CODE_RATE.get(key[1], 0)
+            data['amount'] = round(data['base'] * rate / 100, 2)
+
+        return result
+
+    def _generar_csvs_iva_simple(self, ventas, compras,
+                                  v_extracted, c_extracted):
+        """Genera los 4 CSV de Apertura otros conceptos (IVA Simple F.2051).
+
+        Por qué: Desde nov 2025, ARCA reemplazó F.2002 por F.2051 (IVA Simple).
+        La apertura se importa vía CSV (separador ;, decimal coma, latin-1).
+        Separa facturas (débito/crédito) de NC (restitución).
+        """
+        # Separar facturas/ND de NC
+        ventas_fac = ventas.filtered(lambda m: m.move_type == 'out_invoice')
+        ventas_nc = ventas.filtered(lambda m: m.move_type == 'out_refund')
+        compras_fac = compras.filtered(lambda m: m.move_type == 'in_invoice')
+        compras_nc = compras.filtered(lambda m: m.move_type == 'in_refund')
+
+        return {
+            'iva_simple_debito_csv': self._csv_debito_fiscal(
+                ventas_fac, v_extracted),
+            'iva_simple_debito_csv_name': 'IVA_SIMPLE_DEBITO_FISCAL.csv',
+            'iva_simple_rest_debito_csv': self._csv_rest_debito_fiscal(
+                ventas_nc, v_extracted),
+            'iva_simple_rest_debito_csv_name':
+                'IVA_SIMPLE_REST_DEBITO_FISCAL.csv',
+            'iva_simple_credito_csv': self._csv_credito_fiscal(
+                compras_fac, c_extracted),
+            'iva_simple_credito_csv_name': 'IVA_SIMPLE_CREDITO_FISCAL.csv',
+            'iva_simple_rest_credito_csv': self._csv_rest_credito_fiscal(
+                compras_nc, c_extracted),
+            'iva_simple_rest_credito_csv_name':
+                'IVA_SIMPLE_REST_CREDITO_FISCAL.csv',
+        }
+
+    def _csv_debito_fiscal(self, moves, extracted):
+        """CSV 1: Débito fiscal — facturas + ND de venta.
+
+        Por qué: Agrupa por (actividad, tipo_sujeto, alícuota).
+        tipo_op 1 = gravado, tipo_op 3 = exento/no gravado.
+        Formato línea gravado (7 campos):
+            actividad;1;tipo_sujeto;alicuota;neto;debito;dacion
+        Formato línea exento (7 campos):
+            actividad;3;;;;;monto_exento_no_gravado
+        """
+        act = self.actividad_afip or '465320'
+        # {(act, tipo_op, sujeto, code): {'neto': 0, 'iva': 0}}
+        acum = {}
+        exento_ng = 0.0
+
+        for move in moves:
+            data = extracted[move.id]
+            sujeto = self._get_tipo_sujeto(move.commercial_partner_id)
+
+            # Gravado: una línea por alícuota × sujeto
+            for alic in data['iva_alicuotas']:
+                key = (act, '1', sujeto, alic['code'])
+                if key not in acum:
+                    acum[key] = {'neto': 0.0, 'iva': 0.0}
+                acum[key]['neto'] += alic['base']
+                acum[key]['iva'] += alic['amount']
+
+            # Exento + No gravado → tipo_op 3 (sin sujeto ni alícuota)
+            monto_exng = data['exento'] + data['no_gravado']
+            if abs(monto_exng) > 0.005:
+                exento_ng += monto_exng
+
+        # Generar líneas CSV
+        lines = []
+        fmt = self._fmt_csv_amount
+        for key in sorted(acum.keys()):
+            vals = acum[key]
+            _, tipo_op, sujeto, code = key
+            rate = self.IVA_CODE_RATE.get(code, 0)
+            lines.append(
+                f'{key[0]};{tipo_op};{sujeto};{fmt(rate)};'
+                f'{fmt(vals["neto"])};{fmt(vals["iva"])};0'
+            )
+
+        # Exento/no gravado: tipo_op 3, campos 3-6 vacíos
+        if abs(exento_ng) > 0.005:
+            lines.append(f'{act};3;;;;;{fmt(exento_ng)}')
+
+        return self._encode_lines(lines) if lines else False
+
+    def _csv_rest_debito_fiscal(self, moves, extracted):
+        """CSV 2: Restitución débito fiscal — NC de venta.
+
+        Por qué: Mismo esquema que CSV 1 pero sin campo dación (6 campos)
+        y tipo_op 2 para exento/NG. Importes en valor absoluto.
+        Formato gravado: actividad;1;tipo_sujeto;alicuota;neto;debito
+        Formato exento:  actividad;2;;;;monto
+        """
+        act = self.actividad_afip or '465320'
+        acum = {}
+        exento_ng = 0.0
+
+        for move in moves:
+            data = extracted[move.id]
+            sujeto = self._get_tipo_sujeto(move.commercial_partner_id)
+
+            for alic in data['iva_alicuotas']:
+                key = (act, '1', sujeto, alic['code'])
+                if key not in acum:
+                    acum[key] = {'neto': 0.0, 'iva': 0.0}
+                # NC tienen valores negativos en extracted → abs
+                acum[key]['neto'] += abs(alic['base'])
+                acum[key]['iva'] += abs(alic['amount'])
+
+            monto_exng = abs(data['exento']) + abs(data['no_gravado'])
+            if monto_exng > 0.005:
+                exento_ng += monto_exng
+
+        lines = []
+        fmt = self._fmt_csv_amount
+        for key in sorted(acum.keys()):
+            vals = acum[key]
+            _, tipo_op, sujeto, code = key
+            rate = self.IVA_CODE_RATE.get(code, 0)
+            lines.append(
+                f'{key[0]};{tipo_op};{sujeto};{fmt(rate)};'
+                f'{fmt(vals["neto"])};{fmt(vals["iva"])}'
+            )
+
+        # Exento/no gravado: tipo_op 2, campos 3-5 vacíos
+        if abs(exento_ng) > 0.005:
+            lines.append(f'{act};2;;;;{fmt(exento_ng)}')
+
+        return self._encode_lines(lines) if lines else False
+
+    def _csv_credito_fiscal(self, moves, extracted):
+        """CSV 3: Crédito fiscal — facturas + ND de compra.
+
+        Por qué: Agrupa por (concepto, alícuota). concepto = tipo de bien:
+        1=bienes, 3=servicios. Desglosa por concepto dentro de cada move
+        iterando invoice_line_ids.
+        Formato (5 campos):
+            concepto;alicuota;neto;credito_facturado;credito_computable
+        """
+        # {(concepto, code): {'neto': 0, 'iva': 0}}
+        acum = {}
+
+        for move in moves:
+            by_concepto = self._extract_move_data_by_concepto(move)
+            for key, vals in by_concepto.items():
+                if key not in acum:
+                    acum[key] = {'neto': 0.0, 'iva': 0.0}
+                acum[key]['neto'] += vals['base']
+                acum[key]['iva'] += vals['amount']
+
+        lines = []
+        fmt = self._fmt_csv_amount
+        for key in sorted(acum.keys()):
+            concepto, code = key
+            vals = acum[key]
+            rate = self.IVA_CODE_RATE.get(code, 0)
+            # credito_computable = credito_facturado (sin prorrateo)
+            lines.append(
+                f'{concepto};{fmt(rate)};{fmt(vals["neto"])};'
+                f'{fmt(vals["iva"])};{fmt(vals["iva"])}'
+            )
+
+        return self._encode_lines(lines) if lines else False
+
+    def _csv_rest_credito_fiscal(self, moves, extracted):
+        """CSV 4: Restitución crédito fiscal — NC de compra.
+
+        Por qué: Igual que CSV 3 pero sin campo credito_computable (4 campos).
+        Importes en valor absoluto (NC tienen signo negativo en extracted).
+        Formato: concepto;alicuota;neto;credito_facturado
+        """
+        acum = {}
+
+        for move in moves:
+            by_concepto = self._extract_move_data_by_concepto(move)
+            for key, vals in by_concepto.items():
+                if key not in acum:
+                    acum[key] = {'neto': 0.0, 'iva': 0.0}
+                # NC → valores negativos → abs
+                acum[key]['neto'] += abs(vals['base'])
+                acum[key]['iva'] += abs(vals['amount'])
+
+        lines = []
+        fmt = self._fmt_csv_amount
+        for key in sorted(acum.keys()):
+            concepto, code = key
+            vals = acum[key]
+            rate = self.IVA_CODE_RATE.get(code, 0)
+            lines.append(
+                f'{concepto};{fmt(rate)};{fmt(vals["neto"])};'
+                f'{fmt(vals["iva"])}'
+            )
+
+        return self._encode_lines(lines) if lines else False
 
     # -------------------------------------------------------------------------
     # UTILIDADES

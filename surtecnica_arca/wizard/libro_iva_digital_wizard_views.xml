@@ -13,6 +13,9 @@
                         <field name="date_from"/>
                         <field name="date_to"/>
                     </group>
+                    <group string="IVA Simple (F.2051)">
+                        <field name="actividad_afip"/>
+                    </group>
                 </group>
 
                 <!-- Estado done: notebook con pestañas -->
@@ -40,7 +43,25 @@
                         </group>
                     </page>
 
-                    <!-- Pestaña 3: Procesador de errores ARCA -->
+                    <!-- Pestaña 3: CSV IVA Simple -->
+                    <page string="IVA Simple" name="page_iva_simple">
+                        <group string="CSV Apertura de otros conceptos (F.2051)">
+                            <field name="iva_simple_debito_csv"
+                                   filename="iva_simple_debito_csv_name"/>
+                            <field name="iva_simple_debito_csv_name" invisible="1"/>
+                            <field name="iva_simple_rest_debito_csv"
+                                   filename="iva_simple_rest_debito_csv_name"/>
+                            <field name="iva_simple_rest_debito_csv_name" invisible="1"/>
+                            <field name="iva_simple_credito_csv"
+                                   filename="iva_simple_credito_csv_name"/>
+                            <field name="iva_simple_credito_csv_name" invisible="1"/>
+                            <field name="iva_simple_rest_credito_csv"
+                                   filename="iva_simple_rest_credito_csv_name"/>
+                            <field name="iva_simple_rest_credito_csv_name" invisible="1"/>
+                        </group>
+                    </page>
+
+                    <!-- Pestaña 4: Procesador de errores ARCA -->
                     <page string="Errores ARCA" name="page_errores">
                         <group>
                             <field name="errores_arca_tipo"/>
