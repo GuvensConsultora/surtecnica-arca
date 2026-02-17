@@ -1116,6 +1116,9 @@ class LibroIvaDigitalWizard(models.TransientModel):
         }
         por_tipo = {}
         alicuotas = {}
+        # Por qué: alícuotas separadas fac/nc para cruce CSV por concepto
+        alicuotas_fac = {}
+        alicuotas_nc = {}
         totales = dict(_EMPTY_TOTALES)
         # Por qué: ARCA exige aperturas separadas para facturas y NC
         # Facturas (+ ND) → Débito/Crédito Fiscal
@@ -1160,17 +1163,21 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 bucket['iva'] += iva
                 bucket['total'] += data['total']
 
-            # Acumular por código de alícuota IVA
+            # Acumular por código de alícuota IVA (total + separado fac/nc)
+            target_alic = alicuotas_nc if es_nc else alicuotas_fac
             for alic in data['iva_alicuotas']:
                 code = alic['code']
-                if code not in alicuotas:
-                    alicuotas[code] = {'base': 0.0, 'amount': 0.0}
-                alicuotas[code]['base'] += alic['base']
-                alicuotas[code]['amount'] += alic['amount']
+                for bucket in (alicuotas, target_alic):
+                    if code not in bucket:
+                        bucket[code] = {'base': 0.0, 'amount': 0.0}
+                    bucket[code]['base'] += alic['base']
+                    bucket[code]['amount'] += alic['amount']
 
         return {
             'por_tipo': sorted(por_tipo.values(), key=lambda x: x['code']),
             'alicuotas': alicuotas,
+            'alicuotas_fac': alicuotas_fac,
+            'alicuotas_nc': alicuotas_nc,
             'totales': totales,
             'totales_fac': totales_fac,  # facturas + ND
             'totales_nc': totales_nc,     # notas de crédito
@@ -1488,88 +1495,164 @@ class LibroIvaDigitalWizard(models.TransientModel):
         h.append('</div>')
         return '\n'.join(h)
 
-    def _render_cruce_csv_html(self, csv_totals, v_ddjj, c_ddjj):
-        """Cruce de totales CSV apertura vs comprobantes informados TXT.
+    # Mapeo concepto compra → label para display
+    CONCEPTO_LABEL = {'1': 'Bienes', '3': 'Servicios'}
 
-        Por qué: Valida que los importes agrupados en los CSV de apertura
-        de otros conceptos coincidan con los totales de los comprobantes
-        informados en los TXT. La fuente de datos es distinta:
-        - TXT/DDJJ usa tax_base_amount desde tax lines (line_ids)
-        - CSV CF usa abs(line.balance) desde invoice lines (invoice_line_ids)
-        Esto puede generar diferencias de centavos por redondeo.
+    def _render_cruce_csv_html(self, csv_totals, v_ddjj, c_ddjj):
+        """Cruce de totales CSV apertura vs comprobantes informados.
+
+        Por qué: Valida que los importes de los CSV de apertura coincidan
+        con los comprobantes informados. Muestra desglose por concepto
+        (bienes/servicios) para crédito fiscal de compras, y comparación
+        por alícuota contra los totales de los TXT.
+        Nota: TXT tiene importes en moneda factura (ARCA reconvierte),
+        DDJJ y CSV tienen importes en ARS. Se compara DDJJ vs CSV (ambos ARS).
         """
         fmt = self._fmt_money
-        # Armar filas de comparación: (label, valor_comprobantes, valor_csv)
-        rows = []
-
-        # ---- Ventas Facturas vs CSV Débito Fiscal ----
-        vf = v_ddjj['totales_fac']
-        df = csv_totals['df']
-        rows.append(('Ventas Fac. — Neto Gravado',
-                     vf['gravado'], df['neto']))
-        rows.append(('Ventas Fac. — Debito Fiscal',
-                     vf['iva'], df['iva']))
-        rows.append(('Ventas Fac. — Exento + No Gravado',
-                     vf['exento'] + vf['no_gravado'], df['exento_ng']))
-
-        # ---- Ventas NC vs CSV Rest. Débito Fiscal ----
-        # NC tienen signo negativo en DDJJ → abs para comparar con CSV
-        vnc = v_ddjj['totales_nc']
-        rdf = csv_totals['rdf']
-        rows.append(('Ventas NC — Neto Gravado',
-                     abs(vnc['gravado']), rdf['neto']))
-        rows.append(('Ventas NC — Rest. Debito',
-                     abs(vnc['iva']), rdf['iva']))
-        rows.append(('Ventas NC — Exento + No Gravado',
-                     abs(vnc['exento']) + abs(vnc['no_gravado']),
-                     rdf['exento_ng']))
-
-        # ---- Compras Facturas vs CSV Crédito Fiscal ----
-        # Por qué: comparación crítica — CSV usa extraction por concepto
-        # (invoice_line_ids) vs DDJJ que usa tax lines (line_ids).
-        cf_ddjj = c_ddjj['totales_fac']
-        cf_csv = csv_totals['cf']
-        rows.append(('Compras Fac. — Neto Gravado',
-                     cf_ddjj['gravado'], cf_csv['neto']))
-        rows.append(('Compras Fac. — Credito Fiscal',
-                     cf_ddjj['iva'], cf_csv['iva']))
-
-        # ---- Compras NC vs CSV Rest. Crédito Fiscal ----
-        cnc = c_ddjj['totales_nc']
-        rcf = csv_totals['rcf']
-        rows.append(('Compras NC — Neto Gravado',
-                     abs(cnc['gravado']), rcf['neto']))
-        rows.append(('Compras NC — Rest. Credito',
-                     abs(cnc['iva']), rcf['iva']))
-
-        # Renderizar tabla HTML con indicadores de diferencia
         h = ['<div class="ddjj-iva"><div class="section">']
         h.append('<h3>CRUCE: CSV Apertura vs Comprobantes Informados</h3>')
-        h.append('<table><tr>'
-                 '<th>Concepto</th><th>Comprobantes (TXT)</th>'
-                 '<th>CSV Apertura</th><th>Diferencia</th></tr>')
 
+        # ---- VENTAS: comparación compacta ----
+        h.append('<h3 style="font-size:12px">Debito Fiscal (Ventas)</h3>')
+        h.append('<table><tr>'
+                 '<th>Concepto</th><th>Comprobantes</th>'
+                 '<th>CSV Apertura</th><th>Dif.</th></tr>')
+        vf = v_ddjj['totales_fac']
+        df = csv_totals['df']
+        vnc = v_ddjj['totales_nc']
+        rdf = csv_totals['rdf']
+        ventas_rows = [
+            ('Facturas — Neto Gravado', vf['gravado'], df['neto']),
+            ('Facturas — Debito Fiscal', vf['iva'], df['iva']),
+            ('Facturas — Exento + No Grav.',
+             vf['exento'] + vf['no_gravado'], df['exento_ng']),
+            ('NC — Neto Gravado', abs(vnc['gravado']), rdf['neto']),
+            ('NC — Rest. Debito', abs(vnc['iva']), rdf['iva']),
+            ('NC — Exento + No Grav.',
+             abs(vnc['exento']) + abs(vnc['no_gravado']), rdf['exento_ng']),
+        ]
         hay_dif = False
-        for label, txt_val, csv_val in rows:
-            diff = round(txt_val - csv_val, 2)
+        for label, ddjj_val, csv_val in ventas_rows:
+            diff = round(ddjj_val - csv_val, 2)
             if abs(diff) > 0.01:
                 hay_dif = True
-                diff_html = (
-                    f'<span style="color:#c0392b;font-weight:bold">'
-                    f'{fmt(diff)}</span>')
+                diff_html = (f'<span style="color:#c0392b;font-weight:bold">'
+                             f'{fmt(diff)}</span>')
             else:
                 diff_html = '<span style="color:#27ae60">OK</span>'
-            h.append(
-                f'<tr><td>{label}</td>'
-                f'<td>{fmt(txt_val)}</td><td>{fmt(csv_val)}</td>'
-                f'<td>{diff_html}</td></tr>')
-
+            h.append(f'<tr><td>{label}</td><td>{fmt(ddjj_val)}</td>'
+                     f'<td>{fmt(csv_val)}</td><td>{diff_html}</td></tr>')
         h.append('</table>')
 
+        # ---- COMPRAS FAC: detalle por concepto (bienes/servicios) ----
+        cf_csv = csv_totals['cf']
+        cf_alic = c_ddjj.get('alicuotas_fac', {})
+        h.append('<h3 style="font-size:12px">'
+                 'Credito Fiscal — Facturas de Compra</h3>')
+        h.append('<table><tr><th>Concepto</th><th>Alicuota</th>'
+                 '<th>Neto Gravado</th><th>Credito Fiscal</th></tr>')
+
+        # Filas de detalle por concepto+alícuota
+        csv_by_code = {}  # agregar por código para comparar con DDJJ
+        for d in cf_csv.get('detalle', []):
+            clabel = self.CONCEPTO_LABEL.get(d['concepto'], d['concepto'])
+            alabel = self.IVA_CODE_LABEL.get(d['code'], d['code'])
+            h.append(f'<tr><td>{clabel}</td><td>{alabel}</td>'
+                     f'<td>{fmt(d["neto"])}</td>'
+                     f'<td>{fmt(d["iva"])}</td></tr>')
+            if d['code'] not in csv_by_code:
+                csv_by_code[d['code']] = {'neto': 0.0, 'iva': 0.0}
+            csv_by_code[d['code']]['neto'] += d['neto']
+            csv_by_code[d['code']]['iva'] += d['iva']
+
+        # Total CSV
+        h.append(f'<tr class="total-row"><td colspan="2">TOTAL CSV</td>'
+                 f'<td>{fmt(cf_csv["neto"])}</td>'
+                 f'<td>{fmt(cf_csv["iva"])}</td></tr>')
+
+        # Comparación por alícuota: DDJJ fac vs CSV agrupado por code
+        for code in sorted(set(list(cf_alic.keys()) +
+                               list(csv_by_code.keys()))):
+            alabel = self.IVA_CODE_LABEL.get(code, code)
+            ddjj_b = round(cf_alic.get(code, {}).get('base', 0), 2)
+            ddjj_i = round(cf_alic.get(code, {}).get('amount', 0), 2)
+            csv_b = round(csv_by_code.get(code, {}).get('neto', 0), 2)
+            csv_i = round(csv_by_code.get(code, {}).get('iva', 0), 2)
+            diff_b = round(ddjj_b - csv_b, 2)
+            diff_i = round(ddjj_i - csv_i, 2)
+            ok_b = abs(diff_b) <= 0.01
+            ok_i = abs(diff_i) <= 0.01
+            if not (ok_b and ok_i):
+                hay_dif = True
+            st_b = ('<span style="color:#27ae60">OK</span>' if ok_b
+                    else f'<span style="color:#c0392b;font-weight:bold">'
+                         f'{fmt(diff_b)}</span>')
+            st_i = ('<span style="color:#27ae60">OK</span>' if ok_i
+                    else f'<span style="color:#c0392b;font-weight:bold">'
+                         f'{fmt(diff_i)}</span>')
+            h.append(
+                f'<tr style="background:#f8f6fa">'
+                f'<td colspan="2">vs DDJJ IVA {alabel}</td>'
+                f'<td>{st_b} ({fmt(ddjj_b)})</td>'
+                f'<td>{st_i} ({fmt(ddjj_i)})</td></tr>')
+        h.append('</table>')
+
+        # ---- COMPRAS NC: detalle por concepto (restitución) ----
+        rcf_csv = csv_totals['rcf']
+        rcf_alic = c_ddjj.get('alicuotas_nc', {})
+        h.append('<h3 style="font-size:12px">'
+                 'Rest. Credito Fiscal — NC de Compra</h3>')
+        h.append('<table><tr><th>Concepto</th><th>Alicuota</th>'
+                 '<th>Neto Gravado</th><th>Credito Fiscal</th></tr>')
+
+        rcf_by_code = {}
+        for d in rcf_csv.get('detalle', []):
+            clabel = self.CONCEPTO_LABEL.get(d['concepto'], d['concepto'])
+            alabel = self.IVA_CODE_LABEL.get(d['code'], d['code'])
+            h.append(f'<tr><td>{clabel}</td><td>{alabel}</td>'
+                     f'<td>{fmt(d["neto"])}</td>'
+                     f'<td>{fmt(d["iva"])}</td></tr>')
+            if d['code'] not in rcf_by_code:
+                rcf_by_code[d['code']] = {'neto': 0.0, 'iva': 0.0}
+            rcf_by_code[d['code']]['neto'] += d['neto']
+            rcf_by_code[d['code']]['iva'] += d['iva']
+
+        h.append(f'<tr class="total-row"><td colspan="2">TOTAL CSV</td>'
+                 f'<td>{fmt(rcf_csv["neto"])}</td>'
+                 f'<td>{fmt(rcf_csv["iva"])}</td></tr>')
+
+        # NC: DDJJ tiene negativos → abs para comparar
+        for code in sorted(set(list(rcf_alic.keys()) +
+                               list(rcf_by_code.keys()))):
+            alabel = self.IVA_CODE_LABEL.get(code, code)
+            ddjj_b = round(abs(rcf_alic.get(code, {}).get('base', 0)), 2)
+            ddjj_i = round(abs(rcf_alic.get(code, {}).get('amount', 0)), 2)
+            csv_b = round(rcf_by_code.get(code, {}).get('neto', 0), 2)
+            csv_i = round(rcf_by_code.get(code, {}).get('iva', 0), 2)
+            diff_b = round(ddjj_b - csv_b, 2)
+            diff_i = round(ddjj_i - csv_i, 2)
+            ok_b = abs(diff_b) <= 0.01
+            ok_i = abs(diff_i) <= 0.01
+            if not (ok_b and ok_i):
+                hay_dif = True
+            st_b = ('<span style="color:#27ae60">OK</span>' if ok_b
+                    else f'<span style="color:#c0392b;font-weight:bold">'
+                         f'{fmt(diff_b)}</span>')
+            st_i = ('<span style="color:#27ae60">OK</span>' if ok_i
+                    else f'<span style="color:#c0392b;font-weight:bold">'
+                         f'{fmt(diff_i)}</span>')
+            h.append(
+                f'<tr style="background:#f8f6fa">'
+                f'<td colspan="2">vs DDJJ IVA {alabel}</td>'
+                f'<td>{st_b} ({fmt(ddjj_b)})</td>'
+                f'<td>{st_i} ({fmt(ddjj_i)})</td></tr>')
+        h.append('</table>')
+
+        # ---- Resultado general ----
         if hay_dif:
             h.append(
                 '<p class="importante">Se detectaron diferencias entre '
-                'los totales de comprobantes (TXT) y la apertura (CSV). '
+                'los totales de comprobantes y la apertura CSV. '
                 'Revisar antes de presentar.</p>')
         else:
             h.append(
@@ -2249,10 +2332,17 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 f'{fmt(vals["iva"])};{fmt(vals["iva"])}'
             )
 
-        # Totales para cruce con comprobantes informados (TXT)
+        # Totales + detalle por concepto para cruce en wizard
         totals = {
             'neto': round(sum(v['neto'] for v in acum.values()), 2),
             'iva': round(sum(v['iva'] for v in acum.values()), 2),
+            # Por qué: detalle por (concepto, alícuota) para desglose
+            # bienes/servicios en el reporte de cruce del wizard
+            'detalle': [
+                {'concepto': k[0], 'code': k[1],
+                 'neto': round(v['neto'], 2), 'iva': round(v['iva'], 2)}
+                for k, v in sorted(acum.items())
+            ],
         }
         binary = self._encode_lines(lines) if len(lines) > 1 else False
         return binary, totals
@@ -2284,10 +2374,15 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 f'{concepto};{code};{fmt(vals["neto"])};{fmt(vals["iva"])}'
             )
 
-        # Totales para cruce con comprobantes informados (TXT)
+        # Totales + detalle por concepto para cruce en wizard
         totals = {
             'neto': round(sum(v['neto'] for v in acum.values()), 2),
             'iva': round(sum(v['iva'] for v in acum.values()), 2),
+            'detalle': [
+                {'concepto': k[0], 'code': k[1],
+                 'neto': round(v['neto'], 2), 'iva': round(v['iva'], 2)}
+                for k, v in sorted(acum.items())
+            ],
         }
         binary = self._encode_lines(lines) if len(lines) > 1 else False
         return binary, totals
