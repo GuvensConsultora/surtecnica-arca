@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+
+    <!-- Menú: Contabilidad > Informes > ARCA > Libro IVA Digital -->
+    <!-- Por qué: Se ubica en Informes porque es exportación de datos fiscales -->
+    <menuitem id="menu_arca_root"
+              name="ARCA"
+              parent="account.menu_finance_reports"
+              sequence="90"/>
+
+    <menuitem id="menu_libro_iva_digital"
+              name="Libro IVA Digital"
+              parent="menu_arca_root"
+              action="action_libro_iva_digital_wizard"
+              sequence="10"/>
+
+</odoo>

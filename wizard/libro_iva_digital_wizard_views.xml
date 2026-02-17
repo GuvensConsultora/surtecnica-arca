@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+
+    <record id="libro_iva_digital_wizard_form" model="ir.ui.view">
+        <field name="name">libro.iva.digital.wizard.form</field>
+        <field name="model">libro.iva.digital.wizard</field>
+        <field name="arch" type="xml">
+            <form string="Libro IVA Digital - ARCA">
+
+                <!-- Estado draft: selección de período -->
+                <group invisible="state != 'draft'">
+                    <group string="Período">
+                        <field name="date_from"/>
+                        <field name="date_to"/>
+                    </group>
+                </group>
+
+                <!-- Estado done: archivos + cuadratura -->
+                <div invisible="state != 'done'">
+                    <group string="Archivos TXT Generados">
+                        <field name="ventas_cbte_file" filename="ventas_cbte_name"/>
+                        <field name="ventas_cbte_name" invisible="1"/>
+                        <field name="ventas_alic_file" filename="ventas_alic_name"/>
+                        <field name="ventas_alic_name" invisible="1"/>
+                        <field name="compras_cbte_file" filename="compras_cbte_name"/>
+                        <field name="compras_cbte_name" invisible="1"/>
+                        <field name="compras_alic_file" filename="compras_alic_name"/>
+                        <field name="compras_alic_name" invisible="1"/>
+                        <field name="cuadratura_file" filename="cuadratura_name"/>
+                        <field name="cuadratura_name" invisible="1"/>
+                    </group>
+                    <group string="Cuadratura DDJJ F.2051">
+                        <field name="resumen" nolabel="1" colspan="2"
+                               style="font-family: monospace; white-space: pre;"/>
+                    </group>
+                </div>
+
+                <field name="state" invisible="1"/>
+
+                <footer>
+                    <button name="action_generar"
+                            string="Generar Archivos"
+                            type="object"
+                            class="btn-primary"
+                            invisible="state != 'draft'"/>
+                    <button name="action_descargar_zip"
+                            string="Descargar ZIP"
+                            type="object"
+                            class="btn-primary"
+                            invisible="state != 'done'"/>
+                    <button string="Cerrar"
+                            class="btn-secondary"
+                            special="cancel"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_libro_iva_digital_wizard" model="ir.actions.act_window">
+        <field name="name">Libro IVA Digital</field>
+        <field name="res_model">libro.iva.digital.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+    </record>
+
+</odoo>
