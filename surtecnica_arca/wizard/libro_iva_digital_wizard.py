@@ -995,6 +995,18 @@ class LibroIvaDigitalWizard(models.TransientModel):
             .ddjj-iva .det-table td:first-child { width: 55%; }
             .ddjj-iva .section { margin-bottom: 25px; }
             .ddjj-iva .info { color: #888; font-size: 11px; font-style: italic; margin-top: 15px; }
+            .ddjj-iva .step { background: #f8f6fa; border-left: 4px solid #875A7B;
+                              padding: 10px 15px; margin: 10px 0; }
+            .ddjj-iva .step-num { color: #875A7B; font-weight: bold; font-size: 13px;
+                                  margin-bottom: 5px; }
+            .ddjj-iva .step p { margin: 4px 0; }
+            .ddjj-iva .step ul { margin: 5px 0; padding-left: 20px; }
+            .ddjj-iva .step li { margin: 2px 0; }
+            .ddjj-iva .valor-llenar { color: #c0392b; font-weight: bold; }
+            .ddjj-iva .valor-cero { color: #aaa; }
+            .ddjj-iva .importante { color: #c0392b; font-weight: bold;
+                                    background: #fdf2f2; padding: 8px; margin: 8px 0;
+                                    border: 1px solid #f5c6cb; font-size: 11px; }
         </style>
         """
 
@@ -1143,10 +1155,132 @@ class LibroIvaDigitalWizard(models.TransientModel):
 
         h.append('</div>')
 
-        h.append('<p class="info">(*) Este reporte es una previsualización '
+        # ---- GUÍA PASO A PASO — CARGA EN PORTAL ARCA ----
+        # Por qué: el usuario necesita saber exactamente qué valores cargar
+        # en cada campo del portal F.2002 para que la DDJJ quede completa.
+        # Sin la "Apertura de otros conceptos", el Crédito Fiscal queda en 0.
+        h.append('<div class="section">')
+        h.append('<h2>GUIA PASO A PASO — CARGA EN PORTAL ARCA (F.2002)</h2>')
+
+        # Paso 1: Subir archivos
+        h.append('<div class="step">')
+        h.append('<div class="step-num">PASO 1 — Subir archivos TXT</div>')
+        h.append('<p>Menu: <strong>ARCA &rarr; Mis Comprobantes &rarr; '
+                 'Libro IVA Digital &rarr; Importar</strong></p>')
+        h.append('<p>Subir los 4 archivos TXT generados:</p>')
+        h.append('<ul>'
+                 '<li>LIBRO_IVA_DIGITAL_VENTAS_CBTE.txt</li>'
+                 '<li>LIBRO_IVA_DIGITAL_VENTAS_ALICUOTAS.txt</li>'
+                 '<li>LIBRO_IVA_DIGITAL_COMPRAS_CBTE.txt</li>'
+                 '<li>LIBRO_IVA_DIGITAL_COMPRAS_ALICUOTAS.txt</li>'
+                 '</ul>')
+        h.append('</div>')
+
+        # Paso 2: Validar
+        h.append('<div class="step">')
+        h.append('<div class="step-num">PASO 2 — Validar archivos</div>')
+        h.append('<p>Clic en <strong>"Validar"</strong>. Si hay errores, '
+                 'usar la pestaña "Errores ARCA" del wizard en Odoo para '
+                 'identificar los comprobantes con problema.</p>')
+        h.append('</div>')
+
+        # Paso 3: Apertura Ventas
+        v_apertura = [
+            ('Percepciones a no categorizados', vt.get('perc_no_categ', 0)),
+            ('Percepciones / Pagos a cta. Imp. Nacionales',
+             vt.get('perc_nacionales', 0)),
+            ('Percepcion de Ingresos Brutos', vt.get('perc_iibb', 0)),
+            ('Percepcion de Impuestos Municipales', vt.get('perc_mun', 0)),
+            ('Impuestos Internos', vt.get('imp_internos', 0)),
+            ('Otros Tributos', vt.get('otros_tributos', 0)),
+        ]
+        h.append('<div class="step">')
+        h.append('<div class="step-num">PASO 3 — Apertura de otros '
+                 'conceptos: VENTAS</div>')
+        h.append('<p>En <strong>"Comprobantes emitidos"</strong> &rarr; '
+                 'clic en <strong>"Apertura de otros conceptos"</strong>. '
+                 'Completar:</p>')
+        h.append('<table><tr><th>Campo en portal ARCA</th>'
+                 '<th>Valor a cargar</th></tr>')
+        for campo, valor in v_apertura:
+            css_cls = 'valor-llenar' if abs(valor) > 0.005 else 'valor-cero'
+            h.append(f'<tr><td>{campo}</td>'
+                     f'<td class="{css_cls}">{fmt(valor)}</td></tr>')
+        h.append('</table>')
+        h.append('</div>')
+
+        # Paso 4: Apertura Compras
+        c_apertura = [
+            ('Percepciones de IVA', ct.get('perc_iva', 0)),
+            ('Percepciones / Pagos a cta. Imp. Nacionales',
+             ct.get('perc_nacionales', 0)),
+            ('Percepcion de Ingresos Brutos', ct.get('perc_iibb', 0)),
+            ('Percepcion de Impuestos Municipales', ct.get('perc_mun', 0)),
+            ('Impuestos Internos', ct.get('imp_internos', 0)),
+            ('Otros Tributos', ct.get('otros_tributos', 0)),
+        ]
+        h.append('<div class="step">')
+        h.append('<div class="step-num">PASO 4 — Apertura de otros '
+                 'conceptos: COMPRAS</div>')
+        h.append('<p>En <strong>"Comprobantes recibidos"</strong> &rarr; '
+                 'clic en <strong>"Apertura de otros conceptos"</strong>. '
+                 'Completar:</p>')
+        h.append('<table><tr><th>Campo en portal ARCA</th>'
+                 '<th>Valor a cargar</th></tr>')
+        for campo, valor in c_apertura:
+            css_cls = 'valor-llenar' if abs(valor) > 0.005 else 'valor-cero'
+            h.append(f'<tr><td>{campo}</td>'
+                     f'<td class="{css_cls}">{fmt(valor)}</td></tr>')
+        h.append('</table>')
+        h.append('<p class="importante">IMPORTANTE: Si no se completa este '
+                 'paso, el Credito Fiscal aparecera en 0,00 en la '
+                 'determinacion del impuesto.</p>')
+        h.append('</div>')
+
+        # Paso 5: Verificar determinación
+        h.append('<div class="step">')
+        h.append('<div class="step-num">PASO 5 — Verificar Determinacion '
+                 'del Impuesto</div>')
+        h.append('<p>El portal debe mostrar automaticamente:</p>')
+        h.append('<table class="det-table">')
+        h.append(f'<tr><td>Debito Fiscal</td><td>{fmt(debito)}</td></tr>')
+        h.append(f'<tr><td>(-) Credito Fiscal</td>'
+                 f'<td>{fmt(credito)}</td></tr>')
+        h.append(f'<tr class="subtotal-row"><td>Subtotal</td>'
+                 f'<td>{fmt(subtotal)}</td></tr>')
+        if abs(perc_iva) > 0.005:
+            h.append(f'<tr><td>(-) Percepciones IVA sufridas</td>'
+                     f'<td>{fmt(perc_iva)}</td></tr>')
+        if saldo > 0.005:
+            h.append(f'<tr class="total-row"><td>Saldo a pagar</td>'
+                     f'<td class="saldo-pagar">{fmt(saldo)}</td></tr>')
+        elif saldo < -0.005:
+            h.append(f'<tr class="total-row"><td>Saldo a favor</td>'
+                     f'<td class="saldo-favor">{fmt(abs(saldo))}</td></tr>')
+        else:
+            h.append('<tr class="total-row"><td>Sin saldo</td>'
+                     '<td>0,00</td></tr>')
+        h.append('</table>')
+        h.append('<p><strong>Agregar manualmente si corresponde:</strong></p>')
+        h.append('<ul>'
+                 '<li>Retenciones IVA sufridas</li>'
+                 '<li>Saldo a favor de periodos anteriores</li>'
+                 '</ul>')
+        h.append('</div>')
+
+        # Paso 6: Presentar
+        h.append('<div class="step">')
+        h.append('<div class="step-num">PASO 6 — Presentar DDJJ</div>')
+        h.append('<p>Verificar que los totales coincidan con este reporte '
+                 'y hacer clic en <strong>"Presentar"</strong>.</p>')
+        h.append('</div>')
+
+        h.append('</div>')  # close guia section
+
+        h.append('<p class="info">(*) Este reporte es una previsualizacion '
                  'orientativa. Verificar contra el portal ARCA antes de presentar. '
                  'No incluye retenciones IVA sufridas ni saldo a favor de '
-                 'períodos anteriores.</p>')
+                 'periodos anteriores.</p>')
         h.append('</div>')
         return '\n'.join(h)
 
@@ -1213,6 +1347,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
         )
         # Hoja 3: Determinación del Impuesto
         self._excel_sheet_determinacion(
+            wb, fmts, v_data, c_data, empresa, cuit, periodo,
+        )
+        # Hoja 4: Guía paso a paso para carga en portal ARCA
+        self._excel_sheet_guia_portal(
             wb, fmts, v_data, c_data, empresa, cuit, periodo,
         )
 
@@ -1400,6 +1538,177 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 ws.write(row, 1, emitido, fmts['money'])
                 ws.write(row, 2, recibido, fmts['money'])
                 row += 1
+
+    def _excel_sheet_guia_portal(self, wb, fmts, v_data, c_data,
+                                 empresa, cuit, periodo):
+        """Escribe la hoja Guía Carga Portal con el paso a paso.
+
+        Por qué: El usuario necesita saber exactamente qué valores cargar
+        en cada campo del portal ARCA (F.2002). Sin la "Apertura de otros
+        conceptos", el Crédito Fiscal aparece en 0,00.
+        """
+        ws = wb.add_worksheet('Guia Carga Portal')
+        ws.set_column('A:A', 50)
+        ws.set_column('B:B', 20)
+
+        vt = v_data['totales']
+        ct = c_data['totales']
+        debito = vt['iva']
+        credito = ct['iva']
+        subtotal = debito - credito
+        perc_iva = ct.get('perc_iva', 0)
+        saldo = subtotal - perc_iva
+
+        # Formatos específicos de esta hoja
+        step_fmt = wb.add_format({
+            'bold': True, 'font_size': 12, 'font_color': '#875A7B',
+            'bottom': 1, 'bottom_color': '#875A7B',
+        })
+        highlight_fmt = wb.add_format({
+            'num_format': '#,##0.00', 'border': 1, 'align': 'right',
+            'font_color': '#c0392b', 'bold': True,
+        })
+        warn_fmt = wb.add_format({
+            'bold': True, 'font_color': '#c0392b', 'text_wrap': True,
+        })
+        wrap_fmt = wb.add_format({'text_wrap': True})
+
+        row = 0
+        ws.write(row, 0,
+                 f'GUIA CARGA PORTAL ARCA (F.2002) | Periodo {periodo}',
+                 fmts['title'])
+        row += 1
+        ws.write(row, 0, f'{empresa} | CUIT: {cuit}')
+        row += 2
+
+        # ---- PASO 1 ----
+        ws.write(row, 0, 'PASO 1 — Subir archivos TXT', step_fmt)
+        row += 1
+        ws.write(row, 0,
+                 'Menu: ARCA > Mis Comprobantes > Libro IVA Digital > Importar',
+                 wrap_fmt)
+        row += 1
+        for fname in [
+            'LIBRO_IVA_DIGITAL_VENTAS_CBTE.txt',
+            'LIBRO_IVA_DIGITAL_VENTAS_ALICUOTAS.txt',
+            'LIBRO_IVA_DIGITAL_COMPRAS_CBTE.txt',
+            'LIBRO_IVA_DIGITAL_COMPRAS_ALICUOTAS.txt',
+        ]:
+            ws.write(row, 0, f'  {fname}')
+            row += 1
+        row += 1
+
+        # ---- PASO 2 ----
+        ws.write(row, 0, 'PASO 2 — Validar archivos', step_fmt)
+        row += 1
+        ws.write(row, 0,
+                 'Clic en "Validar". Si hay errores, usar pestaña '
+                 '"Errores ARCA" del wizard en Odoo.', wrap_fmt)
+        row += 2
+
+        # ---- PASO 3: Apertura Ventas ----
+        ws.write(row, 0,
+                 'PASO 3 — Apertura de otros conceptos: VENTAS', step_fmt)
+        row += 1
+        ws.write(row, 0,
+                 'En "Comprobantes emitidos" > clic "Apertura de otros '
+                 'conceptos". Completar:', wrap_fmt)
+        row += 1
+        ws.write(row, 0, 'Campo en portal ARCA', fmts['header'])
+        ws.write(row, 1, 'Valor a cargar', fmts['header'])
+        row += 1
+
+        v_apertura = [
+            ('Percepciones a no categorizados', vt.get('perc_no_categ', 0)),
+            ('Percepciones / Pagos a cta. Imp. Nacionales',
+             vt.get('perc_nacionales', 0)),
+            ('Percepcion de Ingresos Brutos', vt.get('perc_iibb', 0)),
+            ('Percepcion de Impuestos Municipales', vt.get('perc_mun', 0)),
+            ('Impuestos Internos', vt.get('imp_internos', 0)),
+            ('Otros Tributos', vt.get('otros_tributos', 0)),
+        ]
+        for campo, valor in v_apertura:
+            ws.write(row, 0, campo, fmts['text'])
+            fmt_val = highlight_fmt if abs(valor) > 0.005 else fmts['money']
+            ws.write(row, 1, valor, fmt_val)
+            row += 1
+        row += 1
+
+        # ---- PASO 4: Apertura Compras ----
+        ws.write(row, 0,
+                 'PASO 4 — Apertura de otros conceptos: COMPRAS', step_fmt)
+        row += 1
+        ws.write(row, 0,
+                 'En "Comprobantes recibidos" > clic "Apertura de otros '
+                 'conceptos". Completar:', wrap_fmt)
+        row += 1
+        ws.write(row, 0, 'Campo en portal ARCA', fmts['header'])
+        ws.write(row, 1, 'Valor a cargar', fmts['header'])
+        row += 1
+
+        c_apertura = [
+            ('Percepciones de IVA', ct.get('perc_iva', 0)),
+            ('Percepciones / Pagos a cta. Imp. Nacionales',
+             ct.get('perc_nacionales', 0)),
+            ('Percepcion de Ingresos Brutos', ct.get('perc_iibb', 0)),
+            ('Percepcion de Impuestos Municipales', ct.get('perc_mun', 0)),
+            ('Impuestos Internos', ct.get('imp_internos', 0)),
+            ('Otros Tributos', ct.get('otros_tributos', 0)),
+        ]
+        for campo, valor in c_apertura:
+            ws.write(row, 0, campo, fmts['text'])
+            fmt_val = highlight_fmt if abs(valor) > 0.005 else fmts['money']
+            ws.write(row, 1, valor, fmt_val)
+            row += 1
+        ws.write(row, 0,
+                 'IMPORTANTE: Si no se completa este paso, el Credito '
+                 'Fiscal aparecera en 0,00.', warn_fmt)
+        row += 2
+
+        # ---- PASO 5: Verificar Determinación ----
+        ws.write(row, 0,
+                 'PASO 5 — Verificar Determinacion del Impuesto', step_fmt)
+        row += 1
+        ws.write(row, 0, 'El portal debe mostrar automaticamente:')
+        row += 1
+
+        det_items = [
+            ('Debito Fiscal', debito),
+            ('(-) Credito Fiscal', credito),
+            ('Subtotal', subtotal),
+        ]
+        if abs(perc_iva) > 0.005:
+            det_items.append(('(-) Percepciones IVA sufridas', perc_iva))
+
+        if saldo > 0.005:
+            det_items.append(('SALDO A PAGAR', saldo))
+        elif saldo < -0.005:
+            det_items.append(('SALDO A FAVOR', abs(saldo)))
+        else:
+            det_items.append(('SIN SALDO', 0.0))
+
+        for label, valor in det_items:
+            is_total = label.startswith('SALDO') or label == 'SIN SALDO'
+            ws.write(row, 0, label,
+                     fmts['total_text'] if is_total else fmts['text'])
+            ws.write(row, 1, valor,
+                     fmts['total_money'] if is_total else fmts['money'])
+            row += 1
+        row += 1
+
+        ws.write(row, 0, 'Agregar manualmente si corresponde:', wrap_fmt)
+        row += 1
+        ws.write(row, 0, '  - Retenciones IVA sufridas')
+        row += 1
+        ws.write(row, 0, '  - Saldo a favor de periodos anteriores')
+        row += 2
+
+        # ---- PASO 6: Presentar ----
+        ws.write(row, 0, 'PASO 6 — Presentar DDJJ', step_fmt)
+        row += 1
+        ws.write(row, 0,
+                 'Verificar que los totales coincidan con este reporte '
+                 'y hacer clic en "Presentar".', wrap_fmt)
 
     # -------------------------------------------------------------------------
     # UTILIDADES
