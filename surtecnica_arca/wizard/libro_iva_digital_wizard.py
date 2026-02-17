@@ -610,7 +610,11 @@ class LibroIvaDigitalWizard(models.TransientModel):
         }
 
         # Paso 1: Clasificar líneas de producto → no_gravado / exento
-        for line in move.invoice_line_ids.filtered(lambda l: not l.display_type):
+        # Por qué: En Odoo 17 display_type='product' para líneas de factura
+        # (no False). Filtrar por exclusión de sección/nota.
+        for line in move.invoice_line_ids.filtered(
+            lambda l: l.display_type not in ('line_section', 'line_note')
+        ):
             line_class = self._classify_line_iva(line)
             if line_class == 'no_gravado':
                 result['no_gravado'] += line.price_subtotal * sign
@@ -1868,7 +1872,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
         result = {}
 
         for line in move.invoice_line_ids.filtered(
-            lambda l: not l.display_type
+            lambda l: l.display_type not in ('line_section', 'line_note')
         ):
             # Concepto: bienes ('1') si producto físico, servicios ('3') si no
             product = line.product_id
