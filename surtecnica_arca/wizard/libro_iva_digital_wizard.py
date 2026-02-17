@@ -2,6 +2,7 @@
 
 import base64
 import io
+import json
 import logging
 import zipfile
 from datetime import date
@@ -51,6 +52,23 @@ class LibroIvaDigitalWizard(models.TransientModel):
     # en el portal ARCA (F.2002), para verificación antes de presentar
     ddjj_iva_html = fields.Html(
         string='DDJJ IVA', readonly=True, sanitize=False,
+    )
+
+    # Por qué: Mapeo JSON {línea_TXT: datos_comprobante} para identificar
+    # rápidamente qué factura corresponde a cada error de validación ARCA
+    line_map_json = fields.Text()
+
+    # Procesador de errores ARCA
+    errores_arca_tipo = fields.Selection([
+        ('compras', 'Compras'),
+        ('ventas', 'Ventas'),
+    ], string='Archivo con error', default='compras')
+    errores_arca_csv = fields.Text(
+        string='Errores ARCA (CSV)',
+        help='Pegue aquí el contenido del CSV de errores de validación de ARCA',
+    )
+    errores_arca_html = fields.Html(
+        string='Resultado', readonly=True, sanitize=False,
     )
 
     # -------------------------------------------------------------------------
@@ -105,13 +123,20 @@ class LibroIvaDigitalWizard(models.TransientModel):
         ventas = self._get_moves('out')
         compras = self._get_moves('in')
 
-        # Generar líneas para cada archivo
-        v_cbte, v_alic = self._procesar_moves(ventas, 'ventas')
-        c_cbte, c_alic = self._procesar_moves(compras, 'compras')
+        # Generar líneas para cada archivo + mapeo de líneas
+        v_cbte, v_alic, v_cbte_map, v_alic_map = self._procesar_moves(
+            ventas, 'ventas')
+        c_cbte, c_alic, c_cbte_map, c_alic_map = self._procesar_moves(
+            compras, 'compras')
 
         # Codificar archivos
         vals = {
             'state': 'done',
+            # Mapeo línea TXT → comprobante para cruzar errores ARCA
+            'line_map_json': json.dumps({
+                'ventas_cbte': v_cbte_map, 'ventas_alic': v_alic_map,
+                'compras_cbte': c_cbte_map, 'compras_alic': c_alic_map,
+            }),
             'ventas_cbte_file': self._encode_lines(v_cbte),
             'ventas_cbte_name': 'LIBRO_IVA_DIGITAL_VENTAS_CBTE.txt',
             'ventas_alic_file': self._encode_lines(v_alic),
@@ -176,6 +201,126 @@ class LibroIvaDigitalWizard(models.TransientModel):
         }
 
     # -------------------------------------------------------------------------
+    # PROCESAMIENTO DE ERRORES ARCA
+    # -------------------------------------------------------------------------
+
+    def action_procesar_errores(self):
+        """Cruza el CSV de errores ARCA con el mapeo de líneas del TXT.
+
+        Por qué: ARCA devuelve errores referenciando nro de línea del archivo
+        TXT. Sin un índice, el usuario tiene que contar líneas manualmente.
+        Este método parsea el CSV, busca el comprobante de cada línea y
+        muestra nombre, proveedor, CUIT e importe con link al asiento.
+        """
+        self.ensure_one()
+        csv_text = self.errores_arca_csv
+        if not csv_text:
+            raise UserError(
+                'Pegue el contenido del CSV de errores de ARCA.')
+
+        tipo = self.errores_arca_tipo or 'compras'
+        line_map = json.loads(self.line_map_json or '{}')
+        cbte_map = line_map.get(f'{tipo}_cbte', {})
+        alic_map = line_map.get(f'{tipo}_alic', {})
+
+        # Parsear CSV semicolon-separated de ARCA
+        rows = []
+        for line in csv_text.strip().split('\n'):
+            # Saltar encabezado
+            if 'Num.' in line or 'num.' in line or not line.strip():
+                continue
+            parts = line.split(';')
+            if len(parts) < 3:
+                continue
+            cbte_line = parts[0].strip().strip('"')
+            alic_line = parts[1].strip().strip('"')
+            error = ';'.join(parts[2:]).strip().strip('"')
+
+            # Buscar en el mapa de líneas
+            cbte_info = cbte_map.get(cbte_line, {})
+            alic_info = alic_map.get(alic_line, {})
+            # Preferir datos de cbte, fallback a alic
+            info = cbte_info or alic_info
+
+            rows.append({
+                'cbte_line': cbte_line,
+                'alic_line': alic_line,
+                'error': error,
+                'id': info.get('id', ''),
+                'name': info.get('name', '—'),
+                'partner': info.get('partner', '—'),
+                'cuit': info.get('cuit', ''),
+                'total': info.get('total', ''),
+                'alicuota': alic_info.get('alicuota', ''),
+            })
+
+        self.write({'errores_arca_html': self._render_errores_html(rows)})
+
+        return {
+            'type': 'ir.actions.act_window',
+            'res_model': self._name,
+            'res_id': self.id,
+            'view_mode': 'form',
+            'target': 'new',
+        }
+
+    def _render_errores_html(self, rows):
+        """Renderiza tabla HTML con errores ARCA enriquecidos."""
+        fmt = self._fmt_money
+        css = """
+        <style>
+            .arca-err { font-family: Arial, sans-serif; font-size: 12px; }
+            .arca-err h3 { color: #875A7B; }
+            .arca-err table { width: 100%; border-collapse: collapse; }
+            .arca-err th { background-color: #875A7B; color: white;
+                           padding: 6px 8px; font-size: 11px; text-align: left; }
+            .arca-err td { padding: 5px 8px; border-bottom: 1px solid #e8e8e8;
+                           font-size: 11px; }
+            .arca-err .err-text { color: #c0392b; font-weight: bold; }
+            .arca-err a { color: #875A7B; text-decoration: none; font-weight: bold; }
+            .arca-err a:hover { text-decoration: underline; }
+            .arca-err .line-num { text-align: center; color: #666; }
+            .arca-err .amount { text-align: right; }
+        </style>
+        """
+        h = [css, '<div class="arca-err">']
+        h.append(f'<h3>Errores de validación ARCA — {len(rows)} encontrados</h3>')
+        h.append(
+            '<table><tr>'
+            '<th>Lín. Cbte</th><th>Lín. IVA</th>'
+            '<th>Comprobante</th><th>Proveedor / Cliente</th>'
+            '<th>CUIT</th><th>Importe</th><th>Error</th>'
+            '</tr>'
+        )
+        for r in rows:
+            # Link al asiento en Odoo
+            if r['id']:
+                name_html = (
+                    f'<a href="/web#id={r["id"]}'
+                    f'&model=account.move&view_type=form" '
+                    f'target="_blank">{r["name"]}</a>'
+                )
+            else:
+                name_html = r['name']
+
+            total_str = fmt(r['total']) if isinstance(r['total'], (int, float)) else ''
+            alic_str = f' ({r["alicuota"]})' if r['alicuota'] else ''
+
+            h.append(
+                f'<tr>'
+                f'<td class="line-num">{r["cbte_line"]}</td>'
+                f'<td class="line-num">{r["alic_line"]}</td>'
+                f'<td>{name_html}{alic_str}</td>'
+                f'<td>{r["partner"]}</td>'
+                f'<td>{r["cuit"]}</td>'
+                f'<td class="amount">{total_str}</td>'
+                f'<td class="err-text">{r["error"]}</td>'
+                f'</tr>'
+            )
+        h.append('</table></div>')
+        return '\n'.join(h)
+
+    # -------------------------------------------------------------------------
     # BÚSQUEDA DE MOVES
     # -------------------------------------------------------------------------
 
@@ -201,29 +346,58 @@ class LibroIvaDigitalWizard(models.TransientModel):
     # -------------------------------------------------------------------------
 
     def _procesar_moves(self, moves, tipo):
-        """Procesa moves y genera líneas de cabecera + alícuotas.
+        """Procesa moves y genera líneas de cabecera + alícuotas + mapeo.
 
         Args:
             tipo: 'ventas' o 'compras' (determina el formato de salida).
         Returns:
-            tuple: (lista_cabecera, lista_alicuotas)
+            tuple: (lista_cabecera, lista_alicuotas, mapa_cbte, mapa_alic)
+            Los mapas vinculan nro de línea TXT → datos del comprobante,
+            para cruzar con errores de validación de ARCA.
         """
         cbte_lines = []
         alic_lines = []
+        cbte_map = {}
+        alic_map = {}
         errores = []
 
         for move in moves:
             try:
                 data = self._extract_move_data(move)
+                partner = move.commercial_partner_id
+                # Línea cabecera: nro 1-based
+                cbte_num = len(cbte_lines) + 1
 
                 if tipo == 'ventas':
                     cbte_lines.append(self._fmt_ventas_cbte(move, data))
                     for alic in data['iva_alicuotas']:
+                        alic_num = len(alic_lines) + 1
                         alic_lines.append(self._fmt_ventas_alic(move, alic))
+                        alic_map[str(alic_num)] = {
+                            'name': move.name, 'id': move.id,
+                            'partner': partner.name or '',
+                            'alicuota': self.IVA_CODE_LABEL.get(
+                                alic['code'], alic['code']),
+                        }
                 else:
                     cbte_lines.append(self._fmt_compras_cbte(move, data))
                     for alic in data['iva_alicuotas']:
+                        alic_num = len(alic_lines) + 1
                         alic_lines.append(self._fmt_compras_alic(move, alic))
+                        alic_map[str(alic_num)] = {
+                            'name': move.name, 'id': move.id,
+                            'partner': partner.name or '',
+                            'alicuota': self.IVA_CODE_LABEL.get(
+                                alic['code'], alic['code']),
+                        }
+
+                cbte_map[str(cbte_num)] = {
+                    'id': move.id,
+                    'name': move.name,
+                    'partner': partner.name or '',
+                    'cuit': partner.vat or '',
+                    'total': round(data['total'], 2),
+                }
             except Exception as e:
                 errores.append(f'{move.name}: {str(e)}')
 
@@ -231,7 +405,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
             raise UserError(
                 'Errores al procesar comprobantes:\n' + '\n'.join(errores)
             )
-        return cbte_lines, alic_lines
+        return cbte_lines, alic_lines, cbte_map, alic_map
 
     # -------------------------------------------------------------------------
     # EXTRACCIÓN DE DATOS DE UN MOVE

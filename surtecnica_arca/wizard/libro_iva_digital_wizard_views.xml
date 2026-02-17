@@ -40,6 +40,24 @@
                         </group>
                     </page>
 
+                    <!-- Pestaña 3: Procesador de errores ARCA -->
+                    <page string="Errores ARCA" name="page_errores">
+                        <group>
+                            <field name="errores_arca_tipo"/>
+                            <field name="errores_arca_csv"
+                                   placeholder="Pegue aquí el contenido del CSV de errores de ARCA..."
+                                   nolabel="1" colspan="2"/>
+                        </group>
+                        <div>
+                            <button name="action_procesar_errores"
+                                    string="Identificar Comprobantes"
+                                    type="object"
+                                    class="btn-primary"/>
+                        </div>
+                        <field name="errores_arca_html" nolabel="1"/>
+                        <field name="line_map_json" invisible="1"/>
+                    </page>
+
                 </notebook>
 
                 <field name="state" invisible="1"/>
