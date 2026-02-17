@@ -77,6 +77,15 @@ class LibroIvaDigitalWizard(models.TransientModel):
         '4': '10,50%', '5': '21%', '6': '27%',
     }
 
+    # Mapeo inverso: código AFIP → tasa porcentual
+    # Por qué: ARCA valida que IVA = base × alícuota exactamente.
+    # Se usa para recalcular el IVA y evitar diferencias de centavos
+    # por redondeo cuando Odoo suma IVA por línea de producto.
+    IVA_CODE_RATE = {
+        '3': 0.0, '9': 2.5, '8': 5.0,
+        '4': 10.5, '5': 21.0, '6': 27.0,
+    }
+
     # -------------------------------------------------------------------------
     # ACCIÓN PRINCIPAL
     # -------------------------------------------------------------------------
@@ -223,7 +232,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
         sign = -1 if move.move_type in ('out_refund', 'in_refund') else 1
 
         result = {
-            'total': move.amount_total * sign,
+            'total': 0.0,  # Se recalcula en Paso 4 como suma de partes
             'no_gravado': 0.0,
             'exento': 0.0,
             'perc_no_categ': 0.0,      # Ventas campo 11
@@ -264,7 +273,31 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 cat = self._classify_non_iva_tax(tax.tax_group_id)
                 result[cat] += abs(line.balance) * sign
 
+        # Paso 3: Ajustar IVA para consistencia matemática con ARCA
+        # Por qué: ARCA valida que impuesto = base × alícuota exactamente.
+        # Odoo calcula IVA por línea de producto y suma, generando diferencias
+        # de centavos. Recalculamos para que la validación no falle.
+        for code, alic in iva_by_code.items():
+            rate = self.IVA_CODE_RATE.get(code)
+            if rate is not None and rate > 0:
+                alic['amount'] = round(alic['base'] * rate / 100, 2)
+
         result['iva_alicuotas'] = list(iva_by_code.values())
+
+        # Paso 4: Computar total como suma de partes
+        # Por qué: ARCA valida que Total = suma de todos los campos de importe.
+        # Usar move.amount_total genera diferencias cuando algún importe no se
+        # clasifica o hay redondeo. Calculando desde las partes, la suma siempre cuadra.
+        gravado = sum(a['base'] for a in result['iva_alicuotas'])
+        iva = sum(a['amount'] for a in result['iva_alicuotas'])
+        result['total'] = (
+            gravado + iva
+            + result['no_gravado'] + result['exento']
+            + result['perc_no_categ'] + result['perc_iva']
+            + result['perc_nacionales'] + result['perc_iibb']
+            + result['perc_mun'] + result['imp_internos']
+            + result['otros_tributos']
+        )
         return result
 
     def _classify_line_iva(self, line):
@@ -286,14 +319,34 @@ class LibroIvaDigitalWizard(models.TransientModel):
     def _get_vat_afip_code(self, tax):
         """Obtiene el código AFIP de alícuota IVA de un impuesto.
 
-        Por qué: Intenta primero el campo estándar l10n_ar_vat_afip_code,
-        luego fallback por monto del impuesto.
+        Por qué: Intenta primero el campo estándar l10n_ar_vat_afip_code.
+        El fallback por monto SOLO se aplica si el tax group NO tiene
+        l10n_ar_tribute_afip_code y NO parece percepción/retención por nombre.
+        Bug anterior: percepciones/retenciones con tasa coincidente (5%, 21%)
+        se clasificaban como IVA gravado, inflando el neto gravado con su
+        tax_base_amount (importe total de la factura).
         """
         tax_group = tax.tax_group_id
+
+        # Paso 1: código IVA explícito → es IVA seguro
         code = getattr(tax_group, 'l10n_ar_vat_afip_code', False)
         if code:
             return code
-        # Fallback: mapear por monto
+
+        # Paso 2: si tiene código tributo AFIP → NO es IVA (percepción/retención)
+        tribute_code = getattr(tax_group, 'l10n_ar_tribute_afip_code', None)
+        if tribute_code:
+            return False
+
+        # Paso 3: descartar por nombre del grupo (percepciones, retenciones, IIBB, etc.)
+        name = (tax_group.name or '').lower()
+        if any(k in name for k in (
+            'percep', 'reten', 'withhold', 'iibb', 'ingr', 'brut',
+            'munic', 'intern', 'ganan',
+        )):
+            return False
+
+        # Paso 4: fallback por monto solo si no se descartó como tributo
         return self.IVA_AMOUNT_MAP.get(abs(tax.amount), False)
 
     def _classify_non_iva_tax(self, tax_group):

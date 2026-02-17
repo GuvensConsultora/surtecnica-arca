@@ -218,6 +218,46 @@ surtecnica_arca/
 4. Descargar los 4 TXT individualmente o el ZIP completo
 5. Cargar los archivos en la página de ARCA para la DDJJ de IVA
 
+## Reporte DDJJ IVA (F.2002)
+
+Al generar los archivos, la primera pestaña muestra una previsualización de cómo debe quedar cargada la DDJJ IVA en el portal ARCA:
+
+- **Comprobantes Emitidos** — agrupados por tipo (FA-A, FA-B, NC-A, etc.) con cantidad, neto gravado, débito fiscal, no gravado, exento y total
+- **Detalle Alícuotas IVA - Débito Fiscal** — por alícuota (0%, 5%, 10.5%, 21%, 27%) con base imponible y débito
+- **Comprobantes Recibidos** — misma estructura con crédito fiscal
+- **Detalle Alícuotas IVA - Crédito Fiscal** — por alícuota con base y crédito
+- **Determinación del Impuesto** — débito - crédito = subtotal, percepciones IVA sufridas, saldo a pagar/favor
+- **Otros Tributos** (informativo) — IIBB, municipales, nacionales, internos
+
+## Bugs corregidos
+
+### Percepciones clasificadas como IVA gravado (v1.1.0)
+
+**Problema:** `_get_vat_afip_code()` tenía un fallback que mapeaba cualquier impuesto por su tasa porcentual (ej: 5% → código '8', 21% → código '5'). Cuando una percepción IIBB al 5% o una retención IVA al 21% no tenía `l10n_ar_vat_afip_code` en su tax group, el fallback la clasificaba como IVA gravado. Esto agregaba su `tax_base_amount` (el total de la factura) como neto gravado, inflando enormemente los importes.
+
+**Síntoma en ARCA:** `El Importe Total (242) no coincide con la suma de los demás montos (360580)` — diferencias de órdenes de magnitud.
+
+**Fix:** Antes del fallback por monto, verificar:
+1. Si el tax group tiene `l10n_ar_tribute_afip_code` → no es IVA
+2. Si el nombre del grupo contiene "percep", "reten", "iibb", "munic", etc. → no es IVA
+3. Solo entonces usar el fallback por tasa
+
+### Total no coincide con suma de partes (v1.1.0)
+
+**Problema:** El campo Importe Total usaba `move.amount_total` de Odoo, pero los demás campos (no gravado, exento, percepciones, etc.) se computaban desde las tax lines individuales. Cualquier diferencia de clasificación o redondeo generaba inconsistencia.
+
+**Síntoma en ARCA:** `El Importe Total (1231730.44) no coincide con la suma de los demás montos (1201930.51)`
+
+**Fix:** Calcular el total como suma de todas las partes: `total = gravado + iva + no_gravado + exento + percepciones + otros_tributos`. ARCA valida que `Total = suma de campos`, así que calculándolo desde los mismos campos la validación siempre pasa.
+
+### IVA liquidado no coincide con alícuota × base (v1.1.0)
+
+**Problema:** Odoo calcula IVA por línea de producto y luego suma. Para un comprobante con varias líneas, `sum(round(línea × 21%))` puede diferir de `round(sum(líneas) × 21%)` por centavos.
+
+**Síntoma en ARCA:** `Para la alícuota 21% el impuesto liquidado debe ser igual al 21% del importe neto gravado a dicha alícuota`
+
+**Fix:** Después de agregar las bases por alícuota, recalcular: `amount = round(base × rate / 100, 2)`. ARCA exige consistencia matemática exacta.
+
 ## Licencia
 
 LGPL-3
