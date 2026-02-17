@@ -144,17 +144,19 @@ Wizard: Seleccionar período (desde/hasta)
 _get_moves('out')  →  Facturas de venta posted con doc fiscal
 _get_moves('in')   →  Facturas de compra posted con doc fiscal
         ↓
-_extract_move_data(move)  →  Clasifica líneas e impuestos:
-  - invoice_line_ids → gravado / exento / no_gravado
-  - tax lines con l10n_ar_vat_afip_code → IVA alícuotas
-  - tax lines sin código IVA → percepciones / otros
+_procesar_moves(moves, tipo)  →  Por cada move:
+  ├─ _extract_move_data(move)  →  Clasifica líneas e impuestos:
+  │   ├─ Paso 1: invoice_line_ids → gravado / exento / no_gravado
+  │   ├─ Paso 2: tax lines → IVA alícuotas o percepciones/otros
+  │   ├─ Paso 3: Ajustar IVA = base × alícuota (consistencia ARCA)
+  │   └─ Paso 4: Total = suma de partes (consistencia ARCA)
+  ├─ _fmt_*_cbte()  →  Línea posición fija cabecera
+  ├─ _fmt_*_alic()  →  Línea posición fija alícuota (una por alícuota)
+  └─ Mapeo: nro línea TXT → move (para cruzar errores ARCA)
         ↓
-_fmt_ventas_cbte()  →  Línea posición fija 266 chars
-_fmt_ventas_alic()  →  Línea posición fija 62 chars (una por alícuota)
-_fmt_compras_cbte() →  Línea posición fija 325 chars
-_fmt_compras_alic() →  Línea posición fija 84 chars (una por alícuota)
+4 archivos TXT + mapeo JSON + DDJJ HTML
         ↓
-4 archivos TXT + ZIP para descarga
+ZIP: 4 TXT + PDF + Excel
 ```
 
 ### Clasificación de Impuestos
@@ -215,12 +217,11 @@ surtecnica_arca/
 1. **Contabilidad > Informes > ARCA > Libro IVA Digital**
 2. Seleccionar período (desde / hasta)
 3. Click **Generar Archivos**
-4. Descargar los 4 TXT individualmente o el ZIP completo
-5. Cargar los archivos en la página de ARCA para la DDJJ de IVA
+4. El wizard muestra 3 pestañas:
 
-## Reporte DDJJ IVA (F.2002)
+### Pestaña "DDJJ IVA"
 
-Al generar los archivos, la primera pestaña muestra una previsualización de cómo debe quedar cargada la DDJJ IVA en el portal ARCA:
+Previsualización de cómo debe quedar cargada la DDJJ IVA en el portal ARCA (F.2002):
 
 - **Comprobantes Emitidos** — agrupados por tipo (FA-A, FA-B, NC-A, etc.) con cantidad, neto gravado, débito fiscal, no gravado, exento y total
 - **Detalle Alícuotas IVA - Débito Fiscal** — por alícuota (0%, 5%, 10.5%, 21%, 27%) con base imponible y débito
@@ -228,6 +229,32 @@ Al generar los archivos, la primera pestaña muestra una previsualización de c�
 - **Detalle Alícuotas IVA - Crédito Fiscal** — por alícuota con base y crédito
 - **Determinación del Impuesto** — débito - crédito = subtotal, percepciones IVA sufridas, saldo a pagar/favor
 - **Otros Tributos** (informativo) — IIBB, municipales, nacionales, internos
+
+### Pestaña "Archivos"
+
+- Resumen del procesamiento (empresa, CUIT, cantidad de comprobantes)
+- Descarga individual de los 4 archivos TXT
+- Botón **Descargar ZIP** que incluye:
+
+| Archivo | Descripción |
+|---------|-------------|
+| `LIBRO_IVA_DIGITAL_VENTAS_CBTE.txt` | Cabecera ventas (posición fija) |
+| `LIBRO_IVA_DIGITAL_VENTAS_ALICUOTAS.txt` | Alícuotas ventas |
+| `LIBRO_IVA_DIGITAL_COMPRAS_CBTE.txt` | Cabecera compras |
+| `LIBRO_IVA_DIGITAL_COMPRAS_ALICUOTAS.txt` | Alícuotas compras |
+| `DDJJ_IVA_YYYYMM.pdf` | Reporte DDJJ IVA en PDF |
+| `DDJJ_IVA_YYYYMM.xlsx` | Reporte DDJJ IVA en Excel (3 hojas: Débito Fiscal, Crédito Fiscal, Determinación) |
+
+### Pestaña "Errores ARCA"
+
+Permite cruzar el CSV de errores de validación de ARCA con los comprobantes generados:
+
+1. Seleccionar **Compras** o **Ventas**
+2. Pegar el contenido del CSV de errores (formato: `"Num. línea archivo Comprobantes";"Num. línea archivo IVA";"Error"`)
+3. Click **Identificar Comprobantes**
+4. Muestra tabla con: nro línea, **comprobante (link clickeable al asiento en Odoo)**, proveedor/cliente, CUIT, importe y descripción del error
+
+Esto evita tener que contar líneas manualmente en los archivos TXT para encontrar qué factura tiene el error.
 
 ## Bugs corregidos
 
