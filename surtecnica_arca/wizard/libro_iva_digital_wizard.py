@@ -2,11 +2,16 @@
 
 import base64
 import io
+import logging
 import zipfile
 from datetime import date
 
+import xlsxwriter
+
 from odoo import models, fields, api
 from odoo.exceptions import UserError
+
+_logger = logging.getLogger(__name__)
 
 
 class LibroIvaDigitalWizard(models.TransientModel):
@@ -133,8 +138,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
     def action_descargar_zip(self):
         """Descarga todos los archivos en un ZIP."""
         self.ensure_one()
+        periodo = self.date_from.strftime('%Y%m')
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # 4 archivos TXT del Libro IVA Digital
             for fname, fdata in [
                 (self.ventas_cbte_name, self.ventas_cbte_file),
                 (self.ventas_alic_name, self.ventas_alic_file),
@@ -144,9 +151,18 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 if fdata:
                     zf.writestr(fname, base64.b64decode(fdata))
 
+            # Reporte DDJJ IVA en PDF
+            pdf_data = self._generate_ddjj_pdf()
+            if pdf_data:
+                zf.writestr(f'DDJJ_IVA_{periodo}.pdf', pdf_data)
+
+            # Reporte DDJJ IVA en Excel
+            excel_data = self._generate_ddjj_excel()
+            if excel_data:
+                zf.writestr(f'DDJJ_IVA_{periodo}.xlsx', excel_data)
+
         # Guardar ZIP en un attachment para descarga
         zip_data = base64.b64encode(buf.getvalue())
-        periodo = self.date_from.strftime('%Y%m')
         attachment = self.env['ir.attachment'].create({
             'name': f'LIBRO_IVA_DIGITAL_{periodo}.zip',
             'type': 'binary',
@@ -923,6 +939,254 @@ class LibroIvaDigitalWizard(models.TransientModel):
                  'períodos anteriores.</p>')
         h.append('</div>')
         return '\n'.join(h)
+
+    # -------------------------------------------------------------------------
+    # DDJJ IVA - EXPORTACIÓN PDF / EXCEL
+    # -------------------------------------------------------------------------
+
+    def _generate_ddjj_pdf(self):
+        """Genera PDF del reporte DDJJ IVA desde el HTML del wizard.
+
+        Por qué: wkhtmltopdf (incluido en Odoo) convierte el HTML a PDF
+        manteniendo estilos y tablas. Landscape para que quepan las columnas.
+        """
+        html = self.ddjj_iva_html
+        if not html:
+            return False
+        full_html = (
+            '<!DOCTYPE html><html><head><meta charset="utf-8"/>'
+            '<style>body{font-family:Arial,sans-serif;font-size:12px;'
+            'margin:20px;}</style></head><body>'
+            + html + '</body></html>'
+        )
+        try:
+            return self.env['ir.actions.report']._run_wkhtmltopdf(
+                [full_html], landscape=True,
+            )
+        except Exception:
+            _logger.warning('No se pudo generar PDF de DDJJ IVA', exc_info=True)
+            return False
+
+    def _generate_ddjj_excel(self):
+        """Genera Excel con el reporte DDJJ IVA en 3 hojas.
+
+        Por qué: Excel permite al usuario manipular/verificar los datos
+        y comparar contra el portal ARCA antes de presentar.
+        Hojas: Débito Fiscal, Crédito Fiscal, Determinación.
+        """
+        ventas = self._get_moves('out')
+        compras = self._get_moves('in')
+        v_data = self._agrupar_ddjj(ventas)
+        c_data = self._agrupar_ddjj(compras)
+
+        buf = io.BytesIO()
+        wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+
+        # Formatos reutilizables
+        fmts = self._excel_formats(wb)
+        empresa = self.env.company.name
+        cuit = self.env.company.vat or 'Sin configurar'
+        periodo = self.date_from.strftime('%m/%Y')
+
+        # Hoja 1: Débito Fiscal (Ventas)
+        self._excel_sheet_iva(
+            wb, fmts, 'Débito Fiscal', v_data,
+            'COMPROBANTES EMITIDOS (Ventas)', 'Débito Fiscal',
+            empresa, cuit, periodo,
+        )
+        # Hoja 2: Crédito Fiscal (Compras)
+        self._excel_sheet_iva(
+            wb, fmts, 'Crédito Fiscal', c_data,
+            'COMPROBANTES RECIBIDOS (Compras)', 'Crédito Fiscal',
+            empresa, cuit, periodo,
+        )
+        # Hoja 3: Determinación del Impuesto
+        self._excel_sheet_determinacion(
+            wb, fmts, v_data, c_data, empresa, cuit, periodo,
+        )
+
+        wb.close()
+        return buf.getvalue()
+
+    def _excel_formats(self, wb):
+        """Crea y retorna dict con formatos reutilizables para el Excel."""
+        return {
+            'title': wb.add_format({
+                'bold': True, 'font_size': 14, 'font_color': '#2c3e50',
+                'bottom': 2, 'bottom_color': '#875A7B',
+            }),
+            'section': wb.add_format({
+                'bold': True, 'font_size': 11, 'font_color': '#875A7B',
+            }),
+            'header': wb.add_format({
+                'bold': True, 'bg_color': '#875A7B', 'font_color': 'white',
+                'border': 1, 'text_wrap': True, 'align': 'center',
+            }),
+            'text': wb.add_format({'border': 1}),
+            'center': wb.add_format({'border': 1, 'align': 'center'}),
+            'money': wb.add_format({
+                'num_format': '#,##0.00', 'border': 1, 'align': 'right',
+            }),
+            'total_text': wb.add_format({
+                'bold': True, 'bg_color': '#f3eef5', 'border': 1,
+            }),
+            'total_center': wb.add_format({
+                'bold': True, 'bg_color': '#f3eef5', 'border': 1,
+                'align': 'center',
+            }),
+            'total_money': wb.add_format({
+                'bold': True, 'num_format': '#,##0.00', 'border': 1,
+                'bg_color': '#f3eef5', 'align': 'right',
+            }),
+        }
+
+    def _excel_sheet_iva(self, wb, fmts, sheet_name, data, titulo_cbte,
+                         label_iva, empresa, cuit, periodo):
+        """Escribe una hoja de comprobantes + alícuotas (ventas o compras).
+
+        Por qué: Ventas y compras tienen la misma estructura de tabla,
+        solo cambia el título (Débito/Crédito Fiscal).
+        """
+        ws = wb.add_worksheet(sheet_name)
+        ws.set_column('A:A', 35)
+        ws.set_column('B:B', 8)
+        ws.set_column('C:G', 18)
+
+        row = 0
+        ws.write(row, 0, f'DDJJ IVA - F.2002 | Período {periodo}', fmts['title'])
+        row += 1
+        ws.write(row, 0, f'{empresa} | CUIT: {cuit}')
+        row += 2
+
+        # Tabla de comprobantes por tipo
+        ws.write(row, 0, titulo_cbte, fmts['section'])
+        row += 1
+        headers = ['Tipo Comprobante', 'Cant.', 'Neto Gravado',
+                   label_iva, 'No Gravado', 'Exento', 'Total']
+        for col, h in enumerate(headers):
+            ws.write(row, col, h, fmts['header'])
+        row += 1
+
+        for r in data['por_tipo']:
+            ws.write(row, 0, r['name'], fmts['text'])
+            ws.write(row, 1, r['count'], fmts['center'])
+            for col, key in enumerate(
+                ('gravado', 'iva', 'no_gravado', 'exento', 'total'), 2
+            ):
+                ws.write(row, col, r[key], fmts['money'])
+            row += 1
+
+        # Fila total
+        t = data['totales']
+        ws.write(row, 0, 'TOTAL', fmts['total_text'])
+        ws.write(row, 1, t['count'], fmts['total_center'])
+        for col, key in enumerate(
+            ('gravado', 'iva', 'no_gravado', 'exento', 'total'), 2
+        ):
+            ws.write(row, col, t[key], fmts['total_money'])
+        row += 2
+
+        # Detalle alícuotas IVA
+        ws.write(row, 0, f'Detalle Alícuotas IVA - {label_iva}', fmts['section'])
+        row += 1
+        for col, h in enumerate(['Alícuota', 'Base Imponible', label_iva]):
+            ws.write(row, col, h, fmts['header'])
+        row += 1
+
+        total_base = total_iva = 0.0
+        for code in sorted(data['alicuotas'].keys()):
+            a = data['alicuotas'][code]
+            label = self.IVA_CODE_LABEL.get(code, f'Cód. {code}')
+            ws.write(row, 0, f'IVA {label}', fmts['text'])
+            ws.write(row, 1, a['base'], fmts['money'])
+            ws.write(row, 2, a['amount'], fmts['money'])
+            total_base += a['base']
+            total_iva += a['amount']
+            row += 1
+
+        ws.write(row, 0, f'TOTAL {label_iva.upper()}', fmts['total_text'])
+        ws.write(row, 1, total_base, fmts['total_money'])
+        ws.write(row, 2, total_iva, fmts['total_money'])
+
+    def _excel_sheet_determinacion(self, wb, fmts, v_data, c_data,
+                                   empresa, cuit, periodo):
+        """Escribe la hoja de Determinación del Impuesto.
+
+        Por qué: Resume débito - crédito = saldo, que es lo que el
+        usuario carga en el F.2002 de ARCA.
+        """
+        ws = wb.add_worksheet('Determinación')
+        ws.set_column('A:A', 40)
+        ws.set_column('B:C', 20)
+
+        vt = v_data['totales']
+        ct = c_data['totales']
+        debito = vt['iva']
+        credito = ct['iva']
+        subtotal = debito - credito
+        perc_iva = ct['perc_iva']
+        saldo = subtotal - perc_iva
+
+        row = 0
+        ws.write(row, 0, f'DETERMINACIÓN DEL IMPUESTO | Período {periodo}',
+                 fmts['title'])
+        row += 2
+
+        ws.write(row, 0, 'Débito Fiscal', fmts['text'])
+        ws.write(row, 1, debito, fmts['money'])
+        row += 1
+        ws.write(row, 0, '(-) Crédito Fiscal', fmts['text'])
+        ws.write(row, 1, credito, fmts['money'])
+        row += 1
+        ws.write(row, 0, 'Subtotal', fmts['total_text'])
+        ws.write(row, 1, subtotal, fmts['total_money'])
+        row += 1
+
+        if abs(perc_iva) > 0.005:
+            ws.write(row, 0, '(-) Percepciones IVA sufridas', fmts['text'])
+            ws.write(row, 1, perc_iva, fmts['money'])
+            row += 1
+
+        # Resultado final con color según saldo
+        if saldo > 0.005:
+            label, color = 'SALDO A PAGAR', '#e74c3c'
+        elif saldo < -0.005:
+            label, color = 'SALDO A FAVOR', '#27ae60'
+        else:
+            label, color = 'SIN SALDO', '#333333'
+
+        result_fmt = wb.add_format({
+            'bold': True, 'num_format': '#,##0.00', 'border': 1,
+            'bg_color': '#f3eef5', 'align': 'right', 'font_color': color,
+        })
+        ws.write(row, 0, label, fmts['total_text'])
+        ws.write(row, 1, abs(saldo), result_fmt)
+        row += 2
+
+        # Otros tributos (informativo)
+        otros_items = [
+            ('Percepciones IIBB', vt.get('perc_iibb', 0), ct.get('perc_iibb', 0)),
+            ('Percepciones Municipales', vt.get('perc_mun', 0), ct.get('perc_mun', 0)),
+            ('Percepciones Nacionales', vt.get('perc_nacionales', 0),
+             ct.get('perc_nacionales', 0)),
+            ('Impuestos Internos', vt.get('imp_internos', 0),
+             ct.get('imp_internos', 0)),
+            ('Otros Tributos', vt.get('otros_tributos', 0),
+             ct.get('otros_tributos', 0)),
+        ]
+        otros_con_valor = [(n, e, r) for n, e, r in otros_items
+                           if abs(e) > 0.005 or abs(r) > 0.005]
+        if otros_con_valor:
+            ws.write(row, 0, 'OTROS TRIBUTOS (informativo)', fmts['section'])
+            row += 1
+            for col, h in enumerate(['Concepto', 'Emitidos', 'Recibidos']):
+                ws.write(row, col, h, fmts['header'])
+            row += 1
+            for nombre, emitido, recibido in otros_con_valor:
+                ws.write(row, 0, nombre, fmts['text'])
+                ws.write(row, 1, emitido, fmts['money'])
+                ws.write(row, 2, recibido, fmts['money'])
+                row += 1
 
     # -------------------------------------------------------------------------
     # UTILIDADES
