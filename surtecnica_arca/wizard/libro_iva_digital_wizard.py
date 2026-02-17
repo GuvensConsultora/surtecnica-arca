@@ -179,8 +179,11 @@ class LibroIvaDigitalWizard(models.TransientModel):
             ventas, compras, v_extracted, c_extracted)
 
         # Generar CSV IVA Simple (Apertura otros conceptos F.2051)
-        csv_data = self._generar_csvs_iva_simple(
+        csv_data, csv_totals = self._generar_csvs_iva_simple(
             ventas, compras, v_extracted, c_extracted)
+
+        # Cruce: validar que CSV apertura coincida con comprobantes TXT
+        ddjj_html += self._render_cruce_csv_html(csv_totals, v_ddjj, c_ddjj)
 
         # Codificar archivos
         vals = {
@@ -1485,6 +1488,97 @@ class LibroIvaDigitalWizard(models.TransientModel):
         h.append('</div>')
         return '\n'.join(h)
 
+    def _render_cruce_csv_html(self, csv_totals, v_ddjj, c_ddjj):
+        """Cruce de totales CSV apertura vs comprobantes informados TXT.
+
+        Por qué: Valida que los importes agrupados en los CSV de apertura
+        de otros conceptos coincidan con los totales de los comprobantes
+        informados en los TXT. La fuente de datos es distinta:
+        - TXT/DDJJ usa tax_base_amount desde tax lines (line_ids)
+        - CSV CF usa abs(line.balance) desde invoice lines (invoice_line_ids)
+        Esto puede generar diferencias de centavos por redondeo.
+        """
+        fmt = self._fmt_money
+        # Armar filas de comparación: (label, valor_comprobantes, valor_csv)
+        rows = []
+
+        # ---- Ventas Facturas vs CSV Débito Fiscal ----
+        vf = v_ddjj['totales_fac']
+        df = csv_totals['df']
+        rows.append(('Ventas Fac. — Neto Gravado',
+                     vf['gravado'], df['neto']))
+        rows.append(('Ventas Fac. — Debito Fiscal',
+                     vf['iva'], df['iva']))
+        rows.append(('Ventas Fac. — Exento + No Gravado',
+                     vf['exento'] + vf['no_gravado'], df['exento_ng']))
+
+        # ---- Ventas NC vs CSV Rest. Débito Fiscal ----
+        # NC tienen signo negativo en DDJJ → abs para comparar con CSV
+        vnc = v_ddjj['totales_nc']
+        rdf = csv_totals['rdf']
+        rows.append(('Ventas NC — Neto Gravado',
+                     abs(vnc['gravado']), rdf['neto']))
+        rows.append(('Ventas NC — Rest. Debito',
+                     abs(vnc['iva']), rdf['iva']))
+        rows.append(('Ventas NC — Exento + No Gravado',
+                     abs(vnc['exento']) + abs(vnc['no_gravado']),
+                     rdf['exento_ng']))
+
+        # ---- Compras Facturas vs CSV Crédito Fiscal ----
+        # Por qué: comparación crítica — CSV usa extraction por concepto
+        # (invoice_line_ids) vs DDJJ que usa tax lines (line_ids).
+        cf_ddjj = c_ddjj['totales_fac']
+        cf_csv = csv_totals['cf']
+        rows.append(('Compras Fac. — Neto Gravado',
+                     cf_ddjj['gravado'], cf_csv['neto']))
+        rows.append(('Compras Fac. — Credito Fiscal',
+                     cf_ddjj['iva'], cf_csv['iva']))
+
+        # ---- Compras NC vs CSV Rest. Crédito Fiscal ----
+        cnc = c_ddjj['totales_nc']
+        rcf = csv_totals['rcf']
+        rows.append(('Compras NC — Neto Gravado',
+                     abs(cnc['gravado']), rcf['neto']))
+        rows.append(('Compras NC — Rest. Credito',
+                     abs(cnc['iva']), rcf['iva']))
+
+        # Renderizar tabla HTML con indicadores de diferencia
+        h = ['<div class="ddjj-iva"><div class="section">']
+        h.append('<h3>CRUCE: CSV Apertura vs Comprobantes Informados</h3>')
+        h.append('<table><tr>'
+                 '<th>Concepto</th><th>Comprobantes (TXT)</th>'
+                 '<th>CSV Apertura</th><th>Diferencia</th></tr>')
+
+        hay_dif = False
+        for label, txt_val, csv_val in rows:
+            diff = round(txt_val - csv_val, 2)
+            if abs(diff) > 0.01:
+                hay_dif = True
+                diff_html = (
+                    f'<span style="color:#c0392b;font-weight:bold">'
+                    f'{fmt(diff)}</span>')
+            else:
+                diff_html = '<span style="color:#27ae60">OK</span>'
+            h.append(
+                f'<tr><td>{label}</td>'
+                f'<td>{fmt(txt_val)}</td><td>{fmt(csv_val)}</td>'
+                f'<td>{diff_html}</td></tr>')
+
+        h.append('</table>')
+
+        if hay_dif:
+            h.append(
+                '<p class="importante">Se detectaron diferencias entre '
+                'los totales de comprobantes (TXT) y la apertura (CSV). '
+                'Revisar antes de presentar.</p>')
+        else:
+            h.append(
+                '<p style="color:#27ae60;font-weight:bold">'
+                'Todos los totales coinciden.</p>')
+
+        h.append('</div></div>')
+        return '\n'.join(h)
+
     # -------------------------------------------------------------------------
     # DDJJ IVA - EXPORTACIÓN PDF / EXCEL
     # -------------------------------------------------------------------------
@@ -1966,22 +2060,32 @@ class LibroIvaDigitalWizard(models.TransientModel):
         compras_fac = compras.filtered(lambda m: m.move_type == 'in_invoice')
         compras_nc = compras.filtered(lambda m: m.move_type == 'in_refund')
 
-        return {
-            'iva_simple_debito_csv': self._csv_debito_fiscal(
-                ventas_fac, v_extracted),
+        # Por qué: cada CSV retorna (binary, totals) para cruce posterior
+        df_bin, df_totals = self._csv_debito_fiscal(ventas_fac, v_extracted)
+        rdf_bin, rdf_totals = self._csv_rest_debito_fiscal(
+            ventas_nc, v_extracted)
+        cf_bin, cf_totals = self._csv_credito_fiscal(
+            compras_fac, c_extracted)
+        rcf_bin, rcf_totals = self._csv_rest_credito_fiscal(
+            compras_nc, c_extracted)
+
+        csv_fields = {
+            'iva_simple_debito_csv': df_bin,
             'iva_simple_debito_csv_name': 'IVA_SIMPLE_DEBITO_FISCAL.csv',
-            'iva_simple_rest_debito_csv': self._csv_rest_debito_fiscal(
-                ventas_nc, v_extracted),
+            'iva_simple_rest_debito_csv': rdf_bin,
             'iva_simple_rest_debito_csv_name':
                 'IVA_SIMPLE_REST_DEBITO_FISCAL.csv',
-            'iva_simple_credito_csv': self._csv_credito_fiscal(
-                compras_fac, c_extracted),
+            'iva_simple_credito_csv': cf_bin,
             'iva_simple_credito_csv_name': 'IVA_SIMPLE_CREDITO_FISCAL.csv',
-            'iva_simple_rest_credito_csv': self._csv_rest_credito_fiscal(
-                compras_nc, c_extracted),
+            'iva_simple_rest_credito_csv': rcf_bin,
             'iva_simple_rest_credito_csv_name':
                 'IVA_SIMPLE_REST_CREDITO_FISCAL.csv',
         }
+        csv_totals = {
+            'df': df_totals, 'rdf': rdf_totals,
+            'cf': cf_totals, 'rcf': rcf_totals,
+        }
+        return csv_fields, csv_totals
 
     # Headers CSV IVA Simple — formato ARCA F.2051
     # Por qué: ARCA espera headers SIN comillas. Con comillas ARCA no los
@@ -2055,8 +2159,14 @@ class LibroIvaDigitalWizard(models.TransientModel):
         if abs(exento_ng) > 0.005:
             lines.append(f'{act};3;;;;;;{fmt(exento_ng)}')
 
-        # Solo header = sin datos
-        return self._encode_lines(lines) if len(lines) > 1 else False
+        # Totales para cruce con comprobantes informados (TXT)
+        totals = {
+            'neto': round(sum(v['neto'] for v in acum.values()), 2),
+            'iva': round(sum(v['iva'] for v in acum.values()), 2),
+            'exento_ng': round(exento_ng, 2),
+        }
+        binary = self._encode_lines(lines) if len(lines) > 1 else False
+        return binary, totals
 
     def _csv_rest_debito_fiscal(self, moves, extracted):
         """CSV 2: Restitución débito fiscal — NC de venta.
@@ -2101,7 +2211,14 @@ class LibroIvaDigitalWizard(models.TransientModel):
         if abs(exento_ng) > 0.005:
             lines.append(f'{act};2;;;;;{fmt(exento_ng)}')
 
-        return self._encode_lines(lines) if len(lines) > 1 else False
+        # Totales para cruce con comprobantes informados (TXT)
+        totals = {
+            'neto': round(sum(v['neto'] for v in acum.values()), 2),
+            'iva': round(sum(v['iva'] for v in acum.values()), 2),
+            'exento_ng': round(exento_ng, 2),
+        }
+        binary = self._encode_lines(lines) if len(lines) > 1 else False
+        return binary, totals
 
     def _csv_credito_fiscal(self, moves, _extracted):
         """CSV 3: Crédito fiscal — facturas + ND de compra.
@@ -2132,7 +2249,13 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 f'{fmt(vals["iva"])};{fmt(vals["iva"])}'
             )
 
-        return self._encode_lines(lines) if len(lines) > 1 else False
+        # Totales para cruce con comprobantes informados (TXT)
+        totals = {
+            'neto': round(sum(v['neto'] for v in acum.values()), 2),
+            'iva': round(sum(v['iva'] for v in acum.values()), 2),
+        }
+        binary = self._encode_lines(lines) if len(lines) > 1 else False
+        return binary, totals
 
     def _csv_rest_credito_fiscal(self, moves, _extracted):
         """CSV 4: Restitución crédito fiscal — NC de compra.
@@ -2161,7 +2284,13 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 f'{concepto};{code};{fmt(vals["neto"])};{fmt(vals["iva"])}'
             )
 
-        return self._encode_lines(lines) if len(lines) > 1 else False
+        # Totales para cruce con comprobantes informados (TXT)
+        totals = {
+            'neto': round(sum(v['neto'] for v in acum.values()), 2),
+            'iva': round(sum(v['iva'] for v in acum.values()), 2),
+        }
+        binary = self._encode_lines(lines) if len(lines) > 1 else False
+        return binary, totals
 
     # -------------------------------------------------------------------------
     # UTILIDADES
