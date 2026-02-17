@@ -253,22 +253,13 @@ class LibroIvaDigitalWizard(models.TransientModel):
             alic_line = parts[1].strip().strip('"')
             error = ';'.join(parts[2:]).strip().strip('"')
 
-            # Buscar en el mapa de líneas
-            cbte_info = cbte_map.get(cbte_line, {})
-            alic_info = alic_map.get(alic_line, {})
-            # Preferir datos de cbte, fallback a alic
-            info = cbte_info or alic_info
-
+            # Buscar datos completos en los mapas de líneas
             rows.append({
                 'cbte_line': cbte_line,
                 'alic_line': alic_line,
                 'error': error,
-                'id': info.get('id', ''),
-                'name': info.get('name', '—'),
-                'partner': info.get('partner', '—'),
-                'cuit': info.get('cuit', ''),
-                'total': info.get('total', ''),
-                'alicuota': alic_info.get('alicuota', ''),
+                'cbte': cbte_map.get(cbte_line, {}),
+                'alic': alic_map.get(alic_line, {}),
             })
 
         self.write({'errores_arca_html': self._render_errores_html(rows)})
@@ -282,59 +273,138 @@ class LibroIvaDigitalWizard(models.TransientModel):
         }
 
     def _render_errores_html(self, rows):
-        """Renderiza tabla HTML con errores ARCA enriquecidos."""
+        """Renderiza errores ARCA con detalle completo para diagnóstico.
+
+        Por qué: Muestra todos los importes exportados en cada línea del TXT
+        junto al error de ARCA, para que el usuario identifique el campo con
+        problema sin necesidad de abrir cada factura en Odoo.
+        """
         fmt = self._fmt_money
         css = """
         <style>
             .arca-err { font-family: Arial, sans-serif; font-size: 12px; }
             .arca-err h3 { color: #875A7B; }
-            .arca-err table { width: 100%; border-collapse: collapse; }
-            .arca-err th { background-color: #875A7B; color: white;
-                           padding: 6px 8px; font-size: 11px; text-align: left; }
-            .arca-err td { padding: 5px 8px; border-bottom: 1px solid #e8e8e8;
-                           font-size: 11px; }
-            .arca-err .err-text { color: #c0392b; font-weight: bold; }
-            .arca-err a { color: #875A7B; text-decoration: none; font-weight: bold; }
+            .arca-err a { color: #875A7B; text-decoration: none;
+                          font-weight: bold; }
             .arca-err a:hover { text-decoration: underline; }
-            .arca-err .line-num { text-align: center; color: #666; }
-            .arca-err .amount { text-align: right; }
+            .err-card { border: 1px solid #e0e0e0;
+                        border-left: 4px solid #c0392b;
+                        margin: 10px 0; padding: 10px 15px;
+                        background: #fafafa; }
+            .err-card .err-head { font-size: 12px; margin-bottom: 4px; }
+            .err-card .err-head .lines { color: #666; font-size: 11px; }
+            .err-card .err-msg { color: #c0392b; font-weight: bold;
+                                 padding: 6px 0; border-bottom: 1px solid #eee;
+                                 font-size: 12px; }
+            .err-card .err-detail { margin-top: 8px; }
+            .err-card .err-detail table { width: 100%;
+                                          border-collapse: collapse; }
+            .err-card .err-detail th { background: #f3eef5; color: #333;
+                                       padding: 3px 6px; font-size: 10px;
+                                       text-align: right; border: 1px solid #ddd; }
+            .err-card .err-detail th:first-child { text-align: left; }
+            .err-card .err-detail td { padding: 3px 6px; font-size: 11px;
+                                       text-align: right; border: 1px solid #eee; }
+            .err-card .err-detail td:first-child { text-align: left; }
+            .err-card .err-alic { margin-top: 6px; padding-top: 6px;
+                                  border-top: 1px dashed #ccc;
+                                  font-size: 11px; }
+            .err-card .err-compare { color: #888; font-size: 10px;
+                                     margin-top: 4px; }
         </style>
         """
         h = [css, '<div class="arca-err">']
-        h.append(f'<h3>Errores de validación ARCA — {len(rows)} encontrados</h3>')
         h.append(
-            '<table><tr>'
-            '<th>Lín. Cbte</th><th>Lín. IVA</th>'
-            '<th>Comprobante</th><th>Proveedor / Cliente</th>'
-            '<th>CUIT</th><th>Importe</th><th>Error</th>'
-            '</tr>'
-        )
-        for r in rows:
-            # Link al asiento en Odoo
-            if r['id']:
-                name_html = (
-                    f'<a href="/web#id={r["id"]}'
-                    f'&model=account.move&view_type=form" '
-                    f'target="_blank">{html_escape(r["name"])}</a>'
-                )
-            else:
-                name_html = html_escape(r['name'])
+            f'<h3>Errores de validacion ARCA — {len(rows)} encontrados</h3>')
 
-            total_str = fmt(r['total']) if isinstance(r['total'], (int, float)) else ''
-            alic_str = f' ({r["alicuota"]})' if r['alicuota'] else ''
+        for r in rows:
+            cbte = r['cbte']
+            alic = r['alic']
+            # Datos del comprobante (preferir cbte, fallback alic)
+            name = cbte.get('name') or alic.get('name', '—')
+            move_id = cbte.get('id') or alic.get('id', '')
+            partner = cbte.get('partner') or alic.get('partner', '—')
+            cuit = cbte.get('cuit', '')
+
+            h.append('<div class="err-card">')
+
+            # ---- Encabezado: líneas + comprobante + partner ----
+            if move_id:
+                name_html = (
+                    f'<a href="/web#id={move_id}'
+                    f'&model=account.move&view_type=form" '
+                    f'target="_blank">{html_escape(name)}</a>')
+            else:
+                name_html = html_escape(name)
 
             h.append(
-                f'<tr>'
-                f'<td class="line-num">{r["cbte_line"]}</td>'
-                f'<td class="line-num">{r["alic_line"]}</td>'
-                f'<td>{name_html}{alic_str}</td>'
-                f'<td>{html_escape(r["partner"])}</td>'
-                f'<td>{html_escape(r["cuit"])}</td>'
-                f'<td class="amount">{total_str}</td>'
-                f'<td class="err-text">{html_escape(r["error"])}</td>'
-                f'</tr>'
-            )
-        h.append('</table></div>')
+                f'<div class="err-head">'
+                f'<span class="lines">Lin. Cbte: {r["cbte_line"]} | '
+                f'Lin. Alic: {r["alic_line"]}</span> — '
+                f'{name_html} — {html_escape(partner)}'
+                f'{" — CUIT: " + html_escape(cuit) if cuit else ""}'
+                f'</div>')
+
+            # ---- Mensaje de error ----
+            h.append(
+                f'<div class="err-msg">{html_escape(r["error"])}</div>')
+
+            # ---- Detalle importes cabecera ----
+            if cbte:
+                h.append('<div class="err-detail">')
+                h.append(
+                    '<table><tr>'
+                    '<th>Total</th><th>Gravado</th><th>IVA</th>'
+                    '<th>No Grav.</th><th>Exento</th>'
+                    '<th>Perc.IVA</th><th>Perc.IIBB</th>'
+                    '<th>Perc.Nac.</th><th>Imp.Int.</th>'
+                    '<th>Otros</th>'
+                    '</tr><tr>')
+                for key in ('total', 'gravado', 'iva', 'no_gravado',
+                            'exento', 'perc_iva', 'perc_iibb',
+                            'perc_nacionales', 'imp_internos',
+                            'otros_tributos'):
+                    val = cbte.get(key)
+                    if isinstance(val, (int, float)):
+                        h.append(f'<td>{fmt(val)}</td>')
+                    else:
+                        h.append('<td>—</td>')
+                h.append('</tr></table>')
+
+                # Comparar total exportado vs total Odoo
+                odoo_total = cbte.get('odoo_total')
+                exp_total = cbte.get('total')
+                if (odoo_total is not None and exp_total is not None
+                        and abs(odoo_total - exp_total) > 0.005):
+                    h.append(
+                        f'<div class="err-compare">'
+                        f'Total Odoo: {fmt(odoo_total)} vs '
+                        f'Total exportado: {fmt(exp_total)} '
+                        f'(dif: {fmt(odoo_total - exp_total)})</div>')
+                h.append('</div>')
+
+            # ---- Detalle alícuota ----
+            if alic and alic.get('base') is not None:
+                tasa = alic.get('tasa', 0)
+                base = alic.get('base', 0)
+                impuesto = alic.get('impuesto', 0)
+                # Recalcular para comparar
+                esperado = round(base * tasa / 100, 2) if tasa else 0
+                h.append(
+                    f'<div class="err-alic">'
+                    f'Alicuota: <strong>{alic.get("alicuota", "—")}'
+                    f'</strong> | '
+                    f'Base: <strong>{fmt(base)}</strong> | '
+                    f'Impuesto: <strong>{fmt(impuesto)}</strong>')
+                if tasa and abs(esperado - impuesto) > 0.005:
+                    h.append(
+                        f' | Esperado (base x {tasa}%): '
+                        f'<strong>{fmt(esperado)}</strong>')
+                h.append('</div>')
+
+            h.append('</div>')  # close err-card
+
+        h.append('</div>')
         return '\n'.join(h)
 
     # -------------------------------------------------------------------------
@@ -389,33 +459,53 @@ class LibroIvaDigitalWizard(models.TransientModel):
 
                 if tipo == 'ventas':
                     cbte_lines.append(self._fmt_ventas_cbte(move, data))
-                    for alic in data['iva_alicuotas']:
-                        alic_num = len(alic_lines) + 1
-                        alic_lines.append(self._fmt_ventas_alic(move, alic))
-                        alic_map[str(alic_num)] = {
-                            'name': move.name, 'id': move.id,
-                            'partner': partner.name or '',
-                            'alicuota': self.IVA_CODE_LABEL.get(
-                                alic['code'], alic['code']),
-                        }
+                    fmt_alic = self._fmt_ventas_alic
                 else:
                     cbte_lines.append(self._fmt_compras_cbte(move, data))
-                    for alic in data['iva_alicuotas']:
-                        alic_num = len(alic_lines) + 1
-                        alic_lines.append(self._fmt_compras_alic(move, alic))
-                        alic_map[str(alic_num)] = {
-                            'name': move.name, 'id': move.id,
-                            'partner': partner.name or '',
-                            'alicuota': self.IVA_CODE_LABEL.get(
-                                alic['code'], alic['code']),
-                        }
+                    fmt_alic = self._fmt_compras_alic
 
+                # Alícuotas: línea TXT + mapa con detalle para diagnóstico
+                for alic in data['iva_alicuotas']:
+                    alic_num = len(alic_lines) + 1
+                    alic_lines.append(fmt_alic(move, alic))
+                    alic_map[str(alic_num)] = {
+                        'name': move.name, 'id': move.id,
+                        'partner': partner.name or '',
+                        'alicuota': self.IVA_CODE_LABEL.get(
+                            alic['code'], alic['code']),
+                        # Detalle para diagnóstico de errores ARCA
+                        'codigo_iva': alic['code'],
+                        'base': round(alic['base'], 2),
+                        'impuesto': round(alic['amount'], 2),
+                        'tasa': self.IVA_CODE_RATE.get(alic['code'], 0),
+                    }
+
+                # Cabecera: mapa con todos los importes para diagnóstico
+                gravado = sum(a['base'] for a in data['iva_alicuotas'])
+                iva_total = sum(a['amount'] for a in data['iva_alicuotas'])
                 cbte_map[str(cbte_num)] = {
                     'id': move.id,
                     'name': move.name,
                     'partner': partner.name or '',
                     'cuit': partner.vat or '',
+                    'fecha': str(move.invoice_date),
+                    'tipo_cbte': (
+                        move.l10n_latam_document_type_id.name or ''),
                     'total': round(data['total'], 2),
+                    'gravado': round(gravado, 2),
+                    'iva': round(iva_total, 2),
+                    'no_gravado': round(data['no_gravado'], 2),
+                    'exento': round(data['exento'], 2),
+                    'perc_iva': round(data['perc_iva'], 2),
+                    'perc_iibb': round(data['perc_iibb'], 2),
+                    'perc_nacionales': round(data['perc_nacionales'], 2),
+                    'perc_mun': round(data['perc_mun'], 2),
+                    'perc_no_categ': round(data['perc_no_categ'], 2),
+                    'imp_internos': round(data['imp_internos'], 2),
+                    'otros_tributos': round(data['otros_tributos'], 2),
+                    'n_alic': len(data['iva_alicuotas']),
+                    # Total Odoo original para comparar
+                    'odoo_total': round(abs(move.amount_total), 2),
                 }
             except Exception as e:
                 errores.append(f'{move.name}: {str(e)}')
