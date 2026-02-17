@@ -6,6 +6,7 @@ import json
 import logging
 import zipfile
 from datetime import date
+from html import escape as html_escape
 
 import xlsxwriter
 
@@ -57,6 +58,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
     # Por qué: Mapeo JSON {línea_TXT: datos_comprobante} para identificar
     # rápidamente qué factura corresponde a cada error de validación ARCA
     line_map_json = fields.Text()
+
+    # Por qué: almacena datos DDJJ pre-calculados en JSON para evitar
+    # reprocesar moves al generar el Excel
+    ddjj_data_json = fields.Text()
 
     # Procesador de errores ARCA
     errores_arca_tipo = fields.Selection([
@@ -123,11 +128,19 @@ class LibroIvaDigitalWizard(models.TransientModel):
         ventas = self._get_moves('out')
         compras = self._get_moves('in')
 
-        # Generar líneas para cada archivo + mapeo de líneas
+        # Extraer datos una sola vez por comprobante (evita triple procesamiento)
+        v_extracted = {m.id: self._extract_move_data(m) for m in ventas}
+        c_extracted = {m.id: self._extract_move_data(m) for m in compras}
+
+        # Generar líneas TXT + mapeo usando datos pre-extraídos
         v_cbte, v_alic, v_cbte_map, v_alic_map = self._procesar_moves(
-            ventas, 'ventas')
+            ventas, 'ventas', v_extracted)
         c_cbte, c_alic, c_cbte_map, c_alic_map = self._procesar_moves(
-            compras, 'compras')
+            compras, 'compras', c_extracted)
+
+        # DDJJ IVA: HTML + datos agregados para Excel (reutiliza extracted)
+        ddjj_html, v_ddjj, c_ddjj = self._compute_ddjj_iva_html(
+            ventas, compras, v_extracted, c_extracted)
 
         # Codificar archivos
         vals = {
@@ -148,7 +161,11 @@ class LibroIvaDigitalWizard(models.TransientModel):
             'resumen': self._generar_resumen(
                 ventas, compras, v_cbte, c_cbte, v_alic, c_alic
             ),
-            'ddjj_iva_html': self._compute_ddjj_iva_html(ventas, compras),
+            'ddjj_iva_html': ddjj_html,
+            # Datos DDJJ serializados para Excel (evita re-query y reproceso)
+            'ddjj_data_json': json.dumps({
+                'v_data': v_ddjj, 'c_data': c_ddjj,
+            }),
         }
         self.write(vals)
 
@@ -298,10 +315,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 name_html = (
                     f'<a href="/web#id={r["id"]}'
                     f'&model=account.move&view_type=form" '
-                    f'target="_blank">{r["name"]}</a>'
+                    f'target="_blank">{html_escape(r["name"])}</a>'
                 )
             else:
-                name_html = r['name']
+                name_html = html_escape(r['name'])
 
             total_str = fmt(r['total']) if isinstance(r['total'], (int, float)) else ''
             alic_str = f' ({r["alicuota"]})' if r['alicuota'] else ''
@@ -311,10 +328,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 f'<td class="line-num">{r["cbte_line"]}</td>'
                 f'<td class="line-num">{r["alic_line"]}</td>'
                 f'<td>{name_html}{alic_str}</td>'
-                f'<td>{r["partner"]}</td>'
-                f'<td>{r["cuit"]}</td>'
+                f'<td>{html_escape(r["partner"])}</td>'
+                f'<td>{html_escape(r["cuit"])}</td>'
                 f'<td class="amount">{total_str}</td>'
-                f'<td class="err-text">{r["error"]}</td>'
+                f'<td class="err-text">{html_escape(r["error"])}</td>'
                 f'</tr>'
             )
         h.append('</table></div>')
@@ -345,11 +362,13 @@ class LibroIvaDigitalWizard(models.TransientModel):
     # PROCESAMIENTO DE MOVES
     # -------------------------------------------------------------------------
 
-    def _procesar_moves(self, moves, tipo):
+    def _procesar_moves(self, moves, tipo, extracted_data=None):
         """Procesa moves y genera líneas de cabecera + alícuotas + mapeo.
 
         Args:
             tipo: 'ventas' o 'compras' (determina el formato de salida).
+            extracted_data: dict {move_id: data} pre-calculado. Si es None,
+                extrae datos de cada move.
         Returns:
             tuple: (lista_cabecera, lista_alicuotas, mapa_cbte, mapa_alic)
             Los mapas vinculan nro de línea TXT → datos del comprobante,
@@ -363,7 +382,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
 
         for move in moves:
             try:
-                data = self._extract_move_data(move)
+                data = extracted_data[move.id] if extracted_data else self._extract_move_data(move)
                 partner = move.commercial_partner_id
                 # Línea cabecera: nro 1-based
                 cbte_num = len(cbte_lines) + 1
@@ -421,8 +440,13 @@ class LibroIvaDigitalWizard(models.TransientModel):
         # Por qué: NC tienen importes positivos en Odoo, pero negativos en el TXT
         sign = -1 if move.move_type in ('out_refund', 'in_refund') else 1
 
+        # Por qué: documentos con letra 'E' son exportación (código operación 'X')
+        doc_type = move.l10n_latam_document_type_id
+        is_export = getattr(doc_type, 'l10n_ar_letter', '') == 'E'
+
         result = {
             'total': 0.0,  # Se recalcula en Paso 4 como suma de partes
+            'is_export': is_export,
             'no_gravado': 0.0,
             'exento': 0.0,
             'perc_no_categ': 0.0,      # Ventas campo 11
@@ -552,12 +576,17 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 '06': 'perc_iva', '07': 'perc_iibb', '08': 'perc_mun',
                 '09': 'otros_tributos', '04': 'imp_internos',
                 '01': 'perc_nacionales', '02': 'perc_iibb', '03': 'perc_mun',
+                # Por qué: código AFIP 13 = Percepciones IVA a No Categorizado
+                '13': 'perc_no_categ',
             }
             return mapping.get(tribute_code, 'otros_tributos')
 
         # Fallback: clasificar por nombre
         name = (tax_group.name or '').lower()
         if 'percep' in name:
+            # Por qué: detectar percepciones a no categorizados por nombre
+            if 'no categ' in name or 'no inscri' in name:
+                return 'perc_no_categ'
             if 'iva' in name:
                 return 'perc_iva'
             elif any(k in name for k in ('iibb', 'ingr', 'brut', 'provincial')):
@@ -781,6 +810,9 @@ class LibroIvaDigitalWizard(models.TransientModel):
 
         ' ' = gravado, 'E' = exento, 'N' = no gravado, 'X' = exportación.
         """
+        # Por qué: exportaciones tienen código propio independiente del IVA
+        if data.get('is_export'):
+            return 'X'
         tiene_gravado = bool(data['iva_alicuotas'])
         tiene_exento = abs(data['exento']) > 0.01
         tiene_no_gravado = abs(data['no_gravado']) > 0.01
@@ -842,23 +874,26 @@ class LibroIvaDigitalWizard(models.TransientModel):
     # DDJJ IVA - REPORTE PORTAL ARCA (F.2002)
     # -------------------------------------------------------------------------
 
-    def _compute_ddjj_iva_html(self, ventas, compras):
-        """Genera HTML que simula cómo cargar la DDJJ IVA en el portal ARCA.
+    def _compute_ddjj_iva_html(self, ventas, compras,
+                                v_extracted=None, c_extracted=None):
+        """Genera HTML y datos DDJJ IVA para el portal ARCA.
 
-        Por qué: El usuario necesita verificar los totales que debe cargar
-        en el F.2002 de ARCA antes de presentar. Este reporte agrupa los
-        comprobantes por tipo y alícuota, igual que el portal.
+        Returns:
+            tuple: (html, v_data, c_data) — HTML renderizado y datos
+            agregados para reutilizar en Excel sin reprocesar.
         """
-        v_data = self._agrupar_ddjj(ventas)
-        c_data = self._agrupar_ddjj(compras)
-        return self._render_ddjj_html(v_data, c_data)
+        v_data = self._agrupar_ddjj(ventas, v_extracted)
+        c_data = self._agrupar_ddjj(compras, c_extracted)
+        return self._render_ddjj_html(v_data, c_data), v_data, c_data
 
-    def _agrupar_ddjj(self, moves):
+    def _agrupar_ddjj(self, moves, extracted_data=None):
         """Agrupa comprobantes por tipo de documento y acumula importes.
 
+        Args:
+            extracted_data: dict {move_id: data} pre-calculado. Si es None,
+                extrae datos de cada move.
         Por qué: El portal ARCA muestra totales agrupados por tipo de
         comprobante (FA-A, FA-B, NC-A, etc.) y por alícuota de IVA.
-        Reutiliza _extract_move_data para clasificar importes.
         """
         por_tipo = {}
         alicuotas = {}
@@ -872,7 +907,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
         }
 
         for move in moves:
-            data = self._extract_move_data(move)
+            data = extracted_data[move.id] if extracted_data else self._extract_move_data(move)
             doc_type = move.l10n_latam_document_type_id
             key = doc_type.id
 
@@ -1087,6 +1122,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
 
         # ---- RESUMEN OTROS TRIBUTOS (informativo) ----
         otros_items = [
+            ('Perc. a No Categ.', vt.get('perc_no_categ', 0), ct.get('perc_no_categ', 0)),
             ('Percepciones IIBB', vt.get('perc_iibb', 0), ct.get('perc_iibb', 0)),
             ('Percepciones Municipales', vt.get('perc_mun', 0), ct.get('perc_mun', 0)),
             ('Percepciones Nacionales', vt.get('perc_nacionales', 0), ct.get('perc_nacionales', 0)),
@@ -1144,14 +1180,15 @@ class LibroIvaDigitalWizard(models.TransientModel):
     def _generate_ddjj_excel(self):
         """Genera Excel con el reporte DDJJ IVA en 3 hojas.
 
-        Por qué: Excel permite al usuario manipular/verificar los datos
-        y comparar contra el portal ARCA antes de presentar.
+        Por qué: Lee datos DDJJ pre-calculados de ddjj_data_json
+        (generados en action_generar) para no reprocesar moves.
         Hojas: Débito Fiscal, Crédito Fiscal, Determinación.
         """
-        ventas = self._get_moves('out')
-        compras = self._get_moves('in')
-        v_data = self._agrupar_ddjj(ventas)
-        c_data = self._agrupar_ddjj(compras)
+        ddjj_raw = json.loads(self.ddjj_data_json or '{}')
+        v_data = ddjj_raw.get('v_data')
+        c_data = ddjj_raw.get('c_data')
+        if not v_data or not c_data:
+            return False
 
         buf = io.BytesIO()
         wb = xlsxwriter.Workbook(buf, {'in_memory': True})
@@ -1339,6 +1376,8 @@ class LibroIvaDigitalWizard(models.TransientModel):
 
         # Otros tributos (informativo)
         otros_items = [
+            ('Perc. a No Categ.', vt.get('perc_no_categ', 0),
+             ct.get('perc_no_categ', 0)),
             ('Percepciones IIBB', vt.get('perc_iibb', 0), ct.get('perc_iibb', 0)),
             ('Percepciones Municipales', vt.get('perc_mun', 0), ct.get('perc_mun', 0)),
             ('Percepciones Nacionales', vt.get('perc_nacionales', 0),
