@@ -613,6 +613,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
             'imp_internos': 0.0,
             'otros_tributos': 0.0,
             'iva_alicuotas': [],       # [{code, base, amount}]
+            'iva_by_concepto': {},     # {(concepto, code): {base, amount}}
         }
 
         # Paso 1: Clasificar líneas de producto → no_gravado / exento / base IVA
@@ -622,7 +623,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
         # balance siempre está en ARS = moneda de la empresa.
         # Tip: Calcular base IVA aquí (no desde tax_base_amount) asegura
         # consistencia con el CSV que también usa invoice_line_ids.balance.
+        # Patrón: Una sola pasada sobre invoice_line_ids alimenta iva_by_code
+        # (para TXT/DDJJ) e iva_by_concepto (para CSV crédito/restitución).
         iva_by_code = {}
+        iva_by_concepto = {}
         for line in move.invoice_line_ids.filtered(
             lambda l: l.display_type not in ('line_section', 'line_note')
         ):
@@ -636,10 +640,23 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 for tax in line.tax_ids:
                     code = self._get_vat_afip_code(tax)
                     if code and code in self.IVA_GRAVADO_CODES:
+                        bal = abs(line.balance) * sign
                         if code not in iva_by_code:
                             iva_by_code[code] = {
                                 'code': code, 'base': 0.0, 'amount': 0.0}
-                        iva_by_code[code]['base'] += abs(line.balance) * sign
+                        iva_by_code[code]['base'] += bal
+
+                        # Concepto: bienes si producto físico, servicios si no
+                        # Por qué: CSV crédito fiscal agrupa por concepto+alícuota
+                        product = line.product_id
+                        concepto = '1' if (
+                            product and product.type in ('consu', 'product')
+                        ) else '3'
+                        ckey = (concepto, code)
+                        if ckey not in iva_by_concepto:
+                            iva_by_concepto[ckey] = {
+                                'base': 0.0, 'amount': 0.0}
+                        iva_by_concepto[ckey]['base'] += bal
                         break  # Una línea tiene una sola alícuota IVA
 
         # Paso 2: IVA amount + impuestos no-IVA desde tax lines
@@ -667,12 +684,20 @@ class LibroIvaDigitalWizard(models.TransientModel):
         # Por qué: ARCA valida que impuesto = base × alícuota exactamente.
         # Odoo calcula IVA por línea de producto y suma, generando diferencias
         # de centavos. Recalculamos para que la validación no falle.
+        # Patrón: Misma fórmula para iva_by_code e iva_by_concepto asegura
+        # que CSV crédito y TXT/DDJJ tengan idénticos importes de IVA.
         for code, alic in iva_by_code.items():
             rate = self.IVA_CODE_RATE.get(code)
             if rate is not None and rate > 0:
                 alic['amount'] = round(alic['base'] * rate / 100, 2)
 
+        for ckey, cdata in iva_by_concepto.items():
+            rate = self.IVA_CODE_RATE.get(ckey[1])
+            if rate is not None and rate > 0:
+                cdata['amount'] = round(cdata['base'] * rate / 100, 2)
+
         result['iva_alicuotas'] = list(iva_by_code.values())
+        result['iva_by_concepto'] = iva_by_concepto
 
         # Paso 4: Computar total como suma de partes
         # Por qué: ARCA valida que Total = suma de todos los campos de importe.
@@ -2147,46 +2172,6 @@ class LibroIvaDigitalWizard(models.TransientModel):
         s = f'{rounded:.2f}'.rstrip('0')
         return s.replace('.', ',')
 
-    def _extract_move_data_by_concepto(self, move):
-        """Desglosa base+IVA por concepto (bienes/servicios) y alícuota.
-
-        Por qué: CSV Crédito Fiscal de IVA Simple requiere separar neto e IVA
-        por tipo de bien (bienes=1, servicios=3) dentro de cada comprobante.
-
-        Returns:
-            dict: {(concepto, alicuota_code): {'base': float, 'amount': float}}
-        """
-        sign = -1 if move.move_type in ('out_refund', 'in_refund') else 1
-        result = {}
-
-        for line in move.invoice_line_ids.filtered(
-            lambda l: l.display_type not in ('line_section', 'line_note')
-        ):
-            # Concepto: bienes ('1') si producto físico, servicios ('3') si no
-            product = line.product_id
-            if product and product.type in ('consu', 'product'):
-                concepto = '1'
-            else:
-                concepto = '3'
-
-            # Buscar alícuota IVA gravado en los taxes de la línea
-            for tax in line.tax_ids:
-                code = self._get_vat_afip_code(tax)
-                if code and code in self.IVA_GRAVADO_CODES:
-                    key = (concepto, code)
-                    if key not in result:
-                        result[key] = {'base': 0.0, 'amount': 0.0}
-                    # abs(balance) = moneda empresa (ARS), no price_subtotal
-                    result[key]['base'] += abs(line.balance) * sign
-                    break  # Una línea tiene una sola alícuota IVA
-
-        # Recalcular IVA = base × tasa para consistencia con ARCA
-        for key, data in result.items():
-            rate = self.IVA_CODE_RATE.get(key[1], 0)
-            data['amount'] = round(data['base'] * rate / 100, 2)
-
-        return result
-
     def _generar_csvs_iva_simple(self, ventas, compras,
                                   v_extracted, c_extracted):
         """Genera los 4 CSV de Apertura otros conceptos (IVA Simple F.2051).
@@ -2361,18 +2346,21 @@ class LibroIvaDigitalWizard(models.TransientModel):
         binary = self._encode_lines(lines) if len(lines) > 1 else False
         return binary, totals
 
-    def _csv_credito_fiscal(self, moves, _extracted):
+    def _csv_credito_fiscal(self, moves, extracted):
         """CSV 3: Crédito fiscal — facturas + ND de compra.
 
         Por qué: Agrupa por (concepto, alícuota). concepto = tipo de bien:
         1=bienes, 3=servicios. Alícuota = código AFIP.
+        Usa extracted[move.id]['iva_by_concepto'] — misma fuente que TXT/DDJJ.
         Formato (5 cols):
             concepto;code_afip;neto;credito_facturado;credito_computable
         """
         acum = {}
 
         for move in moves:
-            by_concepto = self._extract_move_data_by_concepto(move)
+            # Por qué: Usar iva_by_concepto de _extract_move_data (única fuente)
+            # elimina discrepancias entre CSV y TXT/DDJJ.
+            by_concepto = extracted[move.id]['iva_by_concepto']
             for key, vals in by_concepto.items():
                 if key not in acum:
                     acum[key] = {'neto': 0.0, 'iva': 0.0}
@@ -2405,21 +2393,23 @@ class LibroIvaDigitalWizard(models.TransientModel):
         binary = self._encode_lines(lines) if len(lines) > 1 else False
         return binary, totals
 
-    def _csv_rest_credito_fiscal(self, moves, _extracted):
+    def _csv_rest_credito_fiscal(self, moves, extracted):
         """CSV 4: Restitución crédito fiscal — NC de compra.
 
         Por qué: Igual que CSV 3 pero sin campo credito_computable (4 cols).
         Importes en valor absoluto (NC tienen signo negativo en extracted).
+        Usa extracted[move.id]['iva_by_concepto'] — misma fuente que TXT/DDJJ.
         Formato: concepto;code_afip;neto;credito_facturado
         """
         acum = {}
 
         for move in moves:
-            by_concepto = self._extract_move_data_by_concepto(move)
+            # Por qué: Usar iva_by_concepto de _extract_move_data (única fuente)
+            by_concepto = extracted[move.id]['iva_by_concepto']
             for key, vals in by_concepto.items():
                 if key not in acum:
                     acum[key] = {'neto': 0.0, 'iva': 0.0}
-                # NC → valores negativos → abs
+                # NC → valores negativos en extracted → abs
                 acum[key]['neto'] += abs(vals['base'])
                 acum[key]['iva'] += abs(vals['amount'])
 
