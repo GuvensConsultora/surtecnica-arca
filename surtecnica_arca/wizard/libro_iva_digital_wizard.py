@@ -169,30 +169,21 @@ class LibroIvaDigitalWizard(models.TransientModel):
         c_extracted = {m.id: self._extract_move_data(m) for m in compras}
 
         # Generar líneas TXT + mapeo usando datos pre-extraídos
-        # Por qué: _procesar_moves llama internamente a _to_invoice_currency
-        # para cada move, convirtiendo ARS → moneda factura en el TXT.
+        # Por qué: todo en ARS (moneda compañía). El usuario importa
+        # seleccionando "en pesos" en el portal ARCA.
+        # Así TXT, CSV y DDJJ usan los mismos valores ARS sin conversión.
         v_cbte, v_alic, v_cbte_map, v_alic_map = self._procesar_moves(
             ventas, 'ventas', v_extracted)
         c_cbte, c_alic, c_cbte_map, c_alic_map = self._procesar_moves(
             compras, 'compras', c_extracted)
 
-        # Corregir ARS para que coincida con round-trip TXT→ARCA
-        # Por qué: ARCA lee TXT en moneda factura y reconvierte a ARS.
-        # Para USD: round(ARS/TC,2)×TC ≠ ARS original por redondeo.
-        # El CSV debe tener el ARS que ARCA computa, no el ARS original.
-        # Para ARS (TC=1): no-op, valores idénticos.
-        v_csv = {m.id: self._roundtrip_ars(v_extracted[m.id], m)
-                 for m in ventas}
-        c_csv = {m.id: self._roundtrip_ars(c_extracted[m.id], m)
-                 for m in compras}
-
-        # DDJJ IVA: con valores round-trip para coincidir con portal ARCA
+        # DDJJ IVA: mismos valores ARS que TXT y CSV
         ddjj_html, v_ddjj, c_ddjj = self._compute_ddjj_iva_html(
-            ventas, compras, v_csv, c_csv)
+            ventas, compras, v_extracted, c_extracted)
 
-        # CSV IVA Simple: con valores round-trip para coincidir con ARCA
+        # CSV IVA Simple: mismos valores ARS que TXT
         csv_data, csv_totals = self._generar_csvs_iva_simple(
-            ventas, compras, v_csv, c_csv)
+            ventas, compras, v_extracted, c_extracted)
 
         # Cruce: validar que CSV apertura coincida con comprobantes TXT
         ddjj_html += self._render_cruce_csv_html(csv_totals, v_ddjj, c_ddjj)
@@ -528,22 +519,21 @@ class LibroIvaDigitalWizard(models.TransientModel):
         for move in moves:
             try:
                 data = extracted_data[move.id] if extracted_data else self._extract_move_data(move)
-                # TXT: importes en moneda de factura (ARCA multiplica × TC)
-                # data queda en ARS para DDJJ/CSV; txt_data en moneda factura
-                txt_data = self._to_invoice_currency(data, move)
+                # TXT: importes en ARS (moneda compañía).
+                # Se importa con opción "en pesos" en portal ARCA.
                 partner = move.commercial_partner_id
                 # Línea cabecera: nro 1-based
                 cbte_num = len(cbte_lines) + 1
 
                 if tipo == 'ventas':
-                    cbte_lines.append(self._fmt_ventas_cbte(move, txt_data))
+                    cbte_lines.append(self._fmt_ventas_cbte(move, data))
                     fmt_alic = self._fmt_ventas_alic
                 else:
-                    cbte_lines.append(self._fmt_compras_cbte(move, txt_data))
+                    cbte_lines.append(self._fmt_compras_cbte(move, data))
                     fmt_alic = self._fmt_compras_alic
 
                 # Alícuotas: línea TXT + mapa con detalle para diagnóstico
-                for alic in txt_data['iva_alicuotas']:
+                for alic in data['iva_alicuotas']:
                     alic_num = len(alic_lines) + 1
                     alic_lines.append(fmt_alic(move, alic))
                     alic_map[str(alic_num)] = {
@@ -816,11 +806,16 @@ class LibroIvaDigitalWizard(models.TransientModel):
     # -------------------------------------------------------------------------
 
     def _fmt_ventas_cbte(self, move, data):
-        """Genera una línea del archivo LIBRO_IVA_DIGITAL_VENTAS_CBTE."""
+        """Genera una línea del archivo LIBRO_IVA_DIGITAL_VENTAS_CBTE.
+
+        Por qué: importes en ARS → moneda=PES, TC=1.
+        Se importa con opción "en pesos" en el portal ARCA.
+        """
         partner = move.commercial_partner_id
         pv, num = self._get_doc_parts(move)
         doc_code, doc_num = self._get_partner_doc(partner)
-        cur_code, cur_rate = self._get_currency_info(move)
+        # Importes en ARS → moneda PES, TC 1.0
+        cur_code, cur_rate = 'PES', 1.0
         op_code = self._get_operation_code(data)
         n_alic = len(data['iva_alicuotas'])
         fecha_vto = move.invoice_date_due or move.invoice_date
@@ -884,11 +879,16 @@ class LibroIvaDigitalWizard(models.TransientModel):
     # -------------------------------------------------------------------------
 
     def _fmt_compras_cbte(self, move, data):
-        """Genera una línea del archivo LIBRO_IVA_DIGITAL_COMPRAS_CBTE."""
+        """Genera una línea del archivo LIBRO_IVA_DIGITAL_COMPRAS_CBTE.
+
+        Por qué: importes en ARS → moneda=PES, TC=1.
+        Se importa con opción "en pesos" en el portal ARCA.
+        """
         partner = move.commercial_partner_id
         pv, num = self._get_doc_parts(move)
         doc_code, doc_num = self._get_partner_doc(partner)
-        cur_code, cur_rate = self._get_currency_info(move)
+        # Importes en ARS → moneda PES, TC 1.0
+        cur_code, cur_rate = 'PES', 1.0
         op_code = self._get_operation_code(data)
         n_alic = len(data['iva_alicuotas'])
         # Crédito fiscal = suma de IVA de todas las alícuotas
@@ -1017,126 +1017,6 @@ class LibroIvaDigitalWizard(models.TransientModel):
                     move.invoice_date or fields.Date.today()
                 )
         return code, rate or 1.0
-
-    def _roundtrip_ars(self, data, move):
-        """Simula el round-trip ARS→moneda_factura→ARS que ARCA computa.
-
-        Por qué: ARCA lee el TXT en moneda factura y reconvierte a ARS
-        internamente (USD_base × TC). El round-trip introduce diferencias
-        de centavos vs el ARS original de Odoo.
-        El CSV debe tener el ARS que ARCA computa, no el ARS de Odoo,
-        para que la validación "CSV == TXT" pase.
-        Para facturas ARS (rate=1): no-op, retorna data sin modificar.
-        """
-        if move.currency_id == move.company_currency_id:
-            return data
-        _, rate = self._get_currency_info(move)
-        if rate <= 1.001:
-            return data
-
-        # Copiar para no modificar el original
-        rt = dict(data)
-        for field in ('total', 'no_gravado', 'exento', 'perc_no_categ',
-                      'perc_iva', 'perc_nacionales', 'perc_iibb',
-                      'perc_mun', 'imp_internos', 'otros_tributos'):
-            # ARS → round(ARS/TC, 2) → ×TC = ARS round-trip
-            rt[field] = round(round(data[field] / rate, 2) * rate, 2)
-
-        # Alícuotas: round-trip base, recalcular IVA
-        rt['iva_alicuotas'] = []
-        for a in data['iva_alicuotas']:
-            base_rt = round(round(a['base'] / rate, 2) * rate, 2)
-            iva_rate = self.IVA_CODE_RATE.get(a['code'], 0)
-            amount_rt = round(base_rt * iva_rate / 100, 2) if iva_rate > 0 \
-                else round(round(a['amount'] / rate, 2) * rate, 2)
-            rt['iva_alicuotas'].append({
-                'code': a['code'], 'base': base_rt, 'amount': amount_rt,
-            })
-
-        # iva_by_concepto: misma lógica round-trip
-        rt['iva_by_concepto'] = {}
-        for ckey, cdata in data.get('iva_by_concepto', {}).items():
-            base_rt = round(round(cdata['base'] / rate, 2) * rate, 2)
-            iva_rate = self.IVA_CODE_RATE.get(ckey[1], 0)
-            amount_rt = round(base_rt * iva_rate / 100, 2) if iva_rate > 0 \
-                else round(round(cdata['amount'] / rate, 2) * rate, 2)
-            rt['iva_by_concepto'][ckey] = {
-                'base': base_rt, 'amount': amount_rt,
-            }
-
-        # Recalcular total desde partes round-trip
-        gravado = sum(a['base'] for a in rt['iva_alicuotas'])
-        iva = sum(a['amount'] for a in rt['iva_alicuotas'])
-        rt['total'] = round(
-            gravado + iva
-            + rt['no_gravado'] + rt['exento']
-            + rt['perc_no_categ'] + rt['perc_iva']
-            + rt['perc_nacionales'] + rt['perc_iibb']
-            + rt['perc_mun'] + rt['imp_internos']
-            + rt['otros_tributos'],
-        2)
-        return rt
-
-    def _to_invoice_currency(self, data, move):
-        """Convierte importes extraídos (ARS) a moneda de factura para TXT.
-
-        Por qué: El Libro IVA Digital espera importes en moneda de factura.
-        ARCA multiplica importe × tipo_cambio para obtener ARS.
-        Si escribimos ARS y el TC es 1650, ARCA computa ARS × 1650 → error.
-        Para facturas en ARS (rate=1): no-op, retorna data sin modificar.
-        """
-        if move.currency_id == move.company_currency_id:
-            return data
-        _, rate = self._get_currency_info(move)
-        if rate <= 1.001:
-            return data
-
-        # Copiar para no modificar el original (usado en DDJJ y CSV en ARS)
-        conv = dict(data)
-        for field in ('total', 'no_gravado', 'exento', 'perc_no_categ',
-                      'perc_iva', 'perc_nacionales', 'perc_iibb',
-                      'perc_mun', 'imp_internos', 'otros_tributos'):
-            conv[field] = round(data[field] / rate, 2)
-
-        # Alícuotas: convertir base y recalcular IVA para consistencia ARCA
-        conv['iva_alicuotas'] = []
-        for a in data['iva_alicuotas']:
-            base_conv = round(a['base'] / rate, 2)
-            iva_rate = self.IVA_CODE_RATE.get(a['code'], 0)
-            # Recalcular IVA = base × tasa para que ARCA valide OK
-            amount_conv = round(base_conv * iva_rate / 100, 2) if iva_rate > 0 \
-                else round(a['amount'] / rate, 2)
-            conv['iva_alicuotas'].append({
-                'code': a['code'],
-                'base': base_conv,
-                'amount': amount_conv,
-            })
-
-        # iva_by_concepto: convertir base y recalcular IVA (igual que alícuotas)
-        # Por qué: CSV crédito/restitución agrupa por concepto+alícuota.
-        # Debe coincidir con lo que ARCA suma del TXT (moneda factura).
-        conv['iva_by_concepto'] = {}
-        for ckey, cdata in data.get('iva_by_concepto', {}).items():
-            base_conv = round(cdata['base'] / rate, 2)
-            iva_rate = self.IVA_CODE_RATE.get(ckey[1], 0)
-            amount_conv = round(base_conv * iva_rate / 100, 2) if iva_rate > 0 \
-                else round(cdata['amount'] / rate, 2)
-            conv['iva_by_concepto'][ckey] = {
-                'base': base_conv, 'amount': amount_conv,
-            }
-
-        # Recalcular total desde partes (evita drift de redondeo)
-        gravado = sum(a['base'] for a in conv['iva_alicuotas'])
-        iva = sum(a['amount'] for a in conv['iva_alicuotas'])
-        conv['total'] = round(
-            gravado + iva
-            + conv['no_gravado'] + conv['exento']
-            + conv['perc_no_categ'] + conv['perc_iva']
-            + conv['perc_nacionales'] + conv['perc_iibb']
-            + conv['perc_mun'] + conv['imp_internos']
-            + conv['otros_tributos'],
-        2)
-        return conv
 
     def _get_operation_code(self, data):
         """Determina el código de operación AFIP.
