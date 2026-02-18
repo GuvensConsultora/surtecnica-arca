@@ -650,13 +650,11 @@ class LibroIvaDigitalWizard(models.TransientModel):
                                 'code': code, 'base': 0.0, 'amount': 0.0}
                         iva_by_code[code]['base'] += bal
 
-                        # Concepto ARCA: 1=Productos, 2=Servicios, 3=Productos y Servicios
-                        # Por qué: CSV crédito fiscal agrupa por concepto+alícuota.
-                        # ARCA F.2051 usa 2 para servicios puros (no 3 que es mixto).
-                        product = line.product_id
-                        concepto = '1' if (
-                            product and product.type in ('consu', 'product')
-                        ) else '2'
+                        # Concepto ARCA: 1=Bienes, 2=Locaciones, 3=Servicios
+                        # Por qué: El TXT no tiene campo concepto, ARCA no puede
+                        # cruzar por concepto. Todo como 1 (bienes) para que el
+                        # total CSV coincida con el total TXT sin ambigüedad.
+                        concepto = '1'
                         ckey = (concepto, code)
                         if ckey not in iva_by_concepto:
                             iva_by_concepto[ckey] = {
