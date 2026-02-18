@@ -169,18 +169,29 @@ class LibroIvaDigitalWizard(models.TransientModel):
         c_extracted = {m.id: self._extract_move_data(m) for m in compras}
 
         # Generar líneas TXT + mapeo usando datos pre-extraídos
+        # Por qué: _procesar_moves llama internamente a _to_invoice_currency
+        # para cada move, convirtiendo ARS → moneda factura en el TXT.
         v_cbte, v_alic, v_cbte_map, v_alic_map = self._procesar_moves(
             ventas, 'ventas', v_extracted)
         c_cbte, c_alic, c_cbte_map, c_alic_map = self._procesar_moves(
             compras, 'compras', c_extracted)
 
-        # DDJJ IVA: HTML + datos agregados para Excel (reutiliza extracted)
-        ddjj_html, v_ddjj, c_ddjj = self._compute_ddjj_iva_html(
-            ventas, compras, v_extracted, c_extracted)
+        # Convertir extracted a moneda factura para DDJJ y CSV
+        # Por qué: ARCA valida que CSV apertura == suma TXT comprobantes.
+        # El TXT usa moneda factura → CSV y DDJJ deben usar lo mismo.
+        # Para facturas ARS (rate=1): _to_invoice_currency es no-op.
+        v_conv = {m.id: self._to_invoice_currency(v_extracted[m.id], m)
+                  for m in ventas}
+        c_conv = {m.id: self._to_invoice_currency(c_extracted[m.id], m)
+                  for m in compras}
 
-        # Generar CSV IVA Simple (Apertura otros conceptos F.2051)
+        # DDJJ IVA: en moneda factura para coincidir con portal ARCA
+        ddjj_html, v_ddjj, c_ddjj = self._compute_ddjj_iva_html(
+            ventas, compras, v_conv, c_conv)
+
+        # CSV IVA Simple: en moneda factura para coincidir con TXT
         csv_data, csv_totals = self._generar_csvs_iva_simple(
-            ventas, compras, v_extracted, c_extracted)
+            ventas, compras, v_conv, c_conv)
 
         # Cruce: validar que CSV apertura coincida con comprobantes TXT
         ddjj_html += self._render_cruce_csv_html(csv_totals, v_ddjj, c_ddjj)
@@ -1040,6 +1051,19 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 'base': base_conv,
                 'amount': amount_conv,
             })
+
+        # iva_by_concepto: convertir base y recalcular IVA (igual que alícuotas)
+        # Por qué: CSV crédito/restitución agrupa por concepto+alícuota.
+        # Debe coincidir con lo que ARCA suma del TXT (moneda factura).
+        conv['iva_by_concepto'] = {}
+        for ckey, cdata in data.get('iva_by_concepto', {}).items():
+            base_conv = round(cdata['base'] / rate, 2)
+            iva_rate = self.IVA_CODE_RATE.get(ckey[1], 0)
+            amount_conv = round(base_conv * iva_rate / 100, 2) if iva_rate > 0 \
+                else round(cdata['amount'] / rate, 2)
+            conv['iva_by_concepto'][ckey] = {
+                'base': base_conv, 'amount': amount_conv,
+            }
 
         # Recalcular total desde partes (evita drift de redondeo)
         gravado = sum(a['base'] for a in conv['iva_alicuotas'])
