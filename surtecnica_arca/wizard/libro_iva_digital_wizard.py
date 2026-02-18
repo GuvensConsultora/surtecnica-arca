@@ -595,8 +595,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
         exento, percepciones y otros tributos (→ archivo cabecera).
         El signo se invierte para NC/ND negativas.
         """
-        # Por qué: NC tienen importes positivos en Odoo, pero negativos en el TXT
-        sign = -1 if move.move_type in ('out_refund', 'in_refund') else 1
+        # Por qué: ARCA espera importes positivos siempre (también en NC).
+        # El tipo de comprobante (código 3=NC-A, 8=NC-B, etc.) le dice a ARCA
+        # que es NC y lo resta internamente. Sin sign flip.
+        sign = 1
 
         # Por qué: documentos con letra 'E' son exportación (código operación 'X')
         doc_type = move.l10n_latam_document_type_id
@@ -1053,12 +1055,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
         """Importe → posición fija, sin punto decimal.
 
         Por qué: ARCA usa "13 enteros 2 decimales sin punto decimal" = 15 chars.
-        Para NC (negativos): signo '-' ocupa 1 posición, quedan length-1 dígitos.
-        Ejemplo: 1500.00 → '000000000150000', -1500.00 → '-00000000150000'
+        Siempre positivo: ARCA identifica NC por el tipo de comprobante.
+        Ejemplo: 1500.00 → '000000000150000'
         """
         cents = int(round(abs(amount) * 100))
-        if amount < -0.001:
-            return '-' + str(cents).zfill(length - 1)
         return str(cents).zfill(length)
 
     def _fmt_rate(self, rate):
@@ -2247,7 +2247,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
             )
 
         # Exento/no gravado: tipo_op 3, cols 3-7 vacías, monto en col 8
-        if abs(exento_ng) > 0.005:
+        if exento_ng > 0.005:
             lines.append(f'{act};3;;;;;;{fmt(exento_ng)}')
 
         # Totales para cruce con comprobantes informados (TXT)
@@ -2279,11 +2279,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 key = (act, '1', sujeto, alic['code'])
                 if key not in acum:
                     acum[key] = {'neto': 0.0, 'iva': 0.0}
-                # NC tienen valores negativos en extracted → abs
-                acum[key]['neto'] += abs(alic['base'])
-                acum[key]['iva'] += abs(alic['amount'])
+                acum[key]['neto'] += alic['base']
+                acum[key]['iva'] += alic['amount']
 
-            monto_exng = abs(data['exento']) + abs(data['no_gravado'])
+            monto_exng = data['exento'] + data['no_gravado']
             if monto_exng > 0.005:
                 exento_ng += monto_exng
 
@@ -2299,7 +2298,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
 
         # Exento/no gravado: tipo_op 2, cols 3-6 vacías, monto en col 7
         # Por qué: En restitución, ARCA usa tipo_op 2 para exento/NG (no 3)
-        if abs(exento_ng) > 0.005:
+        if exento_ng > 0.005:
             lines.append(f'{act};2;;;;;{fmt(exento_ng)}')
 
         # Totales para cruce con comprobantes informados (TXT)
@@ -2362,21 +2361,18 @@ class LibroIvaDigitalWizard(models.TransientModel):
         """CSV 4: Restitución crédito fiscal — NC de compra.
 
         Por qué: Igual que CSV 3 pero sin campo credito_computable (4 cols).
-        Importes en valor absoluto (NC tienen signo negativo en extracted).
         Usa extracted[move.id]['iva_by_concepto'] — misma fuente que TXT/DDJJ.
         Formato: concepto;code_afip;neto;credito_facturado
         """
         acum = {}
 
         for move in moves:
-            # Por qué: Usar iva_by_concepto de _extract_move_data (única fuente)
             by_concepto = extracted[move.id]['iva_by_concepto']
             for key, vals in by_concepto.items():
                 if key not in acum:
                     acum[key] = {'neto': 0.0, 'iva': 0.0}
-                # NC → valores negativos en extracted → abs
-                acum[key]['neto'] += abs(vals['base'])
-                acum[key]['iva'] += abs(vals['amount'])
+                acum[key]['neto'] += vals['base']
+                acum[key]['iva'] += vals['amount']
 
         lines = [self._CSV_HEADER_REST_CREDITO]
         fmt = self._fmt_csv_amount
