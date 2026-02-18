@@ -648,12 +648,13 @@ class LibroIvaDigitalWizard(models.TransientModel):
                                 'code': code, 'base': 0.0, 'amount': 0.0}
                         iva_by_code[code]['base'] += bal
 
-                        # Concepto: bienes si producto físico, servicios si no
-                        # Por qué: CSV crédito fiscal agrupa por concepto+alícuota
+                        # Concepto ARCA: 1=Productos, 2=Servicios, 3=Productos y Servicios
+                        # Por qué: CSV crédito fiscal agrupa por concepto+alícuota.
+                        # ARCA F.2051 usa 2 para servicios puros (no 3 que es mixto).
                         product = line.product_id
                         concepto = '1' if (
                             product and product.type in ('consu', 'product')
-                        ) else '3'
+                        ) else '2'
                         ckey = (concepto, code)
                         if ckey not in iva_by_concepto:
                             iva_by_concepto[ckey] = {
