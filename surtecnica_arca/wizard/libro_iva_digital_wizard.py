@@ -485,7 +485,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
         """
         move_types = ['out_invoice', 'out_refund'] if tipo == 'out' \
             else ['in_invoice', 'in_refund']
+        # Por qué: Filtrar por company_id evita mezclar comprobantes
+        # de otras compañías en entornos multi-empresa.
         return self.env['account.move'].search([
+            ('company_id', '=', self.env.company.id),
             ('state', '=', 'posted'),
             ('move_type', 'in', move_types),
             ('invoice_date', '>=', self.date_from),
