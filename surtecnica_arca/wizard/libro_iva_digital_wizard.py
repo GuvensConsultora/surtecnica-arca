@@ -615,11 +615,14 @@ class LibroIvaDigitalWizard(models.TransientModel):
             'iva_alicuotas': [],       # [{code, base, amount}]
         }
 
-        # Paso 1: Clasificar líneas de producto → no_gravado / exento
+        # Paso 1: Clasificar líneas de producto → no_gravado / exento / base IVA
         # Por qué: Usar abs(line.balance) (moneda empresa ARS) en vez de
         # price_subtotal (moneda factura). Para facturas en moneda extranjera
         # price_subtotal está en USD/EUR, causando importes mixtos.
         # balance siempre está en ARS = moneda de la empresa.
+        # Tip: Calcular base IVA aquí (no desde tax_base_amount) asegura
+        # consistencia con el CSV que también usa invoice_line_ids.balance.
+        iva_by_code = {}
         for line in move.invoice_line_ids.filtered(
             lambda l: l.display_type not in ('line_section', 'line_note')
         ):
@@ -628,18 +631,29 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 result['no_gravado'] += abs(line.balance) * sign
             elif line_class == 'exento':
                 result['exento'] += abs(line.balance) * sign
+            else:
+                # Gravado: acumular base por código de alícuota IVA
+                for tax in line.tax_ids:
+                    code = self._get_vat_afip_code(tax)
+                    if code and code in self.IVA_GRAVADO_CODES:
+                        if code not in iva_by_code:
+                            iva_by_code[code] = {
+                                'code': code, 'base': 0.0, 'amount': 0.0}
+                        iva_by_code[code]['base'] += abs(line.balance) * sign
+                        break  # Una línea tiene una sola alícuota IVA
 
-        # Paso 2: IVA gravado desde tax lines → alícuotas
-        iva_by_code = {}
+        # Paso 2: IVA amount + impuestos no-IVA desde tax lines
+        # Por qué: El monto de IVA (amount) se toma de la tax line (balance),
+        # y los impuestos no-IVA (percepciones, IIBB, etc.) se clasifican aquí.
         for line in move.line_ids.filtered(lambda l: l.tax_line_id):
             tax = line.tax_line_id
             vat_code = self._get_vat_afip_code(tax)
 
             if vat_code and vat_code in self.IVA_GRAVADO_CODES:
-                # IVA gravado → archivo alícuotas
+                # IVA gravado → sumar amount (el monto del impuesto en ARS)
                 if vat_code not in iva_by_code:
-                    iva_by_code[vat_code] = {'code': vat_code, 'base': 0.0, 'amount': 0.0}
-                iva_by_code[vat_code]['base'] += abs(line.tax_base_amount) * sign
+                    iva_by_code[vat_code] = {
+                        'code': vat_code, 'base': 0.0, 'amount': 0.0}
                 iva_by_code[vat_code]['amount'] += abs(line.balance) * sign
             elif vat_code in ('1', '2'):
                 # No gravado / exento ya computados en paso 1
@@ -1103,8 +1117,8 @@ class LibroIvaDigitalWizard(models.TransientModel):
             extracted_data: dict {move_id: data} pre-calculado. Si es None,
                 extrae datos de cada move.
         Por qué: El portal ARCA separa la "Apertura de otros conceptos" en
-        secciones distintas para facturas (débito/crédito) y NC (restitución).
-        Se calculan totales separados para cada grupo.
+        secciones distintas para facturas, ND y NC (restitución).
+        Se calculan totales separados para cruce contra CSV apertura.
         """
         _EMPTY_TOTALES = {
             'count': 0, 'gravado': 0.0, 'iva': 0.0,
@@ -1116,22 +1130,28 @@ class LibroIvaDigitalWizard(models.TransientModel):
         }
         por_tipo = {}
         alicuotas = {}
-        # Por qué: alícuotas separadas fac/nc para cruce CSV por concepto
+        # Por qué: alícuotas separadas fac/nd/nc para cruce CSV detallado
         alicuotas_fac = {}
+        alicuotas_nd = {}
         alicuotas_nc = {}
         totales = dict(_EMPTY_TOTALES)
         # Por qué: ARCA exige aperturas separadas para facturas y NC
-        # Facturas (+ ND) → Débito/Crédito Fiscal
+        # Facturas → Débito/Crédito Fiscal
+        # ND → Débito/Crédito Fiscal (separado de facturas para cruce)
         # NC → Restitución del Débito/Crédito Fiscal
         totales_fac = dict(_EMPTY_TOTALES)
+        totales_nd = dict(_EMPTY_TOTALES)
         totales_nc = dict(_EMPTY_TOTALES)
 
         for move in moves:
             data = extracted_data[move.id] if extracted_data else self._extract_move_data(move)
             doc_type = move.l10n_latam_document_type_id
             key = doc_type.id
-            # Por qué: out_refund/in_refund = NC → restitución en ARCA
+            # Por qué: internal_type discrimina Factura/ND/NC sin hardcodear
+            # códigos AFIP. out_refund/in_refund son NC por move_type.
             es_nc = move.move_type in ('out_refund', 'in_refund')
+            es_nd = (not es_nc
+                     and getattr(doc_type, 'internal_type', '') == 'debit_note')
 
             gravado = sum(a['base'] for a in data['iva_alicuotas'])
             iva = sum(a['amount'] for a in data['iva_alicuotas'])
@@ -1150,8 +1170,13 @@ class LibroIvaDigitalWizard(models.TransientModel):
             row['exento'] += data['exento']
             row['total'] += data['total']
 
-            # Acumular en totales generales + separados por tipo
-            target = totales_nc if es_nc else totales_fac
+            # Acumular en totales generales + separados por tipo (fac/nd/nc)
+            if es_nc:
+                target = totales_nc
+            elif es_nd:
+                target = totales_nd
+            else:
+                target = totales_fac
             for bucket in (totales, target):
                 for field in ('no_gravado', 'exento', 'perc_iva',
                               'perc_nacionales', 'perc_iibb', 'perc_mun',
@@ -1163,8 +1188,13 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 bucket['iva'] += iva
                 bucket['total'] += data['total']
 
-            # Acumular por código de alícuota IVA (total + separado fac/nc)
-            target_alic = alicuotas_nc if es_nc else alicuotas_fac
+            # Acumular por código de alícuota IVA (total + separado fac/nd/nc)
+            if es_nc:
+                target_alic = alicuotas_nc
+            elif es_nd:
+                target_alic = alicuotas_nd
+            else:
+                target_alic = alicuotas_fac
             for alic in data['iva_alicuotas']:
                 code = alic['code']
                 for bucket in (alicuotas, target_alic):
@@ -1177,10 +1207,12 @@ class LibroIvaDigitalWizard(models.TransientModel):
             'por_tipo': sorted(por_tipo.values(), key=lambda x: x['code']),
             'alicuotas': alicuotas,
             'alicuotas_fac': alicuotas_fac,
+            'alicuotas_nd': alicuotas_nd,
             'alicuotas_nc': alicuotas_nc,
             'totales': totales,
-            'totales_fac': totales_fac,  # facturas + ND
-            'totales_nc': totales_nc,     # notas de crédito
+            'totales_fac': totales_fac,   # solo facturas
+            'totales_nd': totales_nd,      # solo notas de débito
+            'totales_nc': totales_nc,      # notas de crédito
         }
 
     def _fmt_money(self, amount):
@@ -1502,58 +1534,85 @@ class LibroIvaDigitalWizard(models.TransientModel):
         """Cruce de totales CSV apertura vs comprobantes informados.
 
         Por qué: Valida que los importes de los CSV de apertura coincidan
-        con los comprobantes informados. Muestra desglose por concepto
-        (bienes/servicios) para crédito fiscal de compras, y comparación
-        por alícuota contra los totales de los TXT.
-        Nota: TXT tiene importes en moneda factura (ARCA reconvierte),
-        DDJJ y CSV tienen importes en ARS. Se compara DDJJ vs CSV (ambos ARS).
+        con los comprobantes informados. Muestra facturas y ND por separado
+        para facilitar la identificación de diferencias. CSV débito/crédito
+        incluye Fac+ND; CSV restitución incluye solo NC.
+        Tip: Todos los importes están en ARS (moneda empresa). El TXT puede
+        tener moneda factura, pero DDJJ y CSV siempre usan ARS.
         """
         fmt = self._fmt_money
         h = ['<div class="ddjj-iva"><div class="section">']
         h.append('<h3>CRUCE: CSV Apertura vs Comprobantes Informados</h3>')
+        hay_dif = False
 
-        # ---- VENTAS: comparación compacta ----
+        def _diff_html(val_a, val_b):
+            """Compara dos importes y retorna HTML con OK/diferencia."""
+            nonlocal hay_dif
+            diff = round(val_a - val_b, 2)
+            if abs(diff) > 0.01:
+                hay_dif = True
+                return (f'<span style="color:#c0392b;font-weight:bold">'
+                        f'{fmt(diff)}</span>')
+            return '<span style="color:#27ae60">OK</span>'
+
+        # ---- VENTAS: Fac + ND separadas, luego NC ----
         h.append('<h3 style="font-size:12px">Debito Fiscal (Ventas)</h3>')
         h.append('<table><tr>'
                  '<th>Concepto</th><th>Comprobantes</th>'
                  '<th>CSV Apertura</th><th>Dif.</th></tr>')
         vf = v_ddjj['totales_fac']
-        df = csv_totals['df']
+        vnd = v_ddjj['totales_nd']
         vnc = v_ddjj['totales_nc']
+        df = csv_totals['df']
         rdf = csv_totals['rdf']
+        # CSV débito = Fac + ND → sumar ambos para comparar
+        fac_nd_grav = vf['gravado'] + vnd['gravado']
+        fac_nd_iva = vf['iva'] + vnd['iva']
+        fac_nd_exng = (vf['exento'] + vf['no_gravado']
+                       + vnd['exento'] + vnd['no_gravado'])
         ventas_rows = [
-            ('Facturas — Neto Gravado', vf['gravado'], df['neto']),
-            ('Facturas — Debito Fiscal', vf['iva'], df['iva']),
-            ('Facturas — Exento + No Grav.',
-             vf['exento'] + vf['no_gravado'], df['exento_ng']),
+            ('Fac — Neto Gravado', vf['gravado'], ''),
+            ('ND — Neto Gravado', vnd['gravado'], ''),
+            ('Fac+ND — Neto Gravado', fac_nd_grav, df['neto']),
+            ('Fac+ND — Debito Fiscal', fac_nd_iva, df['iva']),
+            ('Fac+ND — Exento + No Grav.', fac_nd_exng, df['exento_ng']),
             ('NC — Neto Gravado', abs(vnc['gravado']), rdf['neto']),
             ('NC — Rest. Debito', abs(vnc['iva']), rdf['iva']),
             ('NC — Exento + No Grav.',
              abs(vnc['exento']) + abs(vnc['no_gravado']), rdf['exento_ng']),
         ]
-        hay_dif = False
         for label, ddjj_val, csv_val in ventas_rows:
-            diff = round(ddjj_val - csv_val, 2)
-            if abs(diff) > 0.01:
-                hay_dif = True
-                diff_html = (f'<span style="color:#c0392b;font-weight:bold">'
-                             f'{fmt(diff)}</span>')
+            if csv_val == '':
+                # Fila informativa sin comparación (detalle Fac / ND)
+                h.append(f'<tr style="color:#7f8c8d"><td>{label}</td>'
+                         f'<td>{fmt(ddjj_val)}</td>'
+                         f'<td></td><td></td></tr>')
             else:
-                diff_html = '<span style="color:#27ae60">OK</span>'
-            h.append(f'<tr><td>{label}</td><td>{fmt(ddjj_val)}</td>'
-                     f'<td>{fmt(csv_val)}</td><td>{diff_html}</td></tr>')
+                dh = _diff_html(ddjj_val, csv_val)
+                h.append(f'<tr><td>{label}</td><td>{fmt(ddjj_val)}</td>'
+                         f'<td>{fmt(csv_val)}</td><td>{dh}</td></tr>')
         h.append('</table>')
 
-        # ---- COMPRAS FAC: detalle por concepto (bienes/servicios) ----
+        # ---- COMPRAS FAC+ND: detalle por concepto (bienes/servicios) ----
         cf_csv = csv_totals['cf']
-        cf_alic = c_ddjj.get('alicuotas_fac', {})
+        # Por qué: CSV crédito incluye Fac+ND → sumar alicuotas_fac + alicuotas_nd
+        cf_alic_fac = c_ddjj.get('alicuotas_fac', {})
+        cf_alic_nd = c_ddjj.get('alicuotas_nd', {})
+        cf_alic = {}
+        for code in set(list(cf_alic_fac.keys()) + list(cf_alic_nd.keys())):
+            cf_alic[code] = {
+                'base': (cf_alic_fac.get(code, {}).get('base', 0)
+                         + cf_alic_nd.get(code, {}).get('base', 0)),
+                'amount': (cf_alic_fac.get(code, {}).get('amount', 0)
+                           + cf_alic_nd.get(code, {}).get('amount', 0)),
+            }
         h.append('<h3 style="font-size:12px">'
-                 'Credito Fiscal — Facturas de Compra</h3>')
+                 'Credito Fiscal — Facturas + ND de Compra</h3>')
         h.append('<table><tr><th>Concepto</th><th>Alicuota</th>'
                  '<th>Neto Gravado</th><th>Credito Fiscal</th></tr>')
 
-        # Filas de detalle por concepto+alícuota
-        csv_by_code = {}  # agregar por código para comparar con DDJJ
+        # Filas de detalle por concepto+alícuota del CSV
+        csv_by_code = {}
         for d in cf_csv.get('detalle', []):
             clabel = self.CONCEPTO_LABEL.get(d['concepto'], d['concepto'])
             alabel = self.IVA_CODE_LABEL.get(d['code'], d['code'])
@@ -1570,31 +1629,40 @@ class LibroIvaDigitalWizard(models.TransientModel):
                  f'<td>{fmt(cf_csv["neto"])}</td>'
                  f'<td>{fmt(cf_csv["iva"])}</td></tr>')
 
-        # Comparación por alícuota: DDJJ fac vs CSV agrupado por code
+        # Comparación por alícuota: DDJJ (fac+nd) vs CSV agrupado por code
+        # Muestra detalle Fac / ND por separado para diagnóstico
         for code in sorted(set(list(cf_alic.keys()) +
                                list(csv_by_code.keys()))):
             alabel = self.IVA_CODE_LABEL.get(code, code)
+            # Detalle informativo: Fac y ND por separado
+            fac_b = round(cf_alic_fac.get(code, {}).get('base', 0), 2)
+            fac_i = round(cf_alic_fac.get(code, {}).get('amount', 0), 2)
+            nd_b = round(cf_alic_nd.get(code, {}).get('base', 0), 2)
+            nd_i = round(cf_alic_nd.get(code, {}).get('amount', 0), 2)
+            if fac_b or fac_i:
+                h.append(
+                    f'<tr style="color:#7f8c8d;background:#f8f6fa">'
+                    f'<td>Fac</td><td>{alabel}</td>'
+                    f'<td>{fmt(fac_b)}</td>'
+                    f'<td>{fmt(fac_i)}</td></tr>')
+            if nd_b or nd_i:
+                h.append(
+                    f'<tr style="color:#7f8c8d;background:#f8f6fa">'
+                    f'<td>ND</td><td>{alabel}</td>'
+                    f'<td>{fmt(nd_b)}</td>'
+                    f'<td>{fmt(nd_i)}</td></tr>')
+            # Comparación Fac+ND vs CSV
             ddjj_b = round(cf_alic.get(code, {}).get('base', 0), 2)
             ddjj_i = round(cf_alic.get(code, {}).get('amount', 0), 2)
             csv_b = round(csv_by_code.get(code, {}).get('neto', 0), 2)
             csv_i = round(csv_by_code.get(code, {}).get('iva', 0), 2)
-            diff_b = round(ddjj_b - csv_b, 2)
-            diff_i = round(ddjj_i - csv_i, 2)
-            ok_b = abs(diff_b) <= 0.01
-            ok_i = abs(diff_i) <= 0.01
-            if not (ok_b and ok_i):
-                hay_dif = True
-            st_b = ('<span style="color:#27ae60">OK</span>' if ok_b
-                    else f'<span style="color:#c0392b;font-weight:bold">'
-                         f'{fmt(diff_b)}</span>')
-            st_i = ('<span style="color:#27ae60">OK</span>' if ok_i
-                    else f'<span style="color:#c0392b;font-weight:bold">'
-                         f'{fmt(diff_i)}</span>')
+            db = _diff_html(ddjj_b, csv_b)
+            di = _diff_html(ddjj_i, csv_i)
             h.append(
-                f'<tr style="background:#f8f6fa">'
-                f'<td colspan="2">vs DDJJ IVA {alabel}</td>'
-                f'<td>{st_b} ({fmt(ddjj_b)})</td>'
-                f'<td>{st_i} ({fmt(ddjj_i)})</td></tr>')
+                f'<tr style="background:#eef;font-weight:bold">'
+                f'<td>Fac+ND</td><td>vs CSV {alabel}</td>'
+                f'<td>{db} ({fmt(ddjj_b)})</td>'
+                f'<td>{di} ({fmt(ddjj_i)})</td></tr>')
         h.append('</table>')
 
         # ---- COMPRAS NC: detalle por concepto (restitución) ----
@@ -1629,23 +1697,13 @@ class LibroIvaDigitalWizard(models.TransientModel):
             ddjj_i = round(abs(rcf_alic.get(code, {}).get('amount', 0)), 2)
             csv_b = round(rcf_by_code.get(code, {}).get('neto', 0), 2)
             csv_i = round(rcf_by_code.get(code, {}).get('iva', 0), 2)
-            diff_b = round(ddjj_b - csv_b, 2)
-            diff_i = round(ddjj_i - csv_i, 2)
-            ok_b = abs(diff_b) <= 0.01
-            ok_i = abs(diff_i) <= 0.01
-            if not (ok_b and ok_i):
-                hay_dif = True
-            st_b = ('<span style="color:#27ae60">OK</span>' if ok_b
-                    else f'<span style="color:#c0392b;font-weight:bold">'
-                         f'{fmt(diff_b)}</span>')
-            st_i = ('<span style="color:#27ae60">OK</span>' if ok_i
-                    else f'<span style="color:#c0392b;font-weight:bold">'
-                         f'{fmt(diff_i)}</span>')
+            db = _diff_html(ddjj_b, csv_b)
+            di = _diff_html(ddjj_i, csv_i)
             h.append(
                 f'<tr style="background:#f8f6fa">'
                 f'<td colspan="2">vs DDJJ IVA {alabel}</td>'
-                f'<td>{st_b} ({fmt(ddjj_b)})</td>'
-                f'<td>{st_i} ({fmt(ddjj_i)})</td></tr>')
+                f'<td>{db} ({fmt(ddjj_b)})</td>'
+                f'<td>{di} ({fmt(ddjj_i)})</td></tr>')
         h.append('</table>')
 
         # ---- Resultado general ----
