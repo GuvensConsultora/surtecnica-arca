@@ -1118,6 +1118,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
         Por qué: El portal ARCA separa la "Apertura de otros conceptos" en
         secciones distintas para facturas, ND y NC (restitución).
         Se calculan totales separados para cruce contra CSV apertura.
+        También recolecta detalle por comprobante para Libro IVA Excel.
         """
         _EMPTY_TOTALES = {
             'count': 0, 'gravado': 0.0, 'iva': 0.0,
@@ -1141,6 +1142,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
         totales_fac = dict(_EMPTY_TOTALES)
         totales_nd = dict(_EMPTY_TOTALES)
         totales_nc = dict(_EMPTY_TOTALES)
+
+        # Por qué: Detalle por comprobante para hojas Libro IVA en Excel.
+        # Cada fila tiene los datos necesarios para la grilla del libro.
+        detalle_moves = []
 
         for move in moves:
             data = extracted_data[move.id] if extracted_data else self._extract_move_data(move)
@@ -1202,6 +1207,36 @@ class LibroIvaDigitalWizard(models.TransientModel):
                     bucket[code]['base'] += alic['base']
                     bucket[code]['amount'] += alic['amount']
 
+            # Detalle por comprobante para Libro IVA Excel
+            # Por qué: Desglose de neto/iva por alícuota permite al usuario
+            # cruzar cada factura contra el TXT y el portal ARCA.
+            partner = move.commercial_partner_id
+            iva_by_code = {a['code']: a for a in data['iva_alicuotas']}
+            move_row = {
+                'fecha': str(move.invoice_date),
+                'tipo_cbte': doc_type.name or '',
+                'nro_cbte': move.l10n_latam_document_number or move.name,
+                'partner': partner.name or '',
+                'cuit': partner.vat or '',
+                'es_nc': es_nc,
+            }
+            # Neto y IVA por alícuota (cada código AFIP)
+            for code in sorted(self.IVA_CODE_RATE.keys()):
+                a = iva_by_code.get(code, {})
+                move_row[f'neto_{code}'] = round(a.get('base', 0.0), 2)
+                move_row[f'iva_{code}'] = round(a.get('amount', 0.0), 2)
+            move_row['no_gravado'] = round(data['no_gravado'], 2)
+            move_row['exento'] = round(data['exento'], 2)
+            move_row['perc_iva'] = round(data['perc_iva'], 2)
+            move_row['perc_iibb'] = round(data['perc_iibb'], 2)
+            move_row['perc_mun'] = round(data['perc_mun'], 2)
+            move_row['perc_nacionales'] = round(data['perc_nacionales'], 2)
+            move_row['imp_internos'] = round(data['imp_internos'], 2)
+            move_row['otros_tributos'] = round(data['otros_tributos'], 2)
+            move_row['perc_no_categ'] = round(data['perc_no_categ'], 2)
+            move_row['total'] = round(data['total'], 2)
+            detalle_moves.append(move_row)
+
         return {
             'por_tipo': sorted(por_tipo.values(), key=lambda x: x['code']),
             'alicuotas': alicuotas,
@@ -1212,6 +1247,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
             'totales_fac': totales_fac,   # solo facturas
             'totales_nd': totales_nd,      # solo notas de débito
             'totales_nc': totales_nc,      # notas de crédito
+            'detalle_moves': detalle_moves,  # fila por comprobante para Libro IVA
         }
 
     def _fmt_money(self, amount):
@@ -1713,8 +1749,45 @@ class LibroIvaDigitalWizard(models.TransientModel):
                          f'<td>{fmt(csv_val)}</td><td>{dh}</td></tr>')
         h.append('</table>')
 
-        # ---- COMPRAS FAC+ND: detalle por concepto (bienes/servicios) ----
+        # ---- COMPRAS: Resumen totales Fac+ND y NC (igual que ventas) ----
+        # Por qué: Mostrar primero un resumen de totales para detectar
+        # diferencias rápido, antes del detalle por alícuota.
+        h.append('<h3 style="font-size:12px">Credito Fiscal (Compras)</h3>')
+        h.append('<table><tr>'
+                 '<th>Concepto</th><th>Comprobantes</th>'
+                 '<th>CSV Apertura</th><th>Dif.</th></tr>')
+        cf = c_ddjj['totales_fac']
+        cnd = c_ddjj['totales_nd']
+        cnc = c_ddjj['totales_nc']
         cf_csv = csv_totals['cf']
+        rcf_csv = csv_totals['rcf']
+        # CSV crédito = Fac + ND → sumar ambos para comparar
+        fac_nd_grav_c = cf['gravado'] + cnd['gravado']
+        fac_nd_iva_c = cf['iva'] + cnd['iva']
+        fac_nd_exng_c = (cf['exento'] + cf['no_gravado']
+                         + cnd['exento'] + cnd['no_gravado'])
+        compras_rows = [
+            ('Fac — Neto Gravado', cf['gravado'], ''),
+            ('ND — Neto Gravado', cnd['gravado'], ''),
+            ('Fac+ND — Neto Gravado', fac_nd_grav_c, cf_csv['neto']),
+            ('Fac+ND — Credito Fiscal', fac_nd_iva_c, cf_csv['iva']),
+            ('Fac+ND — Exento + No Grav.', fac_nd_exng_c, ''),
+            ('NC — Neto Gravado', abs(cnc['gravado']), rcf_csv['neto']),
+            ('NC — Rest. Credito', abs(cnc['iva']), rcf_csv['iva']),
+        ]
+        for label, ddjj_val, csv_val in compras_rows:
+            if csv_val == '':
+                # Fila informativa sin comparación
+                h.append(f'<tr style="color:#7f8c8d"><td>{label}</td>'
+                         f'<td>{fmt(ddjj_val)}</td>'
+                         f'<td></td><td></td></tr>')
+            else:
+                dh = _diff_html(ddjj_val, csv_val)
+                h.append(f'<tr><td>{label}</td><td>{fmt(ddjj_val)}</td>'
+                         f'<td>{fmt(csv_val)}</td><td>{dh}</td></tr>')
+        h.append('</table>')
+
+        # ---- COMPRAS FAC+ND: detalle por concepto (bienes/servicios) ----
         # Por qué: CSV crédito incluye Fac+ND → sumar alicuotas_fac + alicuotas_nd
         cf_alic_fac = c_ddjj.get('alicuotas_fac', {})
         cf_alic_nd = c_ddjj.get('alicuotas_nd', {})
@@ -1727,7 +1800,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
                            + cf_alic_nd.get(code, {}).get('amount', 0)),
             }
         h.append('<h3 style="font-size:12px">'
-                 'Credito Fiscal — Facturas + ND de Compra</h3>')
+                 'Detalle Credito Fiscal — Facturas + ND de Compra</h3>')
         h.append('<table><tr><th>Concepto</th><th>Alicuota</th>'
                  '<th>Neto Gravado</th><th>Credito Fiscal</th></tr>')
 
@@ -1786,7 +1859,6 @@ class LibroIvaDigitalWizard(models.TransientModel):
         h.append('</table>')
 
         # ---- COMPRAS NC: detalle por concepto (restitución) ----
-        rcf_csv = csv_totals['rcf']
         rcf_alic = c_ddjj.get('alicuotas_nc', {})
         h.append('<h3 style="font-size:12px">'
                  'Rest. Credito Fiscal — NC de Compra</h3>')
@@ -1868,11 +1940,12 @@ class LibroIvaDigitalWizard(models.TransientModel):
             return False
 
     def _generate_ddjj_excel(self):
-        """Genera Excel con el reporte DDJJ IVA en 3 hojas.
+        """Genera Excel con el reporte DDJJ IVA en 6 hojas.
 
         Por qué: Lee datos DDJJ pre-calculados de ddjj_data_json
         (generados en action_generar) para no reprocesar moves.
-        Hojas: Débito Fiscal, Crédito Fiscal, Determinación.
+        Hojas: Libro IVA Ventas, Libro IVA Compras, Débito Fiscal,
+        Crédito Fiscal, Determinación, Guía Carga Portal.
         """
         ddjj_raw = json.loads(self.ddjj_data_json or '{}')
         v_data = ddjj_raw.get('v_data')
@@ -1889,23 +1962,33 @@ class LibroIvaDigitalWizard(models.TransientModel):
         cuit = self.env.company.vat or 'Sin configurar'
         periodo = self.date_from.strftime('%m/%Y')
 
-        # Hoja 1: Débito Fiscal (Ventas)
+        # Hoja 1: Libro IVA Ventas (detalle por comprobante)
+        self._excel_sheet_libro_iva(
+            wb, fmts, 'Libro IVA Ventas', v_data,
+            empresa, cuit, periodo, es_ventas=True,
+        )
+        # Hoja 2: Libro IVA Compras (detalle por comprobante)
+        self._excel_sheet_libro_iva(
+            wb, fmts, 'Libro IVA Compras', c_data,
+            empresa, cuit, periodo, es_ventas=False,
+        )
+        # Hoja 3: Débito Fiscal (Ventas) — resumen por tipo cbte
         self._excel_sheet_iva(
             wb, fmts, 'Débito Fiscal', v_data,
             'COMPROBANTES EMITIDOS (Ventas)', 'Débito Fiscal',
             empresa, cuit, periodo,
         )
-        # Hoja 2: Crédito Fiscal (Compras)
+        # Hoja 4: Crédito Fiscal (Compras) — resumen por tipo cbte
         self._excel_sheet_iva(
             wb, fmts, 'Crédito Fiscal', c_data,
             'COMPROBANTES RECIBIDOS (Compras)', 'Crédito Fiscal',
             empresa, cuit, periodo,
         )
-        # Hoja 3: Determinación del Impuesto
+        # Hoja 5: Determinación del Impuesto
         self._excel_sheet_determinacion(
             wb, fmts, v_data, c_data, empresa, cuit, periodo,
         )
-        # Hoja 4: Guía paso a paso para carga en portal ARCA
+        # Hoja 6: Guía paso a paso para carga en portal ARCA
         self._excel_sheet_guia_portal(
             wb, fmts, v_data, c_data, empresa, cuit, periodo,
         )
@@ -1979,6 +2062,123 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 'align': 'right', 'top': 2, 'top_color': '#875A7B',
             }),
         }
+
+    def _excel_sheet_libro_iva(self, wb, fmts, sheet_name, data,
+                               empresa, cuit, periodo, es_ventas=True):
+        """Escribe hoja Libro IVA con detalle por comprobante.
+
+        Por qué: El Libro IVA Digital exige un listado factura por factura
+        con desglose de neto/iva por alícuota, exento, no gravado,
+        percepciones y total. Permite al usuario cruzar cada comprobante
+        contra el TXT y el portal ARCA.
+        NC se muestran en negativo (rojo) para reflejar la restitución.
+        """
+        detalle = data.get('detalle_moves', [])
+        ws = wb.add_worksheet(sheet_name)
+
+        # Alícuotas presentes en los datos (solo las que tienen movimiento)
+        # Por qué: No mostrar columnas vacías para alícuotas sin uso
+        codigos_usados = set()
+        for r in detalle:
+            for code in self.IVA_CODE_RATE:
+                if abs(r.get(f'neto_{code}', 0)) > 0.005 or abs(r.get(f'iva_{code}', 0)) > 0.005:
+                    codigos_usados.add(code)
+        codigos_usados = sorted(codigos_usados)
+
+        # Construir headers dinámicamente según alícuotas presentes
+        headers = ['Fecha', 'Tipo Comprobante', 'Número', 'Razón Social', 'CUIT']
+        col_keys = []  # mapeo col → key del dict para escribir datos
+        for code in codigos_usados:
+            label = self.IVA_CODE_LABEL.get(code, code)
+            headers.append(f'Neto {label}')
+            col_keys.append(f'neto_{code}')
+            headers.append(f'IVA {label}')
+            col_keys.append(f'iva_{code}')
+        headers.append('No Gravado')
+        col_keys.append('no_gravado')
+        headers.append('Exento')
+        col_keys.append('exento')
+        # Percepciones y otros según tipo (ventas usa perc_no_categ, compras usa perc_iva)
+        if es_ventas:
+            perc_cols = [
+                ('Perc. No Categ.', 'perc_no_categ'),
+                ('Perc. Nacionales', 'perc_nacionales'),
+                ('Perc. IIBB', 'perc_iibb'),
+                ('Perc. Municipales', 'perc_mun'),
+                ('Imp. Internos', 'imp_internos'),
+                ('Otros Tributos', 'otros_tributos'),
+            ]
+        else:
+            perc_cols = [
+                ('Perc. IVA', 'perc_iva'),
+                ('Perc. Nacionales', 'perc_nacionales'),
+                ('Perc. IIBB', 'perc_iibb'),
+                ('Perc. Municipales', 'perc_mun'),
+                ('Imp. Internos', 'imp_internos'),
+                ('Otros Tributos', 'otros_tributos'),
+            ]
+        # Solo agregar columnas de percepciones que tengan algún valor
+        perc_con_valor = []
+        for label, key in perc_cols:
+            if any(abs(r.get(key, 0)) > 0.005 for r in detalle):
+                perc_con_valor.append((label, key))
+                headers.append(label)
+                col_keys.append(key)
+        headers.append('Total')
+        col_keys.append('total')
+
+        # Anchos de columna
+        ws.set_column(0, 0, 12)   # Fecha
+        ws.set_column(1, 1, 22)   # Tipo
+        ws.set_column(2, 2, 18)   # Número
+        ws.set_column(3, 3, 30)   # Razón Social
+        ws.set_column(4, 4, 15)   # CUIT
+        # Columnas monetarias
+        for c in range(5, len(headers)):
+            ws.set_column(c, c, 15)
+
+        # Encabezado
+        row = 0
+        titulo = 'LIBRO IVA VENTAS' if es_ventas else 'LIBRO IVA COMPRAS'
+        ws.write(row, 0, f'{titulo} | Período {periodo}', fmts['title'])
+        row += 1
+        ws.write(row, 0, f'{empresa} | CUIT: {cuit}')
+        row += 2
+
+        # Headers
+        for col, h in enumerate(headers):
+            ws.write(row, col, h, fmts['header'])
+        row += 1
+
+        # Acumuladores para totales
+        totals = {k: 0.0 for k in col_keys}
+
+        # Filas de detalle
+        for r in detalle:
+            is_nc = r.get('es_nc', False)
+            # NC en negativo (rojo)
+            sign = -1 if is_nc else 1
+            fmt_t = fmts['nc_text'] if is_nc else fmts['text']
+            fmt_m = fmts['nc_money'] if is_nc else fmts['money']
+
+            ws.write(row, 0, r.get('fecha', ''), fmt_t)
+            ws.write(row, 1, r.get('tipo_cbte', ''), fmt_t)
+            ws.write(row, 2, r.get('nro_cbte', ''), fmt_t)
+            ws.write(row, 3, r.get('partner', ''), fmt_t)
+            ws.write(row, 4, r.get('cuit', ''), fmt_t)
+
+            for col_idx, key in enumerate(col_keys, 5):
+                val = r.get(key, 0.0) * sign
+                ws.write(row, col_idx, val, fmt_m)
+                totals[key] += val
+            row += 1
+
+        # Fila de totales
+        ws.write(row, 0, 'TOTALES', fmts['total_text'])
+        for c in range(1, 5):
+            ws.write(row, c, '', fmts['total_text'])
+        for col_idx, key in enumerate(col_keys, 5):
+            ws.write(row, col_idx, totals[key], fmts['total_money'])
 
     def _excel_sheet_iva(self, wb, fmts, sheet_name, data, titulo_cbte,
                          label_iva, empresa, cuit, periodo):
