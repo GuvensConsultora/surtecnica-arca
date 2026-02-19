@@ -603,6 +603,15 @@ class LibroIvaDigitalWizard(models.TransientModel):
         # que es NC y lo resta internamente. Sin sign flip.
         sign = 1
 
+        # Por qué: line.balance está en moneda empresa (ARS). Su signo depende
+        # del tipo de asiento: en out_invoice/in_refund las líneas de producto
+        # son créditos (balance negativo), en out_refund/in_invoice son débitos
+        # (balance positivo). inv_sign normaliza para que líneas normales queden
+        # positivas y líneas de anticipo/descuento conserven su signo negativo.
+        # Bug anterior: abs(line.balance) convertía anticipos negativos en
+        # positivos, inflando neto gravado e IVA en facturas con anticipos.
+        inv_sign = -1 if move.move_type in ('out_invoice', 'in_refund') else 1
+
         # Por qué: documentos con letra 'E' son exportación (código operación 'X')
         doc_type = move.l10n_latam_document_type_id
         is_export = getattr(doc_type, 'l10n_ar_letter', '') == 'E'
@@ -624,12 +633,11 @@ class LibroIvaDigitalWizard(models.TransientModel):
         }
 
         # Paso 1: Clasificar líneas de producto → no_gravado / exento / base IVA
-        # Por qué: Usar abs(line.balance) (moneda empresa ARS) en vez de
+        # Por qué: Usar line.balance * inv_sign (moneda empresa ARS) en vez de
         # price_subtotal (moneda factura). Para facturas en moneda extranjera
         # price_subtotal está en USD/EUR, causando importes mixtos.
         # balance siempre está en ARS = moneda de la empresa.
-        # Tip: Calcular base IVA aquí (no desde tax_base_amount) asegura
-        # consistencia con el CSV que también usa invoice_line_ids.balance.
+        # inv_sign preserva el signo negativo de anticipos/descuentos.
         # Patrón: Una sola pasada sobre invoice_line_ids alimenta iva_by_code
         # (para TXT/DDJJ) e iva_by_concepto (para CSV crédito/restitución).
         iva_by_code = {}
@@ -639,15 +647,15 @@ class LibroIvaDigitalWizard(models.TransientModel):
         ):
             line_class = self._classify_line_iva(line)
             if line_class == 'no_gravado':
-                result['no_gravado'] += abs(line.balance) * sign
+                result['no_gravado'] += line.balance * inv_sign * sign
             elif line_class == 'exento':
-                result['exento'] += abs(line.balance) * sign
+                result['exento'] += line.balance * inv_sign * sign
             else:
                 # Gravado: acumular base por código de alícuota IVA
                 for tax in line.tax_ids:
                     code = self._get_vat_afip_code(tax)
                     if code and code in self.IVA_GRAVADO_CODES:
-                        bal = abs(line.balance) * sign
+                        bal = line.balance * inv_sign * sign
                         if code not in iva_by_code:
                             iva_by_code[code] = {
                                 'code': code, 'base': 0.0, 'amount': 0.0}
@@ -677,14 +685,14 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 if vat_code not in iva_by_code:
                     iva_by_code[vat_code] = {
                         'code': vat_code, 'base': 0.0, 'amount': 0.0}
-                iva_by_code[vat_code]['amount'] += abs(line.balance) * sign
+                iva_by_code[vat_code]['amount'] += line.balance * inv_sign * sign
             elif vat_code in ('1', '2'):
                 # No gravado / exento ya computados en paso 1
                 pass
             else:
                 # Impuesto no-IVA → clasificar en cabecera
                 cat = self._classify_non_iva_tax(tax.tax_group_id)
-                result[cat] += abs(line.balance) * sign
+                result[cat] += line.balance * inv_sign * sign
 
         # Paso 3: Ajustar IVA para consistencia matemática con ARCA
         # Por qué: ARCA valida que impuesto = base × alícuota exactamente.
