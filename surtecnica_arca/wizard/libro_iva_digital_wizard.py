@@ -1279,14 +1279,35 @@ class LibroIvaDigitalWizard(models.TransientModel):
         h.append(f'<p><strong>{empresa}</strong> | CUIT: {cuit}</p>')
 
         # ---- VENTAS: COMPROBANTES EMITIDOS ----
+        # Por qué: Separar facturas/ND de NC para que el usuario vea claramente
+        # el neto. NC se muestran con signo negativo; al final se totaliza
+        # Facturas + ND - NC = Neto.
         vt = v_data['totales']
+        vtf = v_data['totales_fac']
+        vtnd = v_data['totales_nd']
+        vtnc = v_data['totales_nc']
+
+        cols_hdr = ('<th>Tipo Comprobante</th><th>Cant.</th><th>Neto Gravado</th>'
+                    '<th>Débito Fiscal</th><th>No Gravado</th>'
+                    '<th>Exento</th><th>Total</th>')
+
+        # Clasificar filas por_tipo en facturas/ND vs NC
+        rows_fac = []  # facturas + ND
+        rows_nc = []   # notas de crédito
+        for row in v_data['por_tipo']:
+            code = str(row.get('code', ''))
+            # NC ventas: códigos AFIP 3,8,13 (NC-A,NC-B,NC-C)
+            if code in ('3', '8', '13'):
+                rows_nc.append(row)
+            else:
+                rows_fac.append(row)
+
         h.append('<div class="section">')
         h.append('<h3>COMPROBANTES EMITIDOS (Ventas) - Débito Fiscal</h3>')
-        h.append('<table><tr>'
-                 '<th>Tipo Comprobante</th><th>Cant.</th><th>Neto Gravado</th>'
-                 '<th>Débito Fiscal</th><th>No Gravado</th>'
-                 '<th>Exento</th><th>Total</th></tr>')
-        for row in v_data['por_tipo']:
+
+        # -- Subtabla Facturas + ND --
+        h.append(f'<table><tr>{cols_hdr}</tr>')
+        for row in rows_fac:
             h.append(
                 f'<tr><td>{row["name"]}</td>'
                 f'<td style="text-align:center">{row["count"]}</td>'
@@ -1294,12 +1315,53 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 f'<td>{fmt(row["no_gravado"])}</td><td>{fmt(row["exento"])}</td>'
                 f'<td>{fmt(row["total"])}</td></tr>'
             )
+        # Subtotal facturas + ND
+        sub_fac_count = vtf['count'] + vtnd['count']
+        sub_fac_grav = vtf['gravado'] + vtnd['gravado']
+        sub_fac_iva = vtf['iva'] + vtnd['iva']
+        sub_fac_nograv = vtf['no_gravado'] + vtnd['no_gravado']
+        sub_fac_exento = vtf['exento'] + vtnd['exento']
+        sub_fac_total = vtf['total'] + vtnd['total']
         h.append(
-            f'<tr class="total-row"><td>TOTAL</td>'
-            f'<td style="text-align:center">{vt["count"]}</td>'
-            f'<td>{fmt(vt["gravado"])}</td><td>{fmt(vt["iva"])}</td>'
-            f'<td>{fmt(vt["no_gravado"])}</td><td>{fmt(vt["exento"])}</td>'
-            f'<td>{fmt(vt["total"])}</td></tr>'
+            f'<tr class="total-row"><td>SUBTOTAL FACTURAS + ND</td>'
+            f'<td style="text-align:center">{sub_fac_count}</td>'
+            f'<td>{fmt(sub_fac_grav)}</td><td>{fmt(sub_fac_iva)}</td>'
+            f'<td>{fmt(sub_fac_nograv)}</td><td>{fmt(sub_fac_exento)}</td>'
+            f'<td>{fmt(sub_fac_total)}</td></tr>'
+        )
+
+        # -- Filas NC en negativo --
+        if rows_nc:
+            for row in rows_nc:
+                h.append(
+                    f'<tr style="color:#c0392b"><td>{row["name"]}</td>'
+                    f'<td style="text-align:center">{row["count"]}</td>'
+                    f'<td>{fmt(-row["gravado"])}</td><td>{fmt(-row["iva"])}</td>'
+                    f'<td>{fmt(-row["no_gravado"])}</td><td>{fmt(-row["exento"])}</td>'
+                    f'<td>{fmt(-row["total"])}</td></tr>'
+                )
+            # Subtotal NC (negativo)
+            h.append(
+                f'<tr class="total-row" style="color:#c0392b">'
+                f'<td>SUBTOTAL NC</td>'
+                f'<td style="text-align:center">{vtnc["count"]}</td>'
+                f'<td>{fmt(-vtnc["gravado"])}</td><td>{fmt(-vtnc["iva"])}</td>'
+                f'<td>{fmt(-vtnc["no_gravado"])}</td><td>{fmt(-vtnc["exento"])}</td>'
+                f'<td>{fmt(-vtnc["total"])}</td></tr>'
+            )
+
+        # -- Fila NETO = Facturas + ND - NC --
+        neto_grav = sub_fac_grav - vtnc['gravado']
+        neto_iva = sub_fac_iva - vtnc['iva']
+        neto_nograv = sub_fac_nograv - vtnc['no_gravado']
+        neto_exento = sub_fac_exento - vtnc['exento']
+        neto_total = sub_fac_total - vtnc['total']
+        h.append(
+            f'<tr class="subtotal-row"><td>NETO (FA + ND - NC)</td>'
+            f'<td style="text-align:center">{sub_fac_count + vtnc["count"]}</td>'
+            f'<td>{fmt(neto_grav)}</td><td>{fmt(neto_iva)}</td>'
+            f'<td>{fmt(neto_nograv)}</td><td>{fmt(neto_exento)}</td>'
+            f'<td>{fmt(neto_total)}</td></tr>'
         )
         h.append('</table>')
 
@@ -1320,14 +1382,34 @@ class LibroIvaDigitalWizard(models.TransientModel):
         h.append('</table></div>')
 
         # ---- COMPRAS: COMPROBANTES RECIBIDOS ----
+        # Por qué: Misma lógica que ventas — separar facturas/ND de NC,
+        # mostrar NC en negativo y totalizar neto.
         ct = c_data['totales']
+        ctf = c_data['totales_fac']
+        ctnd = c_data['totales_nd']
+        ctnc = c_data['totales_nc']
+
+        cols_hdr_c = ('<th>Tipo Comprobante</th><th>Cant.</th><th>Neto Gravado</th>'
+                      '<th>Crédito Fiscal</th><th>No Gravado</th>'
+                      '<th>Exento</th><th>Total</th>')
+
+        # Clasificar filas por_tipo en facturas/ND vs NC
+        rows_fac_c = []
+        rows_nc_c = []
+        for row in c_data['por_tipo']:
+            code = str(row.get('code', ''))
+            # NC compras: códigos AFIP 3,8,13 (NC-A,NC-B,NC-C)
+            if code in ('3', '8', '13'):
+                rows_nc_c.append(row)
+            else:
+                rows_fac_c.append(row)
+
         h.append('<div class="section">')
         h.append('<h3>COMPROBANTES RECIBIDOS (Compras) - Crédito Fiscal</h3>')
-        h.append('<table><tr>'
-                 '<th>Tipo Comprobante</th><th>Cant.</th><th>Neto Gravado</th>'
-                 '<th>Crédito Fiscal</th><th>No Gravado</th>'
-                 '<th>Exento</th><th>Total</th></tr>')
-        for row in c_data['por_tipo']:
+
+        # -- Subtabla Facturas + ND --
+        h.append(f'<table><tr>{cols_hdr_c}</tr>')
+        for row in rows_fac_c:
             h.append(
                 f'<tr><td>{row["name"]}</td>'
                 f'<td style="text-align:center">{row["count"]}</td>'
@@ -1335,12 +1417,51 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 f'<td>{fmt(row["no_gravado"])}</td><td>{fmt(row["exento"])}</td>'
                 f'<td>{fmt(row["total"])}</td></tr>'
             )
+        sub_fac_c_count = ctf['count'] + ctnd['count']
+        sub_fac_c_grav = ctf['gravado'] + ctnd['gravado']
+        sub_fac_c_iva = ctf['iva'] + ctnd['iva']
+        sub_fac_c_nograv = ctf['no_gravado'] + ctnd['no_gravado']
+        sub_fac_c_exento = ctf['exento'] + ctnd['exento']
+        sub_fac_c_total = ctf['total'] + ctnd['total']
         h.append(
-            f'<tr class="total-row"><td>TOTAL</td>'
-            f'<td style="text-align:center">{ct["count"]}</td>'
-            f'<td>{fmt(ct["gravado"])}</td><td>{fmt(ct["iva"])}</td>'
-            f'<td>{fmt(ct["no_gravado"])}</td><td>{fmt(ct["exento"])}</td>'
-            f'<td>{fmt(ct["total"])}</td></tr>'
+            f'<tr class="total-row"><td>SUBTOTAL FACTURAS + ND</td>'
+            f'<td style="text-align:center">{sub_fac_c_count}</td>'
+            f'<td>{fmt(sub_fac_c_grav)}</td><td>{fmt(sub_fac_c_iva)}</td>'
+            f'<td>{fmt(sub_fac_c_nograv)}</td><td>{fmt(sub_fac_c_exento)}</td>'
+            f'<td>{fmt(sub_fac_c_total)}</td></tr>'
+        )
+
+        # -- Filas NC en negativo --
+        if rows_nc_c:
+            for row in rows_nc_c:
+                h.append(
+                    f'<tr style="color:#c0392b"><td>{row["name"]}</td>'
+                    f'<td style="text-align:center">{row["count"]}</td>'
+                    f'<td>{fmt(-row["gravado"])}</td><td>{fmt(-row["iva"])}</td>'
+                    f'<td>{fmt(-row["no_gravado"])}</td><td>{fmt(-row["exento"])}</td>'
+                    f'<td>{fmt(-row["total"])}</td></tr>'
+                )
+            h.append(
+                f'<tr class="total-row" style="color:#c0392b">'
+                f'<td>SUBTOTAL NC</td>'
+                f'<td style="text-align:center">{ctnc["count"]}</td>'
+                f'<td>{fmt(-ctnc["gravado"])}</td><td>{fmt(-ctnc["iva"])}</td>'
+                f'<td>{fmt(-ctnc["no_gravado"])}</td><td>{fmt(-ctnc["exento"])}</td>'
+                f'<td>{fmt(-ctnc["total"])}</td></tr>'
+            )
+
+        # -- Fila NETO = Facturas + ND - NC --
+        neto_c_grav = sub_fac_c_grav - ctnc['gravado']
+        neto_c_iva = sub_fac_c_iva - ctnc['iva']
+        neto_c_nograv = sub_fac_c_nograv - ctnc['no_gravado']
+        neto_c_exento = sub_fac_c_exento - ctnc['exento']
+        neto_c_total = sub_fac_c_total - ctnc['total']
+        h.append(
+            f'<tr class="subtotal-row"><td>NETO (FA + ND - NC)</td>'
+            f'<td style="text-align:center">{sub_fac_c_count + ctnc["count"]}</td>'
+            f'<td>{fmt(neto_c_grav)}</td><td>{fmt(neto_c_iva)}</td>'
+            f'<td>{fmt(neto_c_nograv)}</td><td>{fmt(neto_c_exento)}</td>'
+            f'<td>{fmt(neto_c_total)}</td></tr>'
         )
         h.append('</table>')
 
@@ -1822,14 +1943,49 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 'bold': True, 'num_format': '#,##0.00', 'border': 1,
                 'bg_color': '#f3eef5', 'align': 'right',
             }),
+            # NC en rojo
+            'nc_text': wb.add_format({
+                'border': 1, 'font_color': '#c0392b',
+            }),
+            'nc_center': wb.add_format({
+                'border': 1, 'align': 'center', 'font_color': '#c0392b',
+            }),
+            'nc_money': wb.add_format({
+                'num_format': '#,##0.00', 'border': 1, 'align': 'right',
+                'font_color': '#c0392b',
+            }),
+            'nc_total_text': wb.add_format({
+                'bold': True, 'bg_color': '#f3eef5', 'border': 1,
+                'font_color': '#c0392b',
+            }),
+            'nc_total_center': wb.add_format({
+                'bold': True, 'bg_color': '#f3eef5', 'border': 1,
+                'align': 'center', 'font_color': '#c0392b',
+            }),
+            'nc_total_money': wb.add_format({
+                'bold': True, 'num_format': '#,##0.00', 'border': 1,
+                'bg_color': '#f3eef5', 'align': 'right', 'font_color': '#c0392b',
+            }),
+            # Fila NETO (borde superior grueso)
+            'neto_text': wb.add_format({
+                'bold': True, 'border': 1, 'top': 2, 'top_color': '#875A7B',
+            }),
+            'neto_center': wb.add_format({
+                'bold': True, 'border': 1, 'align': 'center',
+                'top': 2, 'top_color': '#875A7B',
+            }),
+            'neto_money': wb.add_format({
+                'bold': True, 'num_format': '#,##0.00', 'border': 1,
+                'align': 'right', 'top': 2, 'top_color': '#875A7B',
+            }),
         }
 
     def _excel_sheet_iva(self, wb, fmts, sheet_name, data, titulo_cbte,
                          label_iva, empresa, cuit, periodo):
         """Escribe una hoja de comprobantes + alícuotas (ventas o compras).
 
-        Por qué: Ventas y compras tienen la misma estructura de tabla,
-        solo cambia el título (Débito/Crédito Fiscal).
+        Por qué: Separa facturas/ND de NC. NC se muestran en negativo (rojo).
+        Al final: fila NETO = FA + ND - NC.
         """
         ws = wb.add_worksheet(sheet_name)
         ws.set_column('A:A', 35)
@@ -1851,23 +2007,57 @@ class LibroIvaDigitalWizard(models.TransientModel):
             ws.write(row, col, h, fmts['header'])
         row += 1
 
+        # Clasificar por_tipo en facturas/ND vs NC
+        # NC: códigos AFIP 3,8,13 (NC-A,NC-B,NC-C)
+        rows_fac = []
+        rows_nc = []
         for r in data['por_tipo']:
+            if str(r.get('code', '')) in ('3', '8', '13'):
+                rows_nc.append(r)
+            else:
+                rows_fac.append(r)
+
+        # Filas facturas + ND
+        money_keys = ('gravado', 'iva', 'no_gravado', 'exento', 'total')
+        for r in rows_fac:
             ws.write(row, 0, r['name'], fmts['text'])
             ws.write(row, 1, r['count'], fmts['center'])
-            for col, key in enumerate(
-                ('gravado', 'iva', 'no_gravado', 'exento', 'total'), 2
-            ):
+            for col, key in enumerate(money_keys, 2):
                 ws.write(row, col, r[key], fmts['money'])
             row += 1
 
-        # Fila total
-        t = data['totales']
-        ws.write(row, 0, 'TOTAL', fmts['total_text'])
-        ws.write(row, 1, t['count'], fmts['total_center'])
-        for col, key in enumerate(
-            ('gravado', 'iva', 'no_gravado', 'exento', 'total'), 2
-        ):
-            ws.write(row, col, t[key], fmts['total_money'])
+        # Subtotal facturas + ND
+        tf = data['totales_fac']
+        tnd = data['totales_nd']
+        sub = {k: tf[k] + tnd[k] for k in money_keys}
+        sub['count'] = tf['count'] + tnd['count']
+        ws.write(row, 0, 'SUBTOTAL FACTURAS + ND', fmts['total_text'])
+        ws.write(row, 1, sub['count'], fmts['total_center'])
+        for col, key in enumerate(money_keys, 2):
+            ws.write(row, col, sub[key], fmts['total_money'])
+        row += 1
+
+        # Filas NC en negativo (rojo)
+        tnc = data['totales_nc']
+        if rows_nc:
+            for r in rows_nc:
+                ws.write(row, 0, r['name'], fmts['nc_text'])
+                ws.write(row, 1, r['count'], fmts['nc_center'])
+                for col, key in enumerate(money_keys, 2):
+                    ws.write(row, col, -r[key], fmts['nc_money'])
+                row += 1
+            # Subtotal NC
+            ws.write(row, 0, 'SUBTOTAL NC', fmts['nc_total_text'])
+            ws.write(row, 1, tnc['count'], fmts['nc_total_center'])
+            for col, key in enumerate(money_keys, 2):
+                ws.write(row, col, -tnc[key], fmts['nc_total_money'])
+            row += 1
+
+        # Fila NETO = FA + ND - NC
+        ws.write(row, 0, 'NETO (FA + ND - NC)', fmts['neto_text'])
+        ws.write(row, 1, sub['count'] + tnc['count'], fmts['neto_center'])
+        for col, key in enumerate(money_keys, 2):
+            ws.write(row, col, sub[key] - tnc[key], fmts['neto_money'])
         row += 2
 
         # Detalle alícuotas IVA
