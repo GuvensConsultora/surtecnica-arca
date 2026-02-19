@@ -1207,17 +1207,22 @@ class LibroIvaDigitalWizard(models.TransientModel):
                     bucket[code]['base'] += alic['base']
                     bucket[code]['amount'] += alic['amount']
 
-            # Detalle por comprobante para Libro IVA Excel
-            # Por qué: Desglose de neto/iva por alícuota permite al usuario
-            # cruzar cada factura contra el TXT y el portal ARCA.
+            # Detalle por comprobante para Libro IVA Excel (RG 4597)
+            # Por qué: Replica las columnas del Libro IVA Digital según la
+            # normativa vigente, permitiendo cruzar contra TXT y portal ARCA.
             partner = move.commercial_partner_id
+            pv, num = self._get_doc_parts(move)
+            doc_code, doc_num = self._get_partner_doc(partner)
             iva_by_code = {a['code']: a for a in data['iva_alicuotas']}
+            credito_fiscal = sum(a['amount'] for a in data['iva_alicuotas'])
             move_row = {
                 'fecha': str(move.invoice_date),
                 'tipo_cbte': doc_type.name or '',
-                'nro_cbte': move.l10n_latam_document_number or move.name,
+                'pto_vta': pv,
+                'nro_cbte': num,
+                'doc_code': doc_code,
+                'doc_num': doc_num,
                 'partner': partner.name or '',
-                'cuit': partner.vat or '',
                 'es_nc': es_nc,
             }
             # Neto y IVA por alícuota (cada código AFIP)
@@ -1234,6 +1239,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
             move_row['imp_internos'] = round(data['imp_internos'], 2)
             move_row['otros_tributos'] = round(data['otros_tributos'], 2)
             move_row['perc_no_categ'] = round(data['perc_no_categ'], 2)
+            move_row['credito_fiscal'] = round(credito_fiscal, 2)
             move_row['total'] = round(data['total'], 2)
             detalle_moves.append(move_row)
 
@@ -2063,15 +2069,23 @@ class LibroIvaDigitalWizard(models.TransientModel):
             }),
         }
 
+    # Mapeo código tipo doc AFIP → nombre legible para Libro IVA
+    DOC_TYPE_LABEL = {
+        '80': 'CUIT', '86': 'CUIL', '96': 'DNI', '87': 'CDI',
+        '89': 'LE', '90': 'LC', '94': 'Pasaporte', '99': 'Otro',
+    }
+
     def _excel_sheet_libro_iva(self, wb, fmts, sheet_name, data,
                                empresa, cuit, periodo, es_ventas=True):
-        """Escribe hoja Libro IVA con detalle por comprobante.
+        """Escribe hoja Libro IVA según formato RG 4597 AFIP.
 
-        Por qué: El Libro IVA Digital exige un listado factura por factura
-        con desglose de neto/iva por alícuota, exento, no gravado,
-        percepciones y total. Permite al usuario cruzar cada comprobante
-        contra el TXT y el portal ARCA.
-        NC se muestran en negativo (rojo) para reflejar la restitución.
+        Por qué: La RG 4597 define las columnas obligatorias del Libro IVA
+        Digital. Se replica esa estructura para que el libro impreso desde
+        Excel cumpla con la normativa y permita cruzar contra los TXT.
+        Columnas ordenadas según el diseño de registro ARCA:
+        Ventas: fecha, cbte, doc comprador, importes, alícuotas, otros trib.
+        Compras: fecha, cbte, doc vendedor, importes, alícuotas, créd fiscal.
+        NC en negativo (rojo) para reflejar la restitución.
         """
         detalle = data.get('detalle_moves', [])
         ws = wb.add_worksheet(sheet_name)
@@ -2081,63 +2095,90 @@ class LibroIvaDigitalWizard(models.TransientModel):
         codigos_usados = set()
         for r in detalle:
             for code in self.IVA_CODE_RATE:
-                if abs(r.get(f'neto_{code}', 0)) > 0.005 or abs(r.get(f'iva_{code}', 0)) > 0.005:
+                if (abs(r.get(f'neto_{code}', 0)) > 0.005
+                        or abs(r.get(f'iva_{code}', 0)) > 0.005):
                     codigos_usados.add(code)
         codigos_usados = sorted(codigos_usados)
 
-        # Construir headers dinámicamente según alícuotas presentes
-        headers = ['Fecha', 'Tipo Comprobante', 'Número', 'Razón Social', 'CUIT']
-        col_keys = []  # mapeo col → key del dict para escribir datos
-        for code in codigos_usados:
-            label = self.IVA_CODE_LABEL.get(code, code)
-            headers.append(f'Neto {label}')
-            col_keys.append(f'neto_{code}')
-            headers.append(f'IVA {label}')
-            col_keys.append(f'iva_{code}')
-        headers.append('No Gravado')
-        col_keys.append('no_gravado')
-        headers.append('Exento')
-        col_keys.append('exento')
-        # Percepciones y otros según tipo (ventas usa perc_no_categ, compras usa perc_iva)
+        # ---- Construir columnas según normativa RG 4597 ----
+        # Columnas fijas de identificación del comprobante
+        fixed_headers = [
+            'Fecha', 'Tipo Comprobante', 'Pto. Vta.', 'Nro. Cbte.',
+            'Tipo Doc.', 'Nro. Identificación',
+            'Denominación',
+        ]
+        # col_keys: mapeo posición → key del dict (solo para columnas numéricas)
+        # first_money_col: índice donde empiezan las columnas monetarias
+        first_money_col = len(fixed_headers)
+
+        # Columna Importe Total (campo 9 del TXT)
+        money_headers = ['Imp. Total']
+        money_keys = ['total']
+
+        # Importes de cabecera según tipo de libro (RG 4597)
         if es_ventas:
-            perc_cols = [
+            # Ventas: no_grav, perc_no_categ, exento, perc_nac, perc_iibb,
+            #         perc_mun, imp_internos (campos 10-16 del TXT ventas)
+            cabecera_cols = [
+                ('Imp. No Gravado', 'no_gravado'),
                 ('Perc. No Categ.', 'perc_no_categ'),
+                ('Imp. Op. Exentas', 'exento'),
                 ('Perc. Nacionales', 'perc_nacionales'),
                 ('Perc. IIBB', 'perc_iibb'),
                 ('Perc. Municipales', 'perc_mun'),
                 ('Imp. Internos', 'imp_internos'),
-                ('Otros Tributos', 'otros_tributos'),
             ]
         else:
-            perc_cols = [
+            # Compras: no_grav, exento, perc_iva, perc_nac, perc_iibb,
+            #          perc_mun, imp_internos (campos 10-16 del TXT compras)
+            cabecera_cols = [
+                ('Imp. No Gravado', 'no_gravado'),
+                ('Imp. Op. Exentas', 'exento'),
                 ('Perc. IVA', 'perc_iva'),
                 ('Perc. Nacionales', 'perc_nacionales'),
                 ('Perc. IIBB', 'perc_iibb'),
                 ('Perc. Municipales', 'perc_mun'),
                 ('Imp. Internos', 'imp_internos'),
-                ('Otros Tributos', 'otros_tributos'),
             ]
-        # Solo agregar columnas de percepciones que tengan algún valor
-        perc_con_valor = []
-        for label, key in perc_cols:
+
+        # Solo agregar columnas de cabecera que tengan algún valor
+        for label, key in cabecera_cols:
             if any(abs(r.get(key, 0)) > 0.005 for r in detalle):
-                perc_con_valor.append((label, key))
-                headers.append(label)
-                col_keys.append(key)
-        headers.append('Total')
-        col_keys.append('total')
+                money_headers.append(label)
+                money_keys.append(key)
 
-        # Anchos de columna
+        # Columnas de alícuotas IVA: Neto Gravado + IVA por cada tasa
+        for code in codigos_usados:
+            label = self.IVA_CODE_LABEL.get(code, code)
+            money_headers.append(f'Neto Grav. {label}')
+            money_keys.append(f'neto_{code}')
+            money_headers.append(f'IVA {label}')
+            money_keys.append(f'iva_{code}')
+
+        # Crédito Fiscal Computable (solo compras, campo 21 del TXT)
+        if not es_ventas:
+            money_headers.append('Créd. Fiscal')
+            money_keys.append('credito_fiscal')
+
+        # Otros tributos (último campo del TXT)
+        if any(abs(r.get('otros_tributos', 0)) > 0.005 for r in detalle):
+            money_headers.append('Otros Tributos')
+            money_keys.append('otros_tributos')
+
+        all_headers = fixed_headers + money_headers
+
+        # ---- Anchos de columna ----
         ws.set_column(0, 0, 12)   # Fecha
-        ws.set_column(1, 1, 22)   # Tipo
-        ws.set_column(2, 2, 18)   # Número
-        ws.set_column(3, 3, 30)   # Razón Social
-        ws.set_column(4, 4, 15)   # CUIT
-        # Columnas monetarias
-        for c in range(5, len(headers)):
-            ws.set_column(c, c, 15)
+        ws.set_column(1, 1, 25)   # Tipo Comprobante
+        ws.set_column(2, 2, 8)    # Pto. Vta.
+        ws.set_column(3, 3, 12)   # Nro. Cbte.
+        ws.set_column(4, 4, 9)    # Tipo Doc.
+        ws.set_column(5, 5, 16)   # Nro. Identificación
+        ws.set_column(6, 6, 32)   # Denominación
+        for c in range(first_money_col, len(all_headers)):
+            ws.set_column(c, c, 16)
 
-        # Encabezado
+        # ---- Encabezado ----
         row = 0
         titulo = 'LIBRO IVA VENTAS' if es_ventas else 'LIBRO IVA COMPRAS'
         ws.write(row, 0, f'{titulo} | Período {periodo}', fmts['title'])
@@ -2145,39 +2186,47 @@ class LibroIvaDigitalWizard(models.TransientModel):
         ws.write(row, 0, f'{empresa} | CUIT: {cuit}')
         row += 2
 
-        # Headers
-        for col, h in enumerate(headers):
+        # Headers con freeze en la fila de encabezado
+        for col, h in enumerate(all_headers):
             ws.write(row, col, h, fmts['header'])
+        ws.freeze_panes(row + 1, 0)
+        ws.autofilter(row, 0, row + len(detalle), len(all_headers) - 1)
         row += 1
 
-        # Acumuladores para totales
-        totals = {k: 0.0 for k in col_keys}
+        # ---- Acumuladores para totales ----
+        totals = {k: 0.0 for k in money_keys}
 
-        # Filas de detalle
+        # ---- Filas de detalle ----
         for r in detalle:
             is_nc = r.get('es_nc', False)
-            # NC en negativo (rojo)
             sign = -1 if is_nc else 1
             fmt_t = fmts['nc_text'] if is_nc else fmts['text']
+            fmt_c = fmts['nc_center'] if is_nc else fmts['center']
             fmt_m = fmts['nc_money'] if is_nc else fmts['money']
 
+            # Columnas fijas de identificación
             ws.write(row, 0, r.get('fecha', ''), fmt_t)
             ws.write(row, 1, r.get('tipo_cbte', ''), fmt_t)
-            ws.write(row, 2, r.get('nro_cbte', ''), fmt_t)
-            ws.write(row, 3, r.get('partner', ''), fmt_t)
-            ws.write(row, 4, r.get('cuit', ''), fmt_t)
+            ws.write(row, 2, r.get('pto_vta', ''), fmt_c)
+            ws.write(row, 3, r.get('nro_cbte', ''), fmt_c)
+            doc_label = self.DOC_TYPE_LABEL.get(
+                r.get('doc_code', ''), r.get('doc_code', ''))
+            ws.write(row, 4, doc_label, fmt_c)
+            ws.write(row, 5, r.get('doc_num', ''), fmt_t)
+            ws.write(row, 6, r.get('partner', ''), fmt_t)
 
-            for col_idx, key in enumerate(col_keys, 5):
+            # Columnas monetarias
+            for col_idx, key in enumerate(money_keys, first_money_col):
                 val = r.get(key, 0.0) * sign
                 ws.write(row, col_idx, val, fmt_m)
                 totals[key] += val
             row += 1
 
-        # Fila de totales
+        # ---- Fila de totales ----
         ws.write(row, 0, 'TOTALES', fmts['total_text'])
-        for c in range(1, 5):
+        for c in range(1, first_money_col):
             ws.write(row, c, '', fmts['total_text'])
-        for col_idx, key in enumerate(col_keys, 5):
+        for col_idx, key in enumerate(money_keys, first_money_col):
             ws.write(row, col_idx, totals[key], fmts['total_money'])
 
     def _excel_sheet_iva(self, wb, fmts, sheet_name, data, titulo_cbte,
