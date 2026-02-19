@@ -31,6 +31,10 @@
                         <group string="Resumen">
                             <field name="resumen" nolabel="1" colspan="2"/>
                         </group>
+                        <group string="Libro IVA Excel (RG 4597)">
+                            <field name="libro_iva_excel" filename="libro_iva_excel_name"/>
+                            <field name="libro_iva_excel_name" invisible="1"/>
+                        </group>
                         <group string="Archivos TXT Generados">
                             <field name="ventas_cbte_file" filename="ventas_cbte_name"/>
                             <field name="ventas_cbte_name" invisible="1"/>

@@ -99,6 +99,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
     iva_simple_rest_credito_csv_name = fields.Char(
         default='IVA_SIMPLE_REST_CREDITO_FISCAL.csv')
 
+    # Libro IVA Ventas/Compras en Excel (RG 4597)
+    libro_iva_excel = fields.Binary('Libro IVA Excel')
+    libro_iva_excel_name = fields.Char()
+
     # -------------------------------------------------------------------------
     # CONSTANTES AFIP
     # -------------------------------------------------------------------------
@@ -215,6 +219,14 @@ class LibroIvaDigitalWizard(models.TransientModel):
         }
         # Agregar CSV IVA Simple al write
         vals.update(csv_data)
+
+        # Libro IVA Excel separado (RG 4597)
+        libro_iva_data = self._generate_libro_iva_excel(v_ddjj, c_ddjj)
+        if libro_iva_data:
+            periodo_str = self.date_from.strftime('%Y%m')
+            vals['libro_iva_excel'] = base64.b64encode(libro_iva_data)
+            vals['libro_iva_excel_name'] = f'LIBRO_IVA_{periodo_str}.xlsx'
+
         self.write(vals)
 
         return {
@@ -264,6 +276,13 @@ class LibroIvaDigitalWizard(models.TransientModel):
             excel_data = self._generate_ddjj_excel()
             if excel_data:
                 zf.writestr(f'DDJJ_IVA_{periodo}.xlsx', excel_data)
+
+            # Libro IVA Excel (archivo separado)
+            if self.libro_iva_excel:
+                zf.writestr(
+                    self.libro_iva_excel_name or f'LIBRO_IVA_{periodo}.xlsx',
+                    base64.b64decode(self.libro_iva_excel),
+                )
 
         # Guardar ZIP en un attachment para descarga
         zip_data = base64.b64encode(buf.getvalue())
@@ -1944,6 +1963,35 @@ class LibroIvaDigitalWizard(models.TransientModel):
         except Exception:
             _logger.warning('No se pudo generar PDF de DDJJ IVA', exc_info=True)
             return False
+
+    def _generate_libro_iva_excel(self, v_data, c_data):
+        """Genera Excel con Libro IVA Ventas y Compras (RG 4597).
+
+        Por qué: Archivo separado del reporte DDJJ, contiene solo las
+        2 hojas del Libro IVA Digital según normativa vigente.
+        Se genera en action_generar con datos ya calculados.
+        """
+        if not v_data or not c_data:
+            return False
+
+        buf = io.BytesIO()
+        wb = xlsxwriter.Workbook(buf, {'in_memory': True})
+        fmts = self._excel_formats(wb)
+        empresa = self.env.company.name
+        cuit = self.env.company.vat or 'Sin configurar'
+        periodo = self.date_from.strftime('%m/%Y')
+
+        self._excel_sheet_libro_iva(
+            wb, fmts, 'Libro IVA Ventas', v_data,
+            empresa, cuit, periodo, es_ventas=True,
+        )
+        self._excel_sheet_libro_iva(
+            wb, fmts, 'Libro IVA Compras', c_data,
+            empresa, cuit, periodo, es_ventas=False,
+        )
+
+        wb.close()
+        return buf.getvalue()
 
     def _generate_ddjj_excel(self):
         """Genera Excel con el reporte DDJJ IVA en 6 hojas.
