@@ -105,6 +105,12 @@ class LibroIvaDigitalWizard(models.TransientModel):
     libro_iva_excel = fields.Binary('Libro IVA Excel')
     libro_iva_excel_name = fields.Char()
 
+    # Por qué: UserError no renderiza HTML en Odoo 17. Se muestra en el
+    # wizard como Html con sanitize=False para que los links funcionen.
+    duplicados_html = fields.Html(
+        string='Duplicados', readonly=True, sanitize=False,
+    )
+
     # -------------------------------------------------------------------------
     # CONSTANTES AFIP
     # -------------------------------------------------------------------------
@@ -172,8 +178,20 @@ class LibroIvaDigitalWizard(models.TransientModel):
 
         # Validar duplicados antes de procesar — ARCA deduplica líneas
         # idénticas del TXT causando diferencias con el CSV.
-        self._validar_duplicados(ventas, 'Ventas')
-        self._validar_duplicados(compras, 'Compras')
+        dup_html = self._validar_duplicados(ventas + compras)
+        if dup_html:
+            self.write({
+                'duplicados_html': dup_html,
+            })
+            return {
+                'type': 'ir.actions.act_window',
+                'res_model': self._name,
+                'res_id': self.id,
+                'view_mode': 'form',
+                'target': 'new',
+            }
+        # Limpiar duplicados previos si ya no hay
+        self.duplicados_html = False
 
         # Extraer datos una sola vez por comprobante (evita triple procesamiento)
         v_extracted = {m.id: self._extract_move_data(m) for m in ventas}
@@ -527,7 +545,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
     # VALIDACIÓN DE DUPLICADOS
     # -------------------------------------------------------------------------
 
-    def _validar_duplicados(self, moves, label):
+    def _validar_duplicados(self, moves):
         """Detecta comprobantes duplicados por (tipo+nro, CUIT, importe).
 
         Por qué: ARCA deduplica líneas idénticas del TXT pero el CSV no,
@@ -535,6 +553,8 @@ class LibroIvaDigitalWizard(models.TransientModel):
         Comprobantes" en el portal. Detectar antes de generar evita que
         el usuario presente archivos inconsistentes.
         Clave de duplicado: tipo_doc + nro_comprobante + CUIT + importe total.
+        Returns:
+            str | False: HTML con tabla de duplicados, o False si no hay.
         """
         seen = {}
         duplicados = []
@@ -543,10 +563,8 @@ class LibroIvaDigitalWizard(models.TransientModel):
             doc_num = move.l10n_latam_document_number or ''
             cuit = (move.commercial_partner_id.vat or '').replace('-', '')
             importe = round(abs(move.amount_total), 2)
-            # Clave: tipo documento + número + CUIT + importe
             key = (doc_type.id, doc_num, cuit, importe)
             if key in seen:
-                # Registrar ambos: el original y el duplicado
                 if seen[key] not in duplicados:
                     duplicados.append(seen[key])
                 duplicados.append(move)
@@ -554,28 +572,31 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 seen[key] = move
 
         if not duplicados:
-            return
+            return False
 
-        # Por qué: Markup() hace que UserError renderice HTML en Odoo 17.
-        # Los links abren la factura en nueva pestaña para corregir sin
-        # perder el wizard.
+        # Por qué: Se muestra en campo Html del wizard (sanitize=False)
+        # para que los links <a> funcionen. UserError no renderiza HTML.
         base_url = self.env['ir.config_parameter'].sudo().get_param(
             'web.base.url', '')
+        fmt = self._fmt_money
         h = [
-            f'<p><strong>Se detectaron comprobantes DUPLICADOS en '
-            f'{html_escape(label)}.</strong></p>'
-            f'<p>ARCA deduplicará las líneas del TXT generando diferencias '
-            f'con el CSV. Corregir antes de generar.</p>'
-            f'<table style="border-collapse:collapse;width:100%;'
-            f'font-size:12px;margin-top:8px">'
-            f'<tr style="background:#875A7B;color:white">'
-            f'<th style="padding:6px;text-align:left">Comprobante</th>'
-            f'<th style="padding:6px;text-align:left">CUIT</th>'
-            f'<th style="padding:6px;text-align:right">Importe</th>'
-            f'<th style="padding:6px;text-align:left">Proveedor/Cliente</th>'
-            f'</tr>',
+            '<div style="font-family:Arial,sans-serif;padding:10px">',
+            '<h2 style="color:#c0392b;margin-bottom:5px">'
+            'Comprobantes DUPLICADOS detectados</h2>',
+            '<p style="color:#555;font-size:13px">'
+            'ARCA deduplicara las lineas del TXT generando diferencias '
+            'con el CSV.<br/>'
+            '<strong>Corregi los duplicados y volve a generar.</strong></p>',
+            '<table style="border-collapse:collapse;width:100%;'
+            'font-size:13px;margin-top:10px">',
+            '<tr style="background:#875A7B;color:white">',
+            '<th style="padding:8px;text-align:left">Comprobante</th>',
+            '<th style="padding:8px;text-align:left">CUIT</th>',
+            '<th style="padding:8px;text-align:right">Importe</th>',
+            '<th style="padding:8px;text-align:left">Proveedor / Cliente</th>',
+            '</tr>',
         ]
-        for m in duplicados:
+        for i, m in enumerate(duplicados):
             doc_name = html_escape(
                 m.l10n_latam_document_type_id.name or '')
             doc_num = html_escape(
@@ -583,34 +604,38 @@ class LibroIvaDigitalWizard(models.TransientModel):
             cuit = html_escape(m.commercial_partner_id.vat or '')
             importe = abs(m.amount_total)
             partner = html_escape(
-                (m.commercial_partner_id.name or '')[:40])
-            # Link directo a la factura (nueva pestaña)
+                (m.commercial_partner_id.name or '')[:50])
             url = (f'{base_url}/web#id={m.id}'
                    f'&model=account.move&view_type=form')
-            fmt_imp = f'{importe:,.2f}'.replace(',', 'X').replace(
-                '.', ',').replace('X', '.')
+            # Alternar color de fondo para legibilidad
+            bg = '#fff' if i % 2 == 0 else '#f9f9f9'
             h.append(
-                f'<tr style="border-bottom:1px solid #ddd">'
-                f'<td style="padding:5px">'
+                f'<tr style="background:{bg};'
+                f'border-bottom:1px solid #e0e0e0">'
+                f'<td style="padding:8px">'
                 f'<a href="{url}" target="_blank" '
-                f'style="color:#017e84;text-decoration:underline">'
+                f'style="color:#017e84;font-weight:bold;'
+                f'text-decoration:none">'
                 f'{doc_name} {doc_num}</a></td>'
-                f'<td style="padding:5px">{cuit}</td>'
-                f'<td style="padding:5px;text-align:right">{fmt_imp}</td>'
-                f'<td style="padding:5px">{partner}</td>'
+                f'<td style="padding:8px">{cuit}</td>'
+                f'<td style="padding:8px;text-align:right;'
+                f'font-weight:bold">{fmt(importe)}</td>'
+                f'<td style="padding:8px">{partner}</td>'
                 f'</tr>'
             )
         h.append('</table>')
-        # Easter egg: GIF frustración para aliviar el dolor de los duplicados
+        # GIF frustración
         h.append(
-            '<div style="text-align:center;margin-top:15px">'
+            '<div style="text-align:center;margin-top:20px">'
             '<img src="https://media.giphy.com/media/OT69wDOihxqEw/giphy.gif" '
-            'alt="head desk" style="max-width:300px;border-radius:8px"/>'
-            '<p style="font-size:11px;color:#888;margin-top:5px">'
+            'alt="head desk" style="max-width:280px;border-radius:10px;'
+            'box-shadow:0 2px 8px rgba(0,0,0,0.15)"/>'
+            '<p style="font-size:12px;color:#888;margin-top:8px;'
+            'font-style:italic">'
             'Asi estamos todos con los duplicados...</p>'
-            '</div>'
+            '</div></div>'
         )
-        raise UserError(Markup('\n'.join(h)))
+        return '\n'.join(h)
 
     # -------------------------------------------------------------------------
     # PROCESAMIENTO DE MOVES

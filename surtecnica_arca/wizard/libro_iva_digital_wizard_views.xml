@@ -7,6 +7,11 @@
         <field name="arch" type="xml">
             <form string="Libro IVA Digital - ARCA">
 
+                <!-- Alerta de duplicados: se muestra en estado draft
+                     cuando action_generar detecta comprobantes repetidos -->
+                <field name="duplicados_html" nolabel="1"
+                       invisible="not duplicados_html or state != 'draft'"/>
+
                 <!-- Estado draft: selección de período -->
                 <group invisible="state != 'draft'">
                     <group string="Período">
