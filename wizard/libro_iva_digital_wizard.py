@@ -289,10 +289,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
         # Para gravado, se acumula la base por código IVA desde las líneas de producto
         # en vez de usar tax_base_amount (que está en moneda compañía).
         iva_bases = {}
-        # Por qué: en Odoo 17+ display_type='product' para líneas de producto.
-        # 'not l.display_type' las excluye. Se filtran solo secciones y notas.
+        # Por qué: en Odoo 19 display_type='product' para líneas de producto.
+        # Filtro explícito: solo líneas de producto (excluye section, note, rounding).
         for line in move.invoice_line_ids.filtered(
-            lambda l: l.display_type not in ('line_section', 'line_note')
+            lambda l: l.display_type == 'product'
         ):
             line_class = self._classify_line_iva(line)
             if line_class == 'no_gravado':

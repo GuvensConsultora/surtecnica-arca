@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 {
     'name': 'Libro IVA Digital - ARCA',
-    'version': '17.0.1.0.0',
+    'version': '19.0.1.0.0',
     'category': 'Accounting',
     'summary': 'Generación de archivos TXT del Libro IVA Digital para ARCA (ex AFIP)',
     'description': """
