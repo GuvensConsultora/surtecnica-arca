@@ -168,6 +168,11 @@ class LibroIvaDigitalWizard(models.TransientModel):
         ventas = self._get_moves('out')
         compras = self._get_moves('in')
 
+        # Validar duplicados antes de procesar — ARCA deduplica líneas
+        # idénticas del TXT causando diferencias con el CSV.
+        self._validar_duplicados(ventas, 'Ventas')
+        self._validar_duplicados(compras, 'Compras')
+
         # Extraer datos una sola vez por comprobante (evita triple procesamiento)
         v_extracted = {m.id: self._extract_move_data(m) for m in ventas}
         c_extracted = {m.id: self._extract_move_data(m) for m in compras}
@@ -515,6 +520,60 @@ class LibroIvaDigitalWizard(models.TransientModel):
             # Por qué: Solo facturas con documento fiscal argentino
             ('l10n_latam_document_type_id', '!=', False),
         ], order='invoice_date, name')
+
+    # -------------------------------------------------------------------------
+    # VALIDACIÓN DE DUPLICADOS
+    # -------------------------------------------------------------------------
+
+    def _validar_duplicados(self, moves, label):
+        """Detecta comprobantes duplicados por (tipo+nro, CUIT, importe).
+
+        Por qué: ARCA deduplica líneas idénticas del TXT pero el CSV no,
+        causando diferencias entre "Totales Ingresados" y "Totales de
+        Comprobantes" en el portal. Detectar antes de generar evita que
+        el usuario presente archivos inconsistentes.
+        Clave de duplicado: tipo_doc + nro_comprobante + CUIT + importe total.
+        """
+        seen = {}
+        duplicados = []
+        for move in moves:
+            doc_type = move.l10n_latam_document_type_id
+            doc_num = move.l10n_latam_document_number or ''
+            cuit = (move.commercial_partner_id.vat or '').replace('-', '')
+            importe = round(abs(move.amount_total), 2)
+            # Clave: tipo documento + número + CUIT + importe
+            key = (doc_type.id, doc_num, cuit, importe)
+            if key in seen:
+                # Registrar ambos: el original y el duplicado
+                if seen[key] not in duplicados:
+                    duplicados.append(seen[key])
+                duplicados.append(move)
+            else:
+                seen[key] = move
+
+        if not duplicados:
+            return
+
+        # Armar tabla de duplicados para el UserError
+        lines = [
+            f'Se detectaron comprobantes DUPLICADOS en {label}.\n'
+            f'ARCA deduplicará las líneas del TXT generando diferencias '
+            f'con el CSV. Corregir antes de generar.\n',
+            f'{"Comprobante":<25} {"CUIT":<15} {"Importe":>15} '
+            f'{"Partner":<30} {"ID":>6}',
+            '-' * 95,
+        ]
+        for m in duplicados:
+            doc_name = m.l10n_latam_document_type_id.name or ''
+            doc_num = m.l10n_latam_document_number or ''
+            cuit = m.commercial_partner_id.vat or ''
+            importe = abs(m.amount_total)
+            partner = (m.commercial_partner_id.name or '')[:30]
+            lines.append(
+                f'{doc_name} {doc_num:<15} {cuit:<15} '
+                f'{importe:>15,.2f} {partner:<30} {m.id:>6}'
+            )
+        raise UserError('\n'.join(lines))
 
     # -------------------------------------------------------------------------
     # PROCESAMIENTO DE MOVES
@@ -1427,7 +1486,8 @@ class LibroIvaDigitalWizard(models.TransientModel):
         h.append('</table>')
 
         # ---- VENTAS: ALÍCUOTAS IVA ----
-        h.append('<h3>Detalle Alícuotas IVA - Débito Fiscal</h3>')
+        # Por qué: alicuotas contiene Fac+ND+NC (NC como negativo) = NETO
+        h.append('<h3>Detalle Alícuotas IVA - Débito Fiscal (NETO: Fac+ND-NC)</h3>')
         h.append('<table><tr><th>Alícuota</th>'
                  '<th>Base Imponible</th><th>Débito Fiscal</th></tr>')
         total_base_v = total_iva_v = 0.0
@@ -1438,9 +1498,14 @@ class LibroIvaDigitalWizard(models.TransientModel):
                      f'<td>{fmt(a["base"])}</td><td>{fmt(a["amount"])}</td></tr>')
             total_base_v += a['base']
             total_iva_v += a['amount']
-        h.append(f'<tr class="total-row"><td>TOTAL DÉBITO FISCAL</td>'
+        h.append(f'<tr class="total-row"><td>TOTAL DÉBITO FISCAL (NETO)</td>'
                  f'<td>{fmt(total_base_v)}</td><td>{fmt(total_iva_v)}</td></tr>')
-        h.append('</table></div>')
+        h.append('</table>')
+        h.append('<p style="font-size:10px;color:#888">'
+                 'Nota: estos importes son NETO del periodo (Fac+ND-NC). '
+                 'El CSV Debito Fiscal solo incluye Fac+ND, y el CSV REST '
+                 'Debito solo incluye NC. Ver seccion "Conciliacion" al final.</p>')
+        h.append('</div>')
 
         # ---- COMPRAS: COMPROBANTES RECIBIDOS ----
         # Por qué: Misma lógica que ventas — separar facturas/ND de NC,
@@ -1527,7 +1592,8 @@ class LibroIvaDigitalWizard(models.TransientModel):
         h.append('</table>')
 
         # ---- COMPRAS: ALÍCUOTAS IVA ----
-        h.append('<h3>Detalle Alícuotas IVA - Crédito Fiscal</h3>')
+        # Por qué: alicuotas contiene Fac+ND+NC (NC como negativo) = NETO
+        h.append('<h3>Detalle Alícuotas IVA - Crédito Fiscal (NETO: Fac+ND-NC)</h3>')
         h.append('<table><tr><th>Alícuota</th>'
                  '<th>Base Imponible</th><th>Crédito Fiscal</th></tr>')
         total_base_c = total_iva_c = 0.0
@@ -1538,9 +1604,14 @@ class LibroIvaDigitalWizard(models.TransientModel):
                      f'<td>{fmt(a["base"])}</td><td>{fmt(a["amount"])}</td></tr>')
             total_base_c += a['base']
             total_iva_c += a['amount']
-        h.append(f'<tr class="total-row"><td>TOTAL CRÉDITO FISCAL</td>'
+        h.append(f'<tr class="total-row"><td>TOTAL CRÉDITO FISCAL (NETO)</td>'
                  f'<td>{fmt(total_base_c)}</td><td>{fmt(total_iva_c)}</td></tr>')
-        h.append('</table></div>')
+        h.append('</table>')
+        h.append('<p style="font-size:10px;color:#888">'
+                 'Nota: estos importes son NETO del periodo (Fac+ND-NC). '
+                 'El CSV Credito Fiscal solo incluye Fac+ND, y el CSV REST '
+                 'Credito solo incluye NC. Ver seccion "Conciliacion" al final.</p>')
+        h.append('</div>')
 
         # ---- DETERMINACIÓN DEL IMPUESTO ----
         debito = vt['iva']
@@ -1922,6 +1993,71 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 f'<td>{db} ({fmt(ddjj_b)})</td>'
                 f'<td>{di} ({fmt(ddjj_i)})</td></tr>')
         h.append('</table>')
+
+        # ---- CONCILIACIÓN DE IMPORTES POR ARCHIVO ----
+        # Por qué: CSV, CSV REST, TXT y DDJJ muestran importes distintos porque
+        # cada archivo tiene un alcance diferente (solo fac+ND, solo NC, todos, neto).
+        # Esta tabla aclara qué número corresponde a cada archivo para evitar confusión.
+        h.append('<h3>Conciliacion de importes por archivo</h3>')
+        h.append(
+            '<p style="font-size:11px;color:#555">'
+            'Los distintos archivos muestran importes diferentes porque '
+            'cada uno tiene un alcance distinto. A continuacion se detalla '
+            'que incluye cada archivo y como se relacionan entre si.</p>')
+
+        # Calcular totales por archivo para cada lado (ventas y compras)
+        for side_label, side_fac, side_nd, side_nc, tipo_fiscal in [
+            ('Ventas (Debito Fiscal)', vf, vnd, vnc, 'Debito'),
+            ('Compras (Credito Fiscal)', cf, cnd, cnc, 'Credito'),
+        ]:
+            # Fac+ND: lo que va al CSV principal
+            fnd_grav = side_fac['gravado'] + side_nd['gravado']
+            fnd_iva = side_fac['iva'] + side_nd['iva']
+            # NC: lo que va al CSV REST (valores absolutos)
+            nc_grav = abs(side_nc['gravado'])
+            nc_iva = abs(side_nc['iva'])
+            # TXT: todos positivos (fac+ND+NC sumados en absoluto)
+            txt_grav = fnd_grav + nc_grav
+            txt_iva = fnd_iva + nc_iva
+            # DDJJ NETO: fac+ND menos NC
+            neto_grav = fnd_grav - nc_grav
+            neto_iva = fnd_iva - nc_iva
+
+            h.append(f'<h3 style="font-size:12px">{side_label}</h3>')
+            h.append(
+                '<table>'
+                '<tr><th>Archivo</th><th>Contenido</th>'
+                f'<th>Neto Gravado</th><th>{tipo_fiscal} Fiscal</th></tr>')
+            rows_conc = [
+                (f'CSV {tipo_fiscal} Fiscal',
+                 'Solo Facturas + ND',
+                 fnd_grav, fnd_iva, '#2980b9'),
+                (f'CSV REST {tipo_fiscal}',
+                 'Solo NC (positivo)',
+                 nc_grav, nc_iva, '#c0392b'),
+                ('TXT (todos los comprobantes)',
+                 'Fac + ND + NC (todos positivos)',
+                 txt_grav, txt_iva, '#8e44ad'),
+                ('DDJJ NETO (Fac + ND - NC)',
+                 'Resultado neto del periodo',
+                 neto_grav, neto_iva, '#27ae60'),
+            ]
+            for archivo, contenido, grav, iva, color in rows_conc:
+                h.append(
+                    f'<tr>'
+                    f'<td style="color:{color};font-weight:bold">{archivo}</td>'
+                    f'<td style="font-size:11px">{contenido}</td>'
+                    f'<td>{fmt(grav)}</td><td>{fmt(iva)}</td></tr>')
+            # Fórmula explicativa
+            h.append(
+                '<tr style="background:#f8f6fa;font-size:11px">'
+                '<td colspan="4">'
+                f'<strong>Formula:</strong> '
+                f'TXT ({fmt(txt_grav)}) = CSV ({fmt(fnd_grav)}) + CSV REST ({fmt(nc_grav)}) '
+                f'&nbsp;|&nbsp; '
+                f'DDJJ NETO ({fmt(neto_grav)}) = CSV ({fmt(fnd_grav)}) - CSV REST ({fmt(nc_grav)})'
+                '</td></tr>')
+            h.append('</table>')
 
         # ---- Resultado general ----
         if hay_dif:
