@@ -10,6 +10,8 @@ from html import escape as html_escape
 
 import xlsxwriter
 
+from markupsafe import Markup
+
 from odoo import models, fields, api
 from odoo.exceptions import UserError
 
@@ -554,26 +556,52 @@ class LibroIvaDigitalWizard(models.TransientModel):
         if not duplicados:
             return
 
-        # Armar tabla de duplicados para el UserError
-        lines = [
-            f'Se detectaron comprobantes DUPLICADOS en {label}.\n'
-            f'ARCA deduplicará las líneas del TXT generando diferencias '
-            f'con el CSV. Corregir antes de generar.\n',
-            f'{"Comprobante":<25} {"CUIT":<15} {"Importe":>15} '
-            f'{"Partner":<30} {"ID":>6}',
-            '-' * 95,
+        # Por qué: Markup() hace que UserError renderice HTML en Odoo 17.
+        # Los links abren la factura en nueva pestaña para corregir sin
+        # perder el wizard.
+        base_url = self.env['ir.config_parameter'].sudo().get_param(
+            'web.base.url', '')
+        h = [
+            f'<p><strong>Se detectaron comprobantes DUPLICADOS en '
+            f'{html_escape(label)}.</strong></p>'
+            f'<p>ARCA deduplicará las líneas del TXT generando diferencias '
+            f'con el CSV. Corregir antes de generar.</p>'
+            f'<table style="border-collapse:collapse;width:100%;'
+            f'font-size:12px;margin-top:8px">'
+            f'<tr style="background:#875A7B;color:white">'
+            f'<th style="padding:6px;text-align:left">Comprobante</th>'
+            f'<th style="padding:6px;text-align:left">CUIT</th>'
+            f'<th style="padding:6px;text-align:right">Importe</th>'
+            f'<th style="padding:6px;text-align:left">Proveedor/Cliente</th>'
+            f'</tr>',
         ]
         for m in duplicados:
-            doc_name = m.l10n_latam_document_type_id.name or ''
-            doc_num = m.l10n_latam_document_number or ''
-            cuit = m.commercial_partner_id.vat or ''
+            doc_name = html_escape(
+                m.l10n_latam_document_type_id.name or '')
+            doc_num = html_escape(
+                m.l10n_latam_document_number or '')
+            cuit = html_escape(m.commercial_partner_id.vat or '')
             importe = abs(m.amount_total)
-            partner = (m.commercial_partner_id.name or '')[:30]
-            lines.append(
-                f'{doc_name} {doc_num:<15} {cuit:<15} '
-                f'{importe:>15,.2f} {partner:<30} {m.id:>6}'
+            partner = html_escape(
+                (m.commercial_partner_id.name or '')[:40])
+            # Link directo a la factura (nueva pestaña)
+            url = (f'{base_url}/web#id={m.id}'
+                   f'&model=account.move&view_type=form')
+            fmt_imp = f'{importe:,.2f}'.replace(',', 'X').replace(
+                '.', ',').replace('X', '.')
+            h.append(
+                f'<tr style="border-bottom:1px solid #ddd">'
+                f'<td style="padding:5px">'
+                f'<a href="{url}" target="_blank" '
+                f'style="color:#017e84;text-decoration:underline">'
+                f'{doc_name} {doc_num}</a></td>'
+                f'<td style="padding:5px">{cuit}</td>'
+                f'<td style="padding:5px;text-align:right">{fmt_imp}</td>'
+                f'<td style="padding:5px">{partner}</td>'
+                f'</tr>'
             )
-        raise UserError('\n'.join(lines))
+        h.append('</table>')
+        raise UserError(Markup('\n'.join(h)))
 
     # -------------------------------------------------------------------------
     # PROCESAMIENTO DE MOVES
