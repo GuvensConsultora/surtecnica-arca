@@ -601,6 +601,15 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 f'</tr>'
             )
         h.append('</table>')
+        # Easter egg: GIF frustración para aliviar el dolor de los duplicados
+        h.append(
+            '<div style="text-align:center;margin-top:15px">'
+            '<img src="https://media.giphy.com/media/OT69wDOihxqEw/giphy.gif" '
+            'alt="head desk" style="max-width:300px;border-radius:8px"/>'
+            '<p style="font-size:11px;color:#888;margin-top:5px">'
+            'Asi estamos todos con los duplicados...</p>'
+            '</div>'
+        )
         raise UserError(Markup('\n'.join(h)))
 
     # -------------------------------------------------------------------------
