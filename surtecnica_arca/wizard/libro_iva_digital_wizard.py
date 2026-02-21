@@ -715,8 +715,11 @@ class LibroIvaDigitalWizard(models.TransientModel):
                     'imp_internos': round(data['imp_internos'], 2),
                     'otros_tributos': round(data['otros_tributos'], 2),
                     'n_alic': len(data['iva_alicuotas']),
-                    # Total Odoo original para comparar
-                    'odoo_total': round(abs(move.amount_total), 2),
+                    # Total Odoo original en moneda empresa (ARS) para comparar
+                    # Por qué: amount_total está en moneda factura (USD/EUR),
+                    # pero data['total'] está en ARS. amount_total_signed
+                    # usa sum(line.balance) = siempre en moneda empresa.
+                    'odoo_total': round(abs(move.amount_total_signed), 2),
                 }
             except Exception as e:
                 errores.append(f'{move.name}: {str(e)}')
