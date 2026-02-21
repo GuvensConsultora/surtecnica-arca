@@ -46,6 +46,28 @@ class LibroIvaDigitalWizard(models.TransientModel):
     cuadratura_file = fields.Binary('Cuadratura F.2051')
     cuadratura_name = fields.Char()
 
+    # Configuración IVA Simple (F.2051)
+    # Por qué: Código de actividad AFIP principal para agrupar ventas en CSV
+    actividad_afip = fields.Char(
+        'Actividad AFIP', size=6, default='465320',
+        help='Código actividad principal AFIP (6 dígitos)',
+    )
+
+    # CSV IVA Simple — Apertura de otros conceptos (estado done)
+    # Por qué: Desde nov 2025, ARCA F.2051 importa apertura vía CSV
+    iva_simple_debito_csv = fields.Binary('CSV Débito Fiscal')
+    iva_simple_debito_csv_name = fields.Char(
+        default='IVA_SIMPLE_DEBITO_FISCAL.csv')
+    iva_simple_rest_debito_csv = fields.Binary('CSV Rest. Débito Fiscal')
+    iva_simple_rest_debito_csv_name = fields.Char(
+        default='IVA_SIMPLE_REST_DEBITO_FISCAL.csv')
+    iva_simple_credito_csv = fields.Binary('CSV Crédito Fiscal')
+    iva_simple_credito_csv_name = fields.Char(
+        default='IVA_SIMPLE_CREDITO_FISCAL.csv')
+    iva_simple_rest_credito_csv = fields.Binary('CSV Rest. Crédito Fiscal')
+    iva_simple_rest_credito_csv_name = fields.Char(
+        default='IVA_SIMPLE_REST_CREDITO_FISCAL.csv')
+
     # -------------------------------------------------------------------------
     # CONSTANTES AFIP
     # -------------------------------------------------------------------------
@@ -78,12 +100,25 @@ class LibroIvaDigitalWizard(models.TransientModel):
         'GBP': '021', 'UYU': '011', 'CLP': '033', 'MXN': '010',
     }
 
+    # Mapeo responsabilidad AFIP → tipo sujeto CSV IVA Simple
+    # Por qué: ARCA IVA Simple agrupa ventas por tipo de comprador
+    RESP_TIPO_SUJETO = {
+        '1': '1',   # RI → Operaciones con RI
+        '6': '1',   # Resp. Acuerdo → igual que RI (recibe Factura A)
+        '3': '2',   # Monotributo → Operaciones con Monotributistas
+        '4': '3',   # Autónomo → CF/Exentos/NA
+        '5': '3',   # Consumidor Final → CF/Exentos/NA
+        '9': '3',   # Sujeto Exento → CF/Exentos/NA
+        '10': '3',  # Act. Exentas → CF/Exentos/NA
+        '13': '3',  # Sin categoría → CF/Exentos/NA
+    }
+
     # -------------------------------------------------------------------------
     # ACCIÓN PRINCIPAL
     # -------------------------------------------------------------------------
 
     def action_generar(self):
-        """Genera los 4 archivos TXT del Libro IVA Digital."""
+        """Genera los 4 archivos TXT del Libro IVA Digital + 4 CSV IVA Simple."""
         self.ensure_one()
         if self.date_from > self.date_to:
             raise UserError('La fecha "Desde" no puede ser posterior a "Hasta".')
@@ -94,8 +129,13 @@ class LibroIvaDigitalWizard(models.TransientModel):
         # Validar CUIT de partners antes de generar
         self._validar_cuit_partners(ventas + compras)
 
+        # Extraer datos una sola vez por comprobante (evita doble procesamiento TXT+CSV)
+        v_extracted = {m.id: self._extract_move_data(m) for m in ventas}
+        c_extracted = {m.id: self._extract_move_data(m) for m in compras}
+
         # Ventas: procesar todas juntas
-        v_cbte, v_alic, v_cuad = self._procesar_moves(ventas, 'ventas')
+        v_cbte, v_alic, v_cuad = self._procesar_moves(
+            ventas, 'ventas', v_extracted)
 
         # Compras: separar por letra para cuadratura
         # Por qué: Solo A/M generan crédito fiscal. B/C se informan pero no computan CF.
@@ -103,12 +143,18 @@ class LibroIvaDigitalWizard(models.TransientModel):
             lambda m: m.l10n_latam_document_type_id.l10n_ar_letter in ('A', 'M')
         )
         compras_no_cf = compras - compras_cf
-        c_cbte_cf, c_alic_cf, c_cuad_cf = self._procesar_moves(compras_cf, 'compras')
-        c_cbte_no, c_alic_no, c_cuad_no = self._procesar_moves(compras_no_cf, 'compras')
+        c_cbte_cf, c_alic_cf, c_cuad_cf = self._procesar_moves(
+            compras_cf, 'compras', c_extracted)
+        c_cbte_no, c_alic_no, c_cuad_no = self._procesar_moves(
+            compras_no_cf, 'compras', c_extracted)
 
         # TXT: combinar todas las compras (ARCA requiere todos los cbtes)
         c_cbte = c_cbte_cf + c_cbte_no
         c_alic = c_alic_cf + c_alic_no
+
+        # CSV IVA Simple: mismos datos extraídos que TXT
+        csv_data = self._generar_csvs_iva_simple(
+            ventas, compras, v_extracted, c_extracted)
 
         # Resumen y cuadratura
         resumen = self._generar_resumen(
@@ -131,6 +177,8 @@ class LibroIvaDigitalWizard(models.TransientModel):
             'cuadratura_file': base64.b64encode(resumen.encode('utf-8')),
             'cuadratura_name': f'CUADRATURA_F2051_{periodo}.txt',
         }
+        # Agregar CSV IVA Simple al write
+        vals.update(csv_data)
         self.write(vals)
 
         return {
@@ -146,12 +194,27 @@ class LibroIvaDigitalWizard(models.TransientModel):
         self.ensure_one()
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # 4 archivos TXT del Libro IVA Digital
             for fname, fdata in [
                 (self.ventas_cbte_name, self.ventas_cbte_file),
                 (self.ventas_alic_name, self.ventas_alic_file),
                 (self.compras_cbte_name, self.compras_cbte_file),
                 (self.compras_alic_name, self.compras_alic_file),
                 (self.cuadratura_name, self.cuadratura_file),
+            ]:
+                if fdata:
+                    zf.writestr(fname, base64.b64decode(fdata))
+
+            # 4 CSV IVA Simple (Apertura otros conceptos F.2051)
+            for fname, fdata in [
+                (self.iva_simple_debito_csv_name,
+                 self.iva_simple_debito_csv),
+                (self.iva_simple_rest_debito_csv_name,
+                 self.iva_simple_rest_debito_csv),
+                (self.iva_simple_credito_csv_name,
+                 self.iva_simple_credito_csv),
+                (self.iva_simple_rest_credito_csv_name,
+                 self.iva_simple_rest_credito_csv),
             ]:
                 if fdata:
                     zf.writestr(fname, base64.b64decode(fdata))
@@ -197,11 +260,12 @@ class LibroIvaDigitalWizard(models.TransientModel):
     # PROCESAMIENTO DE MOVES
     # -------------------------------------------------------------------------
 
-    def _procesar_moves(self, moves, tipo):
+    def _procesar_moves(self, moves, tipo, extracted=None):
         """Procesa moves y genera líneas de cabecera + alícuotas.
 
         Args:
             tipo: 'ventas' o 'compras' (determina el formato de salida).
+            extracted: dict {move_id: data} pre-extraído (evita doble cálculo).
         Returns:
             tuple: (lista_cabecera, lista_alicuotas, datos_cuadratura)
             Por qué: datos_cuadratura acumula totales para el resumen
@@ -222,7 +286,9 @@ class LibroIvaDigitalWizard(models.TransientModel):
 
         for move in moves:
             try:
-                data = self._extract_move_data(move)
+                # Usar datos pre-extraídos si están disponibles
+                data = extracted[move.id] if extracted else \
+                    self._extract_move_data(move)
 
                 # Acumular datos para cuadratura
                 for key in ('total', 'no_gravado', 'exento', 'perc_no_categ',
@@ -282,13 +348,16 @@ class LibroIvaDigitalWizard(models.TransientModel):
             'imp_internos': 0.0,
             'otros_tributos': 0.0,
             'iva_alicuotas': [],       # [{code, base, amount}]
+            'iva_by_concepto': {},     # {(concepto, code): {base, amount}}
         }
 
         # Paso 1: Clasificar líneas de producto → no_gravado / exento / gravado
         # Por qué: price_subtotal está en moneda factura, consistente con amount_total
         # Para gravado, se acumula la base por código IVA desde las líneas de producto
         # en vez de usar tax_base_amount (que está en moneda compañía).
+        # Patrón: Una sola pasada alimenta iva_bases (para TXT) e iva_by_concepto (para CSV).
         iva_bases = {}
+        iva_by_concepto = {}
         # Por qué: en Odoo 19 display_type='product' para líneas de producto.
         # Filtro explícito: solo líneas de producto (excluye section, note, rounding).
         for line in move.invoice_line_ids.filtered(
@@ -304,8 +373,16 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 for tax in line.tax_ids:
                     code = self._get_vat_afip_code(tax)
                     if code and code in self.IVA_GRAVADO_CODES:
+                        bal = line.price_subtotal * sign
                         iva_bases.setdefault(code, 0.0)
-                        iva_bases[code] += line.price_subtotal * sign
+                        iva_bases[code] += bal
+                        # Concepto ARCA: 1=Bienes, 2=Locaciones, 3=Servicios
+                        # Por qué: Todo como 1 (bienes) para que el total CSV
+                        # coincida con el total TXT sin ambigüedad.
+                        ckey = ('1', code)
+                        if ckey not in iva_by_concepto:
+                            iva_by_concepto[ckey] = {'base': 0.0, 'amount': 0.0}
+                        iva_by_concepto[ckey]['base'] += bal
                         break  # Solo un IVA gravado por línea
 
         # Paso 2: Importes de IVA y otros impuestos desde tax lines
@@ -340,6 +417,14 @@ class LibroIvaDigitalWizard(models.TransientModel):
             result['iva_alicuotas'].append({
                 'code': code, 'base': base, 'amount': amount,
             })
+
+        # Recalcular IVA en iva_by_concepto para consistencia CSV ↔ TXT
+        # Por qué: Misma fórmula que iva_alicuotas asegura importes idénticos
+        for ckey, cdata in iva_by_concepto.items():
+            rate = self.IVA_RATES.get(ckey[1], 0.0)
+            if rate > 0:
+                cdata['amount'] = round(cdata['base'] * rate, 2)
+        result['iva_by_concepto'] = iva_by_concepto
 
         return result
 
@@ -814,6 +899,254 @@ class LibroIvaDigitalWizard(models.TransientModel):
             return False
         content = '\r\n'.join(lines)
         return base64.b64encode(content.encode('latin-1', errors='replace'))
+
+    # -------------------------------------------------------------------------
+    # CSV IVA SIMPLE — APERTURA OTROS CONCEPTOS (F.2051)
+    # -------------------------------------------------------------------------
+
+    def _get_tipo_sujeto(self, partner):
+        """Tipo sujeto comprador desde responsabilidad AFIP.
+
+        Por qué: ARCA IVA Simple agrupa ventas por tipo de comprador.
+        Fallback: '3' (CF/Exentos/NA) si no tiene responsabilidad configurada.
+        """
+        resp = partner.l10n_ar_afip_responsibility_type_id
+        # Por qué: En Odoo 19 el campo puede ser l10n_ar_afip_code o code
+        code = str(
+            getattr(resp, 'l10n_ar_afip_code', False)
+            or getattr(resp, 'code', False)
+            or ''
+        )
+        return self.RESP_TIPO_SUJETO.get(code, '3')
+
+    def _fmt_csv_amount(self, amount):
+        """Importe para CSV ARCA: coma decimal, sin padding.
+
+        Por qué: ARCA IVA Simple espera formato numérico simple con coma
+        como separador decimal. Sin ceros trailing ni zero-padding.
+        Ejemplos: 100.00 → '100', 10.50 → '10,5', 1234.56 → '1234,56'
+        """
+        if abs(amount) < 0.005:
+            return '0'
+        rounded = round(amount, 2)
+        if rounded == int(rounded):
+            return str(int(rounded))
+        s = f'{rounded:.2f}'.rstrip('0')
+        return s.replace('.', ',')
+
+    def _generar_csvs_iva_simple(self, ventas, compras,
+                                  v_extracted, c_extracted):
+        """Genera los 4 CSV de Apertura otros conceptos (IVA Simple F.2051).
+
+        Por qué: Desde nov 2025, ARCA reemplazó F.2002 por F.2051 (IVA Simple).
+        La apertura se importa vía CSV (separador ;, decimal coma, latin-1).
+        Separa facturas (débito/crédito) de NC (restitución).
+        """
+        # Separar facturas/ND de NC
+        ventas_fac = ventas.filtered(lambda m: m.move_type == 'out_invoice')
+        ventas_nc = ventas.filtered(lambda m: m.move_type == 'out_refund')
+        compras_fac = compras.filtered(lambda m: m.move_type == 'in_invoice')
+        compras_nc = compras.filtered(lambda m: m.move_type == 'in_refund')
+
+        df_bin = self._csv_debito_fiscal(ventas_fac, v_extracted)
+        rdf_bin = self._csv_rest_debito_fiscal(ventas_nc, v_extracted)
+        cf_bin = self._csv_credito_fiscal(compras_fac, c_extracted)
+        rcf_bin = self._csv_rest_credito_fiscal(compras_nc, c_extracted)
+
+        return {
+            'iva_simple_debito_csv': df_bin,
+            'iva_simple_debito_csv_name': 'IVA_SIMPLE_DEBITO_FISCAL.csv',
+            'iva_simple_rest_debito_csv': rdf_bin,
+            'iva_simple_rest_debito_csv_name':
+                'IVA_SIMPLE_REST_DEBITO_FISCAL.csv',
+            'iva_simple_credito_csv': cf_bin,
+            'iva_simple_credito_csv_name': 'IVA_SIMPLE_CREDITO_FISCAL.csv',
+            'iva_simple_rest_credito_csv': rcf_bin,
+            'iva_simple_rest_credito_csv_name':
+                'IVA_SIMPLE_REST_CREDITO_FISCAL.csv',
+        }
+
+    # Headers CSV IVA Simple — formato ARCA F.2051
+    # Por qué: ARCA espera headers SIN comillas. Con comillas ARCA no los
+    # reconoce como cabecera y los parsea como datos → "Alícuota inválida".
+    _CSV_HEADER_DEBITO = (
+        'Actividad;Tipo de Operacion;Tipo de sujeto comprador;'
+        'Codigo de Alicuota;Monto Neto Gravado;'
+        'Debito Fiscal Facturado;Debito Fiscal O.D.P.;'
+        'Monto Neto Exento o No Gravado'
+    )
+    _CSV_HEADER_REST_DEBITO = (
+        'Actividad;Tipo de Operacion;Tipo de sujeto comprador;'
+        'Codigo de Alicuota;Monto Neto Gravado;'
+        'Debito Fiscal a Restituir;'
+        'Monto Neto Exento o No Gravado'
+    )
+    _CSV_HEADER_CREDITO = (
+        'Concepto;Codigo de Alicuota;Monto Neto Gravado;'
+        'Credito Fiscal Facturado;Credito Fiscal Computable'
+    )
+    _CSV_HEADER_REST_CREDITO = (
+        'Concepto;Codigo de Alicuota;Monto Neto Gravado;'
+        'Credito Fiscal Facturado'
+    )
+
+    def _afip_code_1d(self, code_4d):
+        """Convierte código AFIP 4 dígitos → 1 dígito para CSV.
+
+        Por qué: v19 usa '0005', CSV ARCA espera '5'.
+        """
+        return code_4d.lstrip('0') or '0'
+
+    def _csv_debito_fiscal(self, moves, extracted):
+        """CSV 1: Débito fiscal — facturas + ND de venta.
+
+        Por qué: Agrupa por (actividad, tipo_sujeto, alícuota).
+        8 columnas según modelo ARCA. Alícuota = código AFIP (1 dígito).
+        tipo_op 1 = gravado, tipo_op 3 = exento/no gravado.
+        """
+        act = self.actividad_afip or '465320'
+        acum = {}
+        exento_ng = 0.0
+
+        for move in moves:
+            data = extracted[move.id]
+            sujeto = self._get_tipo_sujeto(move.commercial_partner_id)
+
+            # Gravado: una línea por alícuota × sujeto
+            for alic in data['iva_alicuotas']:
+                code = self._afip_code_1d(alic['code'])
+                key = (act, '1', sujeto, code)
+                if key not in acum:
+                    acum[key] = {'neto': 0.0, 'iva': 0.0}
+                acum[key]['neto'] += alic['base']
+                acum[key]['iva'] += alic['amount']
+
+            # Exento + No gravado → tipo_op 3 (sin sujeto ni alícuota)
+            monto_exng = data['exento'] + data['no_gravado']
+            if abs(monto_exng) > 0.005:
+                exento_ng += monto_exng
+
+        # Generar líneas CSV con header
+        lines = [self._CSV_HEADER_DEBITO]
+        fmt = self._fmt_csv_amount
+        for key in sorted(acum.keys()):
+            vals = acum[key]
+            _, tipo_op, sujeto, code = key
+            lines.append(
+                f'{key[0]};{tipo_op};{sujeto};{code};'
+                f'{fmt(vals["neto"])};{fmt(vals["iva"])};0'
+            )
+
+        # Exento/no gravado: tipo_op 3, cols 3-7 vacías, monto en col 8
+        if exento_ng > 0.005:
+            lines.append(f'{act};3;;;;;;{fmt(exento_ng)}')
+
+        return self._encode_lines(lines) if len(lines) > 1 else False
+
+    def _csv_rest_debito_fiscal(self, moves, extracted):
+        """CSV 2: Restitución débito fiscal — NC de venta.
+
+        Por qué: Mismo esquema que CSV 1 pero sin campo O.D.P. (7 cols).
+        tipo_op 2 para exento/NG en restitución. Importes en valor absoluto.
+        """
+        act = self.actividad_afip or '465320'
+        acum = {}
+        exento_ng = 0.0
+
+        for move in moves:
+            data = extracted[move.id]
+            sujeto = self._get_tipo_sujeto(move.commercial_partner_id)
+
+            for alic in data['iva_alicuotas']:
+                code = self._afip_code_1d(alic['code'])
+                key = (act, '1', sujeto, code)
+                if key not in acum:
+                    acum[key] = {'neto': 0.0, 'iva': 0.0}
+                acum[key]['neto'] += alic['base']
+                acum[key]['iva'] += alic['amount']
+
+            monto_exng = data['exento'] + data['no_gravado']
+            if monto_exng > 0.005:
+                exento_ng += monto_exng
+
+        lines = [self._CSV_HEADER_REST_DEBITO]
+        fmt = self._fmt_csv_amount
+        for key in sorted(acum.keys()):
+            vals = acum[key]
+            _, tipo_op, sujeto, code = key
+            lines.append(
+                f'{key[0]};{tipo_op};{sujeto};{code};'
+                f'{fmt(vals["neto"])};{fmt(vals["iva"])}'
+            )
+
+        # Por qué: En restitución, ARCA usa tipo_op 2 para exento/NG (no 3)
+        if exento_ng > 0.005:
+            lines.append(f'{act};2;;;;;{fmt(exento_ng)}')
+
+        return self._encode_lines(lines) if len(lines) > 1 else False
+
+    def _csv_credito_fiscal(self, moves, extracted):
+        """CSV 3: Crédito fiscal — facturas + ND de compra.
+
+        Por qué: Agrupa por (concepto, alícuota). concepto = tipo de bien:
+        1=bienes, 3=servicios. Usa iva_by_concepto de _extract_move_data.
+        Formato (5 cols): concepto;code_afip;neto;cf_facturado;cf_computable
+        """
+        acum = {}
+
+        for move in moves:
+            by_concepto = extracted[move.id]['iva_by_concepto']
+            for key, vals in by_concepto.items():
+                if key not in acum:
+                    acum[key] = {'neto': 0.0, 'iva': 0.0}
+                acum[key]['neto'] += vals['base']
+                acum[key]['iva'] += vals['amount']
+
+        lines = [self._CSV_HEADER_CREDITO]
+        fmt = self._fmt_csv_amount
+        for key in sorted(acum.keys()):
+            concepto, code_4d = key
+            code = self._afip_code_1d(code_4d)
+            vals = acum[key]
+            # credito_computable = credito_facturado (sin prorrateo)
+            lines.append(
+                f'{concepto};{code};{fmt(vals["neto"])};'
+                f'{fmt(vals["iva"])};{fmt(vals["iva"])}'
+            )
+
+        return self._encode_lines(lines) if len(lines) > 1 else False
+
+    def _csv_rest_credito_fiscal(self, moves, extracted):
+        """CSV 4: Restitución crédito fiscal — NC de compra.
+
+        Por qué: Igual que CSV 3 pero sin campo credito_computable (4 cols).
+        Formato: concepto;code_afip;neto;credito_facturado
+        """
+        acum = {}
+
+        for move in moves:
+            by_concepto = extracted[move.id]['iva_by_concepto']
+            for key, vals in by_concepto.items():
+                if key not in acum:
+                    acum[key] = {'neto': 0.0, 'iva': 0.0}
+                acum[key]['neto'] += vals['base']
+                acum[key]['iva'] += vals['amount']
+
+        lines = [self._CSV_HEADER_REST_CREDITO]
+        fmt = self._fmt_csv_amount
+        for key in sorted(acum.keys()):
+            concepto, code_4d = key
+            code = self._afip_code_1d(code_4d)
+            vals = acum[key]
+            lines.append(
+                f'{concepto};{code};{fmt(vals["neto"])};{fmt(vals["iva"])}'
+            )
+
+        return self._encode_lines(lines) if len(lines) > 1 else False
+
+    # -------------------------------------------------------------------------
+    # RESUMEN Y CUADRATURA
+    # -------------------------------------------------------------------------
 
     def _generar_resumen(self, ventas, compras, v_cbte, v_alic, c_cbte, c_alic,
                          v_cuad, c_cuad_cf, c_cuad_no, compras_cf, compras_no_cf):

@@ -13,6 +13,10 @@
                         <field name="date_from"/>
                         <field name="date_to"/>
                     </group>
+                    <group string="IVA Simple (F.2051)">
+                        <field name="actividad_afip"
+                               placeholder="Ej: 465320"/>
+                    </group>
                 </group>
 
                 <!-- Estado done: archivos + cuadratura -->
@@ -28,6 +32,20 @@
                         <field name="compras_alic_name" invisible="1"/>
                         <field name="cuadratura_file" filename="cuadratura_name"/>
                         <field name="cuadratura_name" invisible="1"/>
+                    </group>
+                    <group string="CSV IVA Simple (Apertura Conceptos F.2051)">
+                        <field name="iva_simple_debito_csv"
+                               filename="iva_simple_debito_csv_name"/>
+                        <field name="iva_simple_debito_csv_name" invisible="1"/>
+                        <field name="iva_simple_rest_debito_csv"
+                               filename="iva_simple_rest_debito_csv_name"/>
+                        <field name="iva_simple_rest_debito_csv_name" invisible="1"/>
+                        <field name="iva_simple_credito_csv"
+                               filename="iva_simple_credito_csv_name"/>
+                        <field name="iva_simple_credito_csv_name" invisible="1"/>
+                        <field name="iva_simple_rest_credito_csv"
+                               filename="iva_simple_rest_credito_csv_name"/>
+                        <field name="iva_simple_rest_credito_csv_name" invisible="1"/>
                     </group>
                     <group string="Cuadratura DDJJ F.2051">
                         <field name="resumen" nolabel="1" colspan="2"

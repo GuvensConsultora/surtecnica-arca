@@ -26,8 +26,6 @@
     'data': [
         'security/ir.model.access.csv',
         'wizard/libro_iva_digital_wizard_views.xml',
-        'wizard/apertura_conceptos_wizard_views.xml',
-        'views/product_template_views.xml',
         'views/menu_views.xml',
     ],
     'installable': True,
