@@ -837,6 +837,12 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 cat = self._classify_non_iva_tax(tax.tax_group_id)
                 result[cat] += line.balance * inv_sign * sign
 
+        # Auditoría: guardar IVA original de Odoo (antes de recalcular)
+        # Por qué: Para el reporte de auditoría moneda extranjera, necesitamos
+        # comparar el IVA que Odoo calculó vs el que el módulo reporta a ARCA.
+        result['iva_odoo_original'] = sum(
+            a['amount'] for a in iva_by_code.values())
+
         # Paso 3: Ajustar IVA para consistencia matemática con ARCA
         # Por qué: ARCA valida que impuesto = base × alícuota exactamente.
         # Odoo calcula IVA por línea de producto y suma, generando diferencias
@@ -852,6 +858,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
             rate = self.IVA_CODE_RATE.get(ckey[1])
             if rate is not None and rate > 0:
                 cdata['amount'] = round(cdata['base'] * rate / 100, 2)
+
+        # Auditoría: guardar IVA recalculado (después de ajuste ARCA)
+        result['iva_recalculado'] = sum(
+            a['amount'] for a in iva_by_code.values())
 
         result['iva_alicuotas'] = list(iva_by_code.values())
         result['iva_by_concepto'] = iva_by_concepto
@@ -1384,6 +1394,25 @@ class LibroIvaDigitalWizard(models.TransientModel):
             move_row['perc_no_categ'] = round(data['perc_no_categ'], 2)
             move_row['credito_fiscal'] = round(credito_fiscal, 2)
             move_row['total'] = round(data['total'], 2)
+
+            # Auditoría moneda extranjera
+            # Por qué: Permite comparar IVA Odoo vs IVA ARCA para facturas
+            # en USD/EUR donde el redondeo genera diferencias de centavos.
+            move_row['moneda'] = move.currency_id.name
+            move_row['es_moneda_ext'] = (
+                move.currency_id != move.company_currency_id)
+            move_row['tipo_cambio'] = (
+                getattr(move, 'l10n_ar_currency_rate', 0) or 0)
+            move_row['iva_odoo'] = round(
+                data.get('iva_odoo_original', 0), 2)
+            move_row['iva_arca'] = round(
+                data.get('iva_recalculado', 0), 2)
+            move_row['total_odoo'] = round(
+                abs(move.amount_total_signed), 2)
+            move_row['total_arca'] = round(data['total'], 2)
+            move_row['neto_gravado'] = round(
+                sum(a.get('base', 0.0) for a in data['iva_alicuotas']), 2)
+
             detalle_moves.append(move_row)
 
         return {
@@ -1837,10 +1866,157 @@ class LibroIvaDigitalWizard(models.TransientModel):
 
         h.append('</div>')  # close guia section
 
+        # Auditoría moneda extranjera
+        # Por qué: Muestra diferencias de IVA entre Odoo y ARCA para
+        # facturas en USD/EUR, facilitando la auditoría de redondeos.
+        h.append(self._render_auditoria_moneda_ext_html(v_data, c_data))
+
         h.append('<p class="info">(*) Este reporte es una previsualizacion '
                  'orientativa. Verificar contra el portal ARCA antes de presentar. '
                  'No incluye retenciones IVA sufridas ni saldo a favor de '
                  'periodos anteriores.</p>')
+        h.append('</div>')
+        return '\n'.join(h)
+
+    def _render_auditoria_moneda_ext_html(self, v_data, c_data):
+        """Reporte de auditoría: diferencias IVA en facturas moneda extranjera.
+
+        Por qué: Para facturas USD/EUR, Odoo calcula IVA en moneda factura
+        y redondea antes de convertir a ARS. ARCA espera IVA sobre base ya
+        en ARS. Este reporte muestra las diferencias para auditoría.
+        """
+        fmt = self._fmt_money
+
+        def _build_rows(data):
+            """Filtra detalle_moves a solo moneda extranjera."""
+            return [r for r in data.get('detalle_moves', [])
+                    if r.get('es_moneda_ext')]
+
+        v_rows = _build_rows(v_data)
+        c_rows = _build_rows(c_data)
+
+        # Sin facturas en moneda extranjera → no mostrar sección
+        if not v_rows and not c_rows:
+            return ''
+
+        h = ['<div class="section">']
+        h.append('<h3>AUDITORÍA — Diferencias IVA en Moneda Extranjera</h3>')
+        h.append('<p style="font-size:11px;color:#7f8c8d">'
+                 'Compara el IVA que Odoo calcula internamente vs el IVA '
+                 'que el módulo reporta a ARCA (base ARS × alícuota). '
+                 'Diferencias esperadas por redondeo en conversión.</p>')
+
+        cols_hdr = (
+            '<th>Comprobante</th><th>Cliente</th><th>Moneda</th>'
+            '<th>TC</th><th>Neto Grav. ARS</th>'
+            '<th>IVA Odoo ARS</th><th>IVA ARCA ARS</th><th>Dif. IVA</th>'
+            '<th>Total Odoo ARS</th><th>Total ARCA ARS</th>'
+            '<th>Dif. Total</th>')
+
+        def _render_table(rows, titulo):
+            """Genera tabla HTML para un conjunto de rows."""
+            if not rows:
+                return
+            h.append(f'<h3 style="font-size:12px">{titulo}</h3>')
+            h.append(f'<table><tr>{cols_hdr}</tr>')
+
+            sum_neto = sum_iva_odoo = sum_iva_arca = 0.0
+            sum_total_odoo = sum_total_arca = 0.0
+
+            for r in rows:
+                dif_iva = round(r['iva_odoo'] - r['iva_arca'], 2)
+                dif_total = round(r['total_odoo'] - r['total_arca'], 2)
+                # Color: verde si dif=0, rojo si hay diferencia
+                color_iva = ('#27ae60' if abs(dif_iva) < 0.01
+                             else '#c0392b')
+                color_total = ('#27ae60' if abs(dif_total) < 0.01
+                               else '#c0392b')
+                cbte = f"{r['tipo_cbte']} {r['pto_vta']}-{r['nro_cbte']}"
+                tc = f"{r['tipo_cambio']:.2f}" if r['tipo_cambio'] else '-'
+
+                h.append(
+                    f'<tr>'
+                    f'<td>{cbte}</td>'
+                    f'<td>{r["partner"]}</td>'
+                    f'<td>{r["moneda"]}</td>'
+                    f'<td style="text-align:right">{tc}</td>'
+                    f'<td style="text-align:right">'
+                    f'{fmt(r["neto_gravado"])}</td>'
+                    f'<td style="text-align:right">'
+                    f'{fmt(r["iva_odoo"])}</td>'
+                    f'<td style="text-align:right">'
+                    f'{fmt(r["iva_arca"])}</td>'
+                    f'<td style="text-align:right;color:{color_iva};'
+                    f'font-weight:bold">{fmt(dif_iva)}</td>'
+                    f'<td style="text-align:right">'
+                    f'{fmt(r["total_odoo"])}</td>'
+                    f'<td style="text-align:right">'
+                    f'{fmt(r["total_arca"])}</td>'
+                    f'<td style="text-align:right;color:{color_total};'
+                    f'font-weight:bold">{fmt(dif_total)}</td>'
+                    f'</tr>')
+
+                sum_neto += r['neto_gravado']
+                sum_iva_odoo += r['iva_odoo']
+                sum_iva_arca += r['iva_arca']
+                sum_total_odoo += r['total_odoo']
+                sum_total_arca += r['total_arca']
+
+            # Fila de totales
+            dif_iva_t = round(sum_iva_odoo - sum_iva_arca, 2)
+            dif_total_t = round(sum_total_odoo - sum_total_arca, 2)
+            color_iva_t = ('#27ae60' if abs(dif_iva_t) < 0.01
+                           else '#c0392b')
+            color_total_t = ('#27ae60' if abs(dif_total_t) < 0.01
+                             else '#c0392b')
+            h.append(
+                f'<tr class="total-row">'
+                f'<td colspan="4"><strong>TOTAL ({len(rows)} '
+                f'comprobantes)</strong></td>'
+                f'<td style="text-align:right"><strong>'
+                f'{fmt(sum_neto)}</strong></td>'
+                f'<td style="text-align:right"><strong>'
+                f'{fmt(sum_iva_odoo)}</strong></td>'
+                f'<td style="text-align:right"><strong>'
+                f'{fmt(sum_iva_arca)}</strong></td>'
+                f'<td style="text-align:right;color:{color_iva_t};'
+                f'font-weight:bold">{fmt(dif_iva_t)}</td>'
+                f'<td style="text-align:right"><strong>'
+                f'{fmt(sum_total_odoo)}</strong></td>'
+                f'<td style="text-align:right"><strong>'
+                f'{fmt(sum_total_arca)}</strong></td>'
+                f'<td style="text-align:right;color:{color_total_t};'
+                f'font-weight:bold">{fmt(dif_total_t)}</td>'
+                f'</tr>')
+            h.append('</table>')
+
+        _render_table(v_rows, 'Ventas — Moneda Extranjera')
+        _render_table(c_rows, 'Compras — Moneda Extranjera')
+
+        # Resumen general
+        all_rows = v_rows + c_rows
+        total_dif_iva = round(
+            sum(r['iva_odoo'] - r['iva_arca'] for r in all_rows), 2)
+        total_dif_total = round(
+            sum(r['total_odoo'] - r['total_arca'] for r in all_rows), 2)
+        hay_dif = abs(total_dif_iva) >= 0.01 or abs(total_dif_total) >= 0.01
+
+        if hay_dif:
+            h.append(
+                f'<p style="color:#c0392b;font-weight:bold">'
+                f'Diferencia total IVA: {fmt(total_dif_iva)} | '
+                f'Diferencia total importe: {fmt(total_dif_total)}</p>')
+            h.append(
+                '<p style="font-size:11px;color:#7f8c8d">'
+                'Las diferencias se originan por el redondeo de Odoo al '
+                'convertir IVA de moneda extranjera a ARS. El módulo '
+                'recalcula IVA = base_ARS × alícuota para cumplir con '
+                'la validación de ARCA.</p>')
+        else:
+            h.append(
+                '<p style="color:#27ae60;font-weight:bold">'
+                'Sin diferencias. IVA Odoo coincide con IVA ARCA.</p>')
+
         h.append('</div>')
         return '\n'.join(h)
 
@@ -2245,6 +2421,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
         )
         # Hoja 6: Guía paso a paso para carga en portal ARCA
         self._excel_sheet_guia_portal(
+            wb, fmts, v_data, c_data, empresa, cuit, periodo,
+        )
+        # Hoja 7: Auditoría diferencias IVA moneda extranjera
+        self._excel_sheet_auditoria(
             wb, fmts, v_data, c_data, empresa, cuit, periodo,
         )
 
@@ -2804,6 +2984,125 @@ class LibroIvaDigitalWizard(models.TransientModel):
         ws.write(row, 0,
                  'Verificar que los totales coincidan con este reporte '
                  'y hacer clic en "Presentar".', wrap_fmt)
+
+    def _excel_sheet_auditoria(self, wb, fmts, v_data, c_data,
+                               empresa, cuit, periodo):
+        """Hoja Excel: Auditoría diferencias IVA en moneda extranjera.
+
+        Por qué: Para facturas USD/EUR, Odoo calcula IVA en moneda factura
+        y redondea antes de convertir a ARS. ARCA espera IVA sobre base ARS.
+        Esta hoja permite auditar y justificar las discrepancias.
+        """
+        def _get_me_rows(data):
+            return [r for r in data.get('detalle_moves', [])
+                    if r.get('es_moneda_ext')]
+
+        v_rows = _get_me_rows(v_data)
+        c_rows = _get_me_rows(c_data)
+
+        # Sin facturas ME → no crear hoja
+        if not v_rows and not c_rows:
+            return
+
+        ws = wb.add_worksheet('Auditoría ME')
+        # Anchos de columna
+        ws.set_column('A:A', 28)  # Comprobante
+        ws.set_column('B:B', 30)  # Cliente
+        ws.set_column('C:C', 8)   # Moneda
+        ws.set_column('D:D', 10)  # TC
+        ws.set_column('E:K', 16)  # Importes
+
+        row = 0
+        ws.write(row, 0,
+                 f'Auditoría IVA Moneda Extranjera | Período {periodo}',
+                 fmts['title'])
+        row += 1
+        ws.write(row, 0, f'{empresa} | CUIT: {cuit}')
+        row += 1
+        ws.write(row, 0,
+                 'Compara IVA calculado por Odoo vs IVA reportado a ARCA '
+                 '(base ARS × alícuota)')
+        row += 2
+
+        headers = [
+            'Comprobante', 'Cliente', 'Moneda', 'TC', 'Neto Grav. ARS',
+            'IVA Odoo ARS', 'IVA ARCA ARS', 'Dif. IVA',
+            'Total Odoo ARS', 'Total ARCA ARS', 'Dif. Total',
+        ]
+
+        # Formato diferencia: rojo si ≠ 0
+        dif_fmt = wb.add_format({
+            'num_format': '#,##0.00', 'border': 1, 'align': 'right',
+            'font_color': '#c0392b', 'bold': True,
+        })
+        dif_ok_fmt = wb.add_format({
+            'num_format': '#,##0.00', 'border': 1, 'align': 'right',
+            'font_color': '#27ae60', 'bold': True,
+        })
+
+        def _write_section(rows, titulo):
+            nonlocal row
+            if not rows:
+                return
+
+            ws.write(row, 0, titulo, fmts['section'])
+            row += 1
+
+            for col, hdr in enumerate(headers):
+                ws.write(row, col, hdr, fmts['header'])
+            row += 1
+
+            sum_neto = sum_iva_odoo = sum_iva_arca = 0.0
+            sum_total_odoo = sum_total_arca = 0.0
+
+            for r in rows:
+                cbte = f"{r['tipo_cbte']} {r['pto_vta']}-{r['nro_cbte']}"
+                tc = r.get('tipo_cambio', 0)
+                dif_iva = round(r['iva_odoo'] - r['iva_arca'], 2)
+                dif_total = round(r['total_odoo'] - r['total_arca'], 2)
+
+                ws.write(row, 0, cbte, fmts['text'])
+                ws.write(row, 1, r['partner'], fmts['text'])
+                ws.write(row, 2, r['moneda'], fmts['center'])
+                ws.write(row, 3, tc, fmts['money'])
+                ws.write(row, 4, r['neto_gravado'], fmts['money'])
+                ws.write(row, 5, r['iva_odoo'], fmts['money'])
+                ws.write(row, 6, r['iva_arca'], fmts['money'])
+                ws.write(row, 7, dif_iva,
+                         dif_ok_fmt if abs(dif_iva) < 0.01 else dif_fmt)
+                ws.write(row, 8, r['total_odoo'], fmts['money'])
+                ws.write(row, 9, r['total_arca'], fmts['money'])
+                ws.write(row, 10, dif_total,
+                         dif_ok_fmt if abs(dif_total) < 0.01 else dif_fmt)
+                row += 1
+
+                sum_neto += r['neto_gravado']
+                sum_iva_odoo += r['iva_odoo']
+                sum_iva_arca += r['iva_arca']
+                sum_total_odoo += r['total_odoo']
+                sum_total_arca += r['total_arca']
+
+            # Fila totales
+            dif_iva_t = round(sum_iva_odoo - sum_iva_arca, 2)
+            dif_total_t = round(sum_total_odoo - sum_total_arca, 2)
+            ws.write(row, 0,
+                     f'TOTAL ({len(rows)} comprobantes)',
+                     fmts['total_text'])
+            for col in range(1, 4):
+                ws.write(row, col, '', fmts['total_text'])
+            ws.write(row, 4, sum_neto, fmts['total_money'])
+            ws.write(row, 5, sum_iva_odoo, fmts['total_money'])
+            ws.write(row, 6, sum_iva_arca, fmts['total_money'])
+            ws.write(row, 7, dif_iva_t,
+                     dif_ok_fmt if abs(dif_iva_t) < 0.01 else dif_fmt)
+            ws.write(row, 8, sum_total_odoo, fmts['total_money'])
+            ws.write(row, 9, sum_total_arca, fmts['total_money'])
+            ws.write(row, 10, dif_total_t,
+                     dif_ok_fmt if abs(dif_total_t) < 0.01 else dif_fmt)
+            row += 2
+
+        _write_section(v_rows, 'Ventas — Moneda Extranjera')
+        _write_section(c_rows, 'Compras — Moneda Extranjera')
 
     # -------------------------------------------------------------------------
     # CSV IVA SIMPLE — APERTURA OTROS CONCEPTOS (F.2051)
