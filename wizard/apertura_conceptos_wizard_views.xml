@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+
+    <record id="apertura_conceptos_wizard_form" model="ir.ui.view">
+        <field name="name">apertura.conceptos.wizard.form</field>
+        <field name="model">apertura.conceptos.wizard</field>
+        <field name="arch" type="xml">
+            <form string="Apertura de Conceptos - F.2051">
+
+                <!-- Estado draft: selección de período y actividad -->
+                <group invisible="state != 'draft'">
+                    <group string="Período">
+                        <field name="date_from"/>
+                        <field name="date_to"/>
+                    </group>
+                    <group string="Configuración">
+                        <field name="actividad_default"
+                               placeholder="Ej: 620100"/>
+                    </group>
+                </group>
+
+                <!-- Estado done: archivos CSV + resumen -->
+                <div invisible="state != 'done'">
+                    <group string="Archivos CSV Generados">
+                        <field name="debito_file" filename="debito_name"/>
+                        <field name="debito_name" invisible="1"/>
+                        <field name="rest_debito_file" filename="rest_debito_name"/>
+                        <field name="rest_debito_name" invisible="1"/>
+                        <field name="credito_file" filename="credito_name"/>
+                        <field name="credito_name" invisible="1"/>
+                        <field name="rest_credito_file" filename="rest_credito_name"/>
+                        <field name="rest_credito_name" invisible="1"/>
+                    </group>
+                    <group string="Resumen Cuadratura">
+                        <field name="resumen" nolabel="1" colspan="2"
+                               style="font-family: monospace; white-space: pre;"/>
+                    </group>
+                </div>
+
+                <field name="state" invisible="1"/>
+
+                <footer>
+                    <button name="action_generar"
+                            string="Generar Archivos"
+                            type="object"
+                            class="btn-primary"
+                            invisible="state != 'draft'"/>
+                    <button string="Cerrar"
+                            class="btn-secondary"
+                            special="cancel"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_apertura_conceptos_wizard" model="ir.actions.act_window">
+        <field name="name">Apertura Conceptos F.2051</field>
+        <field name="res_model">apertura.conceptos.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+    </record>
+
+</odoo>

@@ -14,4 +14,10 @@
               action="action_libro_iva_digital_wizard"
               sequence="10"/>
 
+    <menuitem id="menu_apertura_conceptos"
+              name="Apertura Conceptos F.2051"
+              parent="menu_arca_root"
+              action="action_apertura_conceptos_wizard"
+              sequence="20"/>
+
 </odoo>
