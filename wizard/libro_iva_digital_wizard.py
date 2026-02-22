@@ -5,6 +5,9 @@ import io
 import zipfile
 from datetime import date
 
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+
 from odoo import models, fields, api
 from odoo.exceptions import UserError
 
@@ -67,6 +70,16 @@ class LibroIvaDigitalWizard(models.TransientModel):
     iva_simple_rest_credito_csv = fields.Binary('CSV Rest. Crédito Fiscal')
     iva_simple_rest_credito_csv_name = fields.Char(
         default='IVA_SIMPLE_REST_CREDITO_FISCAL.csv')
+
+    # Excel Libro IVA — planillas legibles para contabilidad
+    # Por qué: Normativa RG 4597 exige Libro IVA Ventas/Compras.
+    # El Excel permite revisión humana antes de presentar el digital.
+    libro_iva_ventas_xlsx = fields.Binary('Libro IVA Ventas (Excel)')
+    libro_iva_ventas_xlsx_name = fields.Char(
+        default='LIBRO_IVA_VENTAS.xlsx')
+    libro_iva_compras_xlsx = fields.Binary('Libro IVA Compras (Excel)')
+    libro_iva_compras_xlsx_name = fields.Char(
+        default='LIBRO_IVA_COMPRAS.xlsx')
 
     # -------------------------------------------------------------------------
     # CONSTANTES AFIP
@@ -156,6 +169,12 @@ class LibroIvaDigitalWizard(models.TransientModel):
         csv_data = self._generar_csvs_iva_simple(
             ventas, compras, v_extracted, c_extracted)
 
+        # Excel Libro IVA: planillas legibles con detalle por comprobante
+        xlsx_ventas = self._generar_libro_iva_xlsx(
+            ventas, v_extracted, 'ventas')
+        xlsx_compras = self._generar_libro_iva_xlsx(
+            compras, c_extracted, 'compras')
+
         # Resumen y cuadratura
         resumen = self._generar_resumen(
             ventas, compras, v_cbte, v_alic, c_cbte, c_alic,
@@ -179,6 +198,11 @@ class LibroIvaDigitalWizard(models.TransientModel):
         }
         # Agregar CSV IVA Simple al write
         vals.update(csv_data)
+        # Agregar Excel Libro IVA al write
+        vals['libro_iva_ventas_xlsx'] = xlsx_ventas
+        vals['libro_iva_ventas_xlsx_name'] = f'LIBRO_IVA_VENTAS_{periodo}.xlsx'
+        vals['libro_iva_compras_xlsx'] = xlsx_compras
+        vals['libro_iva_compras_xlsx_name'] = f'LIBRO_IVA_COMPRAS_{periodo}.xlsx'
         self.write(vals)
 
         return {
@@ -215,6 +239,16 @@ class LibroIvaDigitalWizard(models.TransientModel):
                  self.iva_simple_credito_csv),
                 (self.iva_simple_rest_credito_csv_name,
                  self.iva_simple_rest_credito_csv),
+            ]:
+                if fdata:
+                    zf.writestr(fname, base64.b64decode(fdata))
+
+            # 2 Excel Libro IVA (planillas legibles)
+            for fname, fdata in [
+                (self.libro_iva_ventas_xlsx_name,
+                 self.libro_iva_ventas_xlsx),
+                (self.libro_iva_compras_xlsx_name,
+                 self.libro_iva_compras_xlsx),
             ]:
                 if fdata:
                     zf.writestr(fname, base64.b64decode(fdata))
@@ -1143,6 +1177,230 @@ class LibroIvaDigitalWizard(models.TransientModel):
             )
 
         return self._encode_lines(lines) if len(lines) > 1 else False
+
+    # -------------------------------------------------------------------------
+    # EXCEL LIBRO IVA (VENTAS / COMPRAS)
+    # -------------------------------------------------------------------------
+    # Por qué: RG 4597 exige llevar Libro IVA Ventas y Compras. El Excel
+    # permite revisión humana (contadores) antes de presentar el digital.
+    # Formato: una fila por comprobante, columnas por alícuota IVA + totales.
+
+    # Estilos reutilizables para el Excel
+    _XLS_HEADER_FONT = Font(name='Arial', size=10, bold=True, color='FFFFFF')
+    _XLS_HEADER_FILL = PatternFill('solid', fgColor='4472C4')
+    _XLS_HEADER_ALIGN = Alignment(horizontal='center', vertical='center',
+                                   wrap_text=True)
+    _XLS_TOTAL_FONT = Font(name='Arial', size=10, bold=True)
+    _XLS_TOTAL_FILL = PatternFill('solid', fgColor='D9E2F3')
+    _XLS_CELL_FONT = Font(name='Arial', size=9)
+    _XLS_BORDER = Border(
+        bottom=Side(style='thin', color='D9D9D9'),
+    )
+    _XLS_NUM_FMT = '#,##0.00'
+
+    # Columnas del Libro IVA — orden por alícuota de menor a mayor
+    # Por qué: Orden lógico para lectura contable. Cada alícuota tiene
+    # dos columnas: Neto Gravado e IVA (DF para ventas, CF para compras).
+    _IVA_COLS_ORDER = [
+        ('0009', '2,5%'), ('0008', '5%'), ('0004', '10,5%'),
+        ('0005', '21%'), ('0006', '27%'),
+    ]
+
+    def _generar_libro_iva_xlsx(self, moves, extracted, tipo):
+        """Genera planilla Excel del Libro IVA (Ventas o Compras).
+
+        Args:
+            moves: recordset de account.move del período.
+            extracted: dict {move_id: data} con importes pre-extraídos.
+            tipo: 'ventas' o 'compras'.
+        Returns:
+            base64: contenido del XLSX codificado, o False si no hay datos.
+        """
+        if not moves:
+            return False
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = f'Libro IVA {"Ventas" if tipo == "ventas" else "Compras"}'
+
+        # Armar headers dinámicos
+        headers = self._xlsx_get_headers(tipo)
+        self._xlsx_write_title(ws, tipo)
+        self._xlsx_write_headers(ws, headers, row=3)
+
+        # Escribir datos fila por fila
+        row = 4
+        totals = {i: 0.0 for i in range(len(headers))}
+        for move in moves:
+            data = extracted[move.id]
+            row_data = self._xlsx_build_row(move, data, tipo)
+            for col, val in enumerate(row_data):
+                cell = ws.cell(row=row, column=col + 1, value=val)
+                cell.font = self._XLS_CELL_FONT
+                cell.border = self._XLS_BORDER
+                if isinstance(val, (int, float)) and col >= 5:
+                    cell.number_format = self._XLS_NUM_FMT
+                    totals[col] = totals.get(col, 0.0) + val
+                elif isinstance(val, date):
+                    cell.number_format = 'DD/MM/YYYY'
+            row += 1
+
+        # Fila de totales
+        self._xlsx_write_totals(ws, row, headers, totals)
+
+        # Ajustar anchos de columna
+        self._xlsx_auto_width(ws, headers)
+
+        # Guardar en buffer y codificar base64
+        buf = io.BytesIO()
+        wb.save(buf)
+        return base64.b64encode(buf.getvalue())
+
+    def _xlsx_get_headers(self, tipo):
+        """Retorna lista de headers según tipo (ventas/compras).
+
+        Por qué: Ventas y compras tienen columnas base similares pero
+        difieren en percepciones (ventas: no_categ; compras: perc_iva).
+        """
+        label_iva = 'DF' if tipo == 'ventas' else 'CF'
+        headers = ['Fecha', 'Tipo', 'Pto Vta', 'Número', 'CUIT', 'Razón Social']
+
+        # Columnas de IVA por alícuota (neto + impuesto)
+        for _code, name in self._IVA_COLS_ORDER:
+            headers.append(f'Neto {name}')
+            headers.append(f'{label_iva} {name}')
+
+        # Columnas de importes no gravados/exentos
+        headers.extend(['No Gravado', 'Exento'])
+
+        # Percepciones según tipo
+        if tipo == 'ventas':
+            headers.extend([
+                'Perc. no Categ.', 'Perc. Nacionales',
+                'Perc. IIBB', 'Perc. Municipales',
+                'Imp. Internos', 'Otros Tributos',
+            ])
+        else:
+            headers.extend([
+                'Perc. IVA', 'Perc. Nacionales',
+                'Perc. IIBB', 'Perc. Municipales',
+                'Imp. Internos', 'Otros Tributos',
+            ])
+        headers.append('Total')
+        return headers
+
+    def _xlsx_build_row(self, move, data, tipo):
+        """Construye una fila de datos para el Excel.
+
+        Returns:
+            list: valores de la fila en orden de columnas.
+        """
+        partner = move.commercial_partner_id
+        pv, num = self._get_doc_parts(move)
+        doc_type = move.l10n_latam_document_type_id
+        # Por qué: Mostrar prefijo legible (FA-A, NC-B, etc.) en vez del código AFIP
+        tipo_cbte = doc_type.doc_code_prefix or doc_type.code or ''
+
+        doc_code, doc_num = self._get_partner_doc(partner)
+        # Formatear CUIT con guiones para legibilidad
+        cuit = doc_num
+        if doc_code == '80' and len(cuit) == 11:
+            cuit = f'{cuit[:2]}-{cuit[2:10]}-{cuit[10]}'
+
+        row = [
+            move.invoice_date,
+            tipo_cbte,
+            pv,
+            num,
+            cuit,
+            partner.name or '',
+        ]
+
+        # IVA por alícuota: buscar base y monto para cada código
+        # Por qué: dict para acceso O(1) en vez de iterar alícuotas por cada columna
+        iva_dict = {a['code']: a for a in data['iva_alicuotas']}
+        for code, _name in self._IVA_COLS_ORDER:
+            alic = iva_dict.get(code)
+            row.append(alic['base'] if alic else 0.0)
+            row.append(alic['amount'] if alic else 0.0)
+
+        # No gravado / exento
+        row.extend([data['no_gravado'], data['exento']])
+
+        # Percepciones (perc_no_categ para ventas, perc_iva para compras)
+        if tipo == 'ventas':
+            row.append(data['perc_no_categ'])
+        else:
+            row.append(data['perc_iva'])
+
+        row.extend([
+            data['perc_nacionales'], data['perc_iibb'],
+            data['perc_mun'], data['imp_internos'],
+            data['otros_tributos'],
+        ])
+
+        row.append(data['total'])
+        return row
+
+    def _xlsx_write_title(self, ws, tipo):
+        """Escribe título y datos de empresa en las primeras filas."""
+        company = self.env.company
+        titulo = f'LIBRO IVA {"VENTAS" if tipo == "ventas" else "COMPRAS"}'
+        periodo = (f'{self.date_from.strftime("%d/%m/%Y")} - '
+                   f'{self.date_to.strftime("%d/%m/%Y")}')
+
+        ws.cell(row=1, column=1, value=titulo).font = Font(
+            name='Arial', size=12, bold=True)
+        ws.cell(row=1, column=4, value=company.name).font = Font(
+            name='Arial', size=10, bold=True)
+        ws.cell(row=1, column=6, value=f'CUIT: {company.vat or ""}').font = Font(
+            name='Arial', size=10)
+        ws.cell(row=2, column=1, value=f'Período: {periodo}').font = Font(
+            name='Arial', size=10)
+
+    def _xlsx_write_headers(self, ws, headers, row=3):
+        """Escribe fila de encabezados con estilo."""
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=row, column=col, value=header)
+            cell.font = self._XLS_HEADER_FONT
+            cell.fill = self._XLS_HEADER_FILL
+            cell.alignment = self._XLS_HEADER_ALIGN
+            cell.border = Border(
+                bottom=Side(style='medium', color='2F5496'))
+
+    def _xlsx_write_totals(self, ws, row, headers, totals):
+        """Escribe fila de totales al final."""
+        ws.cell(row=row, column=1, value='TOTALES').font = self._XLS_TOTAL_FONT
+        for col in range(len(headers)):
+            cell = ws.cell(row=row, column=col + 1)
+            cell.fill = self._XLS_TOTAL_FILL
+            cell.font = self._XLS_TOTAL_FONT
+            cell.border = Border(
+                top=Side(style='medium', color='2F5496'))
+            if col >= 6 and col in totals and totals[col]:
+                cell.value = round(totals[col], 2)
+                cell.number_format = self._XLS_NUM_FMT
+
+    def _xlsx_auto_width(self, ws, headers):
+        """Ajusta ancho de columnas según contenido.
+
+        Por qué: Columnas numéricas anchas fijas (14), texto variable
+        con mínimo razonable para legibilidad sin scroll.
+        """
+        for col, _header in enumerate(headers, 1):
+            if col <= 2:
+                width = 12  # Fecha, Tipo
+            elif col <= 4:
+                width = 10  # PV, Número
+            elif col == 5:
+                width = 16  # CUIT
+            elif col == 6:
+                width = 30  # Razón Social
+            else:
+                width = 14  # Columnas numéricas
+            ws.column_dimensions[
+                ws.cell(row=1, column=col).column_letter
+            ].width = width
 
     # -------------------------------------------------------------------------
     # RESUMEN Y CUADRATURA

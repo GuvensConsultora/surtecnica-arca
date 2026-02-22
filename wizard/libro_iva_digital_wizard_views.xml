@@ -33,6 +33,14 @@
                         <field name="cuadratura_file" filename="cuadratura_name"/>
                         <field name="cuadratura_name" invisible="1"/>
                     </group>
+                    <group string="Excel Libro IVA (Planillas contables)">
+                        <field name="libro_iva_ventas_xlsx"
+                               filename="libro_iva_ventas_xlsx_name"/>
+                        <field name="libro_iva_ventas_xlsx_name" invisible="1"/>
+                        <field name="libro_iva_compras_xlsx"
+                               filename="libro_iva_compras_xlsx_name"/>
+                        <field name="libro_iva_compras_xlsx_name" invisible="1"/>
+                    </group>
                     <group string="CSV IVA Simple (Apertura Conceptos F.2051)">
                         <field name="iva_simple_debito_csv"
                                filename="iva_simple_debito_csv_name"/>
