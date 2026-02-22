@@ -79,6 +79,16 @@ class LibroIvaDigitalWizard(models.TransientModel):
         string='Resultado', readonly=True, sanitize=False,
     )
 
+    # Por qué: ARCA acepta TXT "en pesos" (todo ARS) o "en moneda de origen"
+    # (importes en la moneda de la factura con TC real). Este selector permite
+    # al usuario elegir antes de generar. DDJJ/CSV siempre van en ARS.
+    moneda_reporte = fields.Selection([
+        ('ars', 'Todo en Pesos (ARS)'),
+        ('moneda_factura', 'En moneda del comprobante'),
+    ], string='Moneda TXT', default='ars',
+       help='ARS: importes en pesos, moneda=PES, TC=1. '
+            'Moneda comprobante: importes en USD/EUR, con TC real.')
+
     # Configuración IVA Simple (F.2051)
     # Por qué: Código de actividad AFIP principal para agrupar ventas en CSV
     actividad_afip = fields.Char(
@@ -193,26 +203,37 @@ class LibroIvaDigitalWizard(models.TransientModel):
         # Limpiar duplicados previos si ya no hay
         self.duplicados_html = False
 
-        # Extraer datos una sola vez por comprobante (evita triple procesamiento)
-        v_extracted = {m.id: self._extract_move_data(m) for m in ventas}
-        c_extracted = {m.id: self._extract_move_data(m) for m in compras}
+        # Extraer datos en ARS para DDJJ, CSV y Excel (siempre en pesos)
+        v_extracted_ars = {m.id: self._extract_move_data(m) for m in ventas}
+        c_extracted_ars = {m.id: self._extract_move_data(m) for m in compras}
 
-        # Generar líneas TXT + mapeo usando datos pre-extraídos
-        # Por qué: todo en ARS (moneda compañía). El usuario importa
-        # seleccionando "en pesos" en el portal ARCA.
-        # Así TXT, CSV y DDJJ usan los mismos valores ARS sin conversión.
+        # Para TXT: según selección del usuario (ARS o moneda factura)
+        # Por qué: ARCA acepta TXT "en pesos" o "en moneda de origen".
+        # DDJJ/CSV/Excel siempre van en ARS independientemente de esta selección.
+        if self.moneda_reporte == 'moneda_factura':
+            v_extracted_txt = {
+                m.id: self._extract_move_data(m, use_invoice_currency=True)
+                for m in ventas}
+            c_extracted_txt = {
+                m.id: self._extract_move_data(m, use_invoice_currency=True)
+                for m in compras}
+        else:
+            v_extracted_txt = v_extracted_ars
+            c_extracted_txt = c_extracted_ars
+
+        # Generar líneas TXT + mapeo usando datos para TXT
         v_cbte, v_alic, v_cbte_map, v_alic_map = self._procesar_moves(
-            ventas, 'ventas', v_extracted)
+            ventas, 'ventas', v_extracted_txt)
         c_cbte, c_alic, c_cbte_map, c_alic_map = self._procesar_moves(
-            compras, 'compras', c_extracted)
+            compras, 'compras', c_extracted_txt)
 
-        # DDJJ IVA: mismos valores ARS que TXT y CSV
+        # DDJJ IVA: siempre en ARS
         ddjj_html, v_ddjj, c_ddjj = self._compute_ddjj_iva_html(
-            ventas, compras, v_extracted, c_extracted)
+            ventas, compras, v_extracted_ars, c_extracted_ars)
 
-        # CSV IVA Simple: mismos valores ARS que TXT
+        # CSV IVA Simple: siempre en ARS
         csv_data, csv_totals = self._generar_csvs_iva_simple(
-            ventas, compras, v_extracted, c_extracted)
+            ventas, compras, v_extracted_ars, c_extracted_ars)
 
         # Cruce: validar que CSV apertura coincida con comprobantes TXT
         ddjj_html += self._render_cruce_csv_html(csv_totals, v_ddjj, c_ddjj)
@@ -734,9 +755,12 @@ class LibroIvaDigitalWizard(models.TransientModel):
     # EXTRACCIÓN DE DATOS DE UN MOVE
     # -------------------------------------------------------------------------
 
-    def _extract_move_data(self, move):
+    def _extract_move_data(self, move, use_invoice_currency=False):
         """Extrae y clasifica todos los importes de un comprobante.
 
+        Args:
+            use_invoice_currency: Si True, usa amount_currency (moneda factura)
+                en vez de balance (ARS). Para facturas ARS no hay diferencia.
         Por qué: Separa IVA gravado (→ archivo alícuotas), no gravado,
         exento, percepciones y otros tributos (→ archivo cabecera).
         El signo se invierte para NC/ND negativas.
@@ -754,6 +778,11 @@ class LibroIvaDigitalWizard(models.TransientModel):
         # Bug anterior: abs(line.balance) convertía anticipos negativos en
         # positivos, inflando neto gravado e IVA en facturas con anticipos.
         inv_sign = -1 if move.move_type in ('out_invoice', 'in_refund') else 1
+
+        # Por qué: Cuando el usuario elige "En moneda del comprobante",
+        # usamos amount_currency (moneda factura) en vez de balance (ARS).
+        # Para facturas en ARS amount_currency == balance, sin diferencia.
+        amt_field = 'amount_currency' if use_invoice_currency else 'balance'
 
         # Por qué: documentos con letra 'E' son exportación (código operación 'X')
         doc_type = move.l10n_latam_document_type_id
@@ -776,11 +805,8 @@ class LibroIvaDigitalWizard(models.TransientModel):
         }
 
         # Paso 1: Clasificar líneas de producto → no_gravado / exento / base IVA
-        # Por qué: Usar line.balance * inv_sign (moneda empresa ARS) en vez de
-        # price_subtotal (moneda factura). Para facturas en moneda extranjera
-        # price_subtotal está en USD/EUR, causando importes mixtos.
-        # balance siempre está en ARS = moneda de la empresa.
-        # inv_sign preserva el signo negativo de anticipos/descuentos.
+        # Por qué: amt_field selecciona balance (ARS) o amount_currency (moneda
+        # factura) según use_invoice_currency. inv_sign normaliza el signo.
         # Patrón: Una sola pasada sobre invoice_line_ids alimenta iva_by_code
         # (para TXT/DDJJ) e iva_by_concepto (para CSV crédito/restitución).
         iva_by_code = {}
@@ -788,21 +814,21 @@ class LibroIvaDigitalWizard(models.TransientModel):
         for line in move.invoice_line_ids.filtered(
             lambda l: l.display_type not in ('line_section', 'line_note')
         ):
+            amt = getattr(line, amt_field) * inv_sign * sign
             line_class = self._classify_line_iva(line)
             if line_class == 'no_gravado':
-                result['no_gravado'] += line.balance * inv_sign * sign
+                result['no_gravado'] += amt
             elif line_class == 'exento':
-                result['exento'] += line.balance * inv_sign * sign
+                result['exento'] += amt
             else:
                 # Gravado: acumular base por código de alícuota IVA
                 for tax in line.tax_ids:
                     code = self._get_vat_afip_code(tax)
                     if code and code in self.IVA_GRAVADO_CODES:
-                        bal = line.balance * inv_sign * sign
                         if code not in iva_by_code:
                             iva_by_code[code] = {
                                 'code': code, 'base': 0.0, 'amount': 0.0}
-                        iva_by_code[code]['base'] += bal
+                        iva_by_code[code]['base'] += amt
 
                         # Concepto ARCA: 1=Bienes, 2=Locaciones, 3=Servicios
                         # Por qué: El TXT no tiene campo concepto, ARCA no puede
@@ -813,29 +839,30 @@ class LibroIvaDigitalWizard(models.TransientModel):
                         if ckey not in iva_by_concepto:
                             iva_by_concepto[ckey] = {
                                 'base': 0.0, 'amount': 0.0}
-                        iva_by_concepto[ckey]['base'] += bal
+                        iva_by_concepto[ckey]['base'] += amt
                         break  # Una línea tiene una sola alícuota IVA
 
         # Paso 2: IVA amount + impuestos no-IVA desde tax lines
-        # Por qué: El monto de IVA (amount) se toma de la tax line (balance),
-        # y los impuestos no-IVA (percepciones, IIBB, etc.) se clasifican aquí.
+        # Por qué: El monto de IVA (amount) se toma de la tax line,
+        # usando amt_field (balance o amount_currency según moneda elegida).
         for line in move.line_ids.filtered(lambda l: l.tax_line_id):
             tax = line.tax_line_id
             vat_code = self._get_vat_afip_code(tax)
+            tax_amt = getattr(line, amt_field) * inv_sign * sign
 
             if vat_code and vat_code in self.IVA_GRAVADO_CODES:
-                # IVA gravado → sumar amount (el monto del impuesto en ARS)
+                # IVA gravado → sumar amount
                 if vat_code not in iva_by_code:
                     iva_by_code[vat_code] = {
                         'code': vat_code, 'base': 0.0, 'amount': 0.0}
-                iva_by_code[vat_code]['amount'] += line.balance * inv_sign * sign
+                iva_by_code[vat_code]['amount'] += tax_amt
             elif vat_code in ('1', '2'):
                 # No gravado / exento ya computados en paso 1
                 pass
             else:
                 # Impuesto no-IVA → clasificar en cabecera
                 cat = self._classify_non_iva_tax(tax.tax_group_id)
-                result[cat] += line.balance * inv_sign * sign
+                result[cat] += tax_amt
 
         # Auditoría: guardar IVA original de Odoo (antes de recalcular)
         # Por qué: Para el reporte de auditoría moneda extranjera, necesitamos
@@ -973,14 +1000,17 @@ class LibroIvaDigitalWizard(models.TransientModel):
     def _fmt_ventas_cbte(self, move, data):
         """Genera una línea del archivo LIBRO_IVA_DIGITAL_VENTAS_CBTE.
 
-        Por qué: importes en ARS → moneda=PES, TC=1.
-        Se importa con opción "en pesos" en el portal ARCA.
+        Por qué: moneda y TC dependen de moneda_reporte del wizard.
+        'ars' → PES, TC=1. 'moneda_factura' → código AFIP real y TC real.
         """
         partner = move.commercial_partner_id
         pv, num = self._get_doc_parts(move)
         doc_code, doc_num = self._get_partner_doc(partner)
-        # Importes en ARS → moneda PES, TC 1.0
-        cur_code, cur_rate = 'PES', 1.0
+        # Moneda según selección del usuario
+        if self.moneda_reporte == 'moneda_factura':
+            cur_code, cur_rate = self._get_currency_info(move)
+        else:
+            cur_code, cur_rate = 'PES', 1.0
         op_code = self._get_operation_code(data)
         n_alic = len(data['iva_alicuotas'])
         fecha_vto = move.invoice_date_due or move.invoice_date
@@ -1046,14 +1076,17 @@ class LibroIvaDigitalWizard(models.TransientModel):
     def _fmt_compras_cbte(self, move, data):
         """Genera una línea del archivo LIBRO_IVA_DIGITAL_COMPRAS_CBTE.
 
-        Por qué: importes en ARS → moneda=PES, TC=1.
-        Se importa con opción "en pesos" en el portal ARCA.
+        Por qué: moneda y TC dependen de moneda_reporte del wizard.
+        'ars' → PES, TC=1. 'moneda_factura' → código AFIP real y TC real.
         """
         partner = move.commercial_partner_id
         pv, num = self._get_doc_parts(move)
         doc_code, doc_num = self._get_partner_doc(partner)
-        # Importes en ARS → moneda PES, TC 1.0
-        cur_code, cur_rate = 'PES', 1.0
+        # Moneda según selección del usuario
+        if self.moneda_reporte == 'moneda_factura':
+            cur_code, cur_rate = self._get_currency_info(move)
+        else:
+            cur_code, cur_rate = 'PES', 1.0
         op_code = self._get_operation_code(data)
         n_alic = len(data['iva_alicuotas'])
         # Crédito fiscal = suma de IVA de todas las alícuotas

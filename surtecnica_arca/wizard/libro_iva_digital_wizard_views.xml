@@ -17,6 +17,7 @@
                     <group string="Período">
                         <field name="date_from"/>
                         <field name="date_to"/>
+                        <field name="moneda_reporte"/>
                     </group>
                     <group string="IVA Simple (F.2051)">
                         <field name="actividad_afip"/>
