@@ -22,3 +22,12 @@ Thumbs.db
 # Odoo
 *.pyc
 filestore/
+
+# Archivos de análisis / temporales
+*.xlsx
+*.docx
+*.zip
+*.png
+*.pdf
+*.csv
+.~lock.*
