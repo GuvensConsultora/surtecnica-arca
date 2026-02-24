@@ -16,10 +16,24 @@ class ResPartner(models.Model):
         self.ensure_one()
         cuit = self.ensure_vat()
 
-        # Por qué: get_connection() ya maneja la búsqueda de certificado internamente
-        # via _create_connection → get_key_and_certificate. No necesitamos pre-chequear.
-        # El código original de l10n_ar_padron tenía un fallback con bug en el search.
+        # Por qué: el certificado AFIP puede estar en otra compañía distinta a la del usuario.
+        # Facturación funciona porque la factura tiene la compañía correcta,
+        # pero acá partimos del usuario. Si su compañía no tiene certificado,
+        # buscamos cualquier compañía que sí tenga uno confirmado.
         company = self.env.user.company_id
+        env_type = company._get_environment_type()
+        try:
+            company.get_key_and_certificate(env_type)
+        except Exception:
+            certificate = self.env['afipws.certificate'].sudo().search([
+                ('alias_id.type', '=', env_type),
+                ('state', '=', 'confirmed'),
+            ], limit=1)
+            if not certificate:
+                raise UserError(_(
+                    'No se encontró un certificado AFIP confirmado para %s'
+                ) % env_type)
+            company = certificate.alias_id.company_id
         padron = company.get_connection('ws_sr_padron_a13').connect()
 
         error_msg = _(
