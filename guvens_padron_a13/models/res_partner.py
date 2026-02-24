@@ -17,23 +17,26 @@ class ResPartner(models.Model):
         cuit = self.ensure_vat()
 
         # Por qué: el certificado AFIP puede estar en otra compañía distinta a la del usuario.
-        # Facturación funciona porque la factura tiene la compañía correcta,
+        # Facturación funciona porque la factura usa su propia company_id,
         # pero acá partimos del usuario. Si su compañía no tiene certificado,
-        # buscamos cualquier compañía que sí tenga uno confirmado.
+        # buscamos la compañía que tenga conexiones AFIP activas (si factura, existe).
         company = self.env.user.company_id
         env_type = company._get_environment_type()
         try:
             company.get_key_and_certificate(env_type)
         except Exception:
-            certificate = self.env['afipws.certificate'].sudo().search([
-                ('alias_id.type', '=', env_type),
-                ('state', '=', 'confirmed'),
+            # Patrón: buscar compañía por conexiones existentes en vez de certificados.
+            # Si facturación electrónica funciona, hay afipws.connection records
+            # para esa compañía — la usamos para A13 también.
+            connection = self.env['afipws.connection'].sudo().search([
+                ('type', '=', env_type),
             ], limit=1)
-            if not certificate:
+            if not connection:
                 raise UserError(_(
-                    'No se encontró un certificado AFIP confirmado para %s'
+                    'No se encontró ninguna conexión AFIP activa para %s. '
+                    'Verifique que la facturación electrónica funcione.'
                 ) % env_type)
-            company = certificate.alias_id.company_id
+            company = connection.company_id
         padron = company.get_connection('ws_sr_padron_a13').connect()
 
         error_msg = _(
