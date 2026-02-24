@@ -63,10 +63,26 @@ class WSSrPadronA13(WSSrPadronA5):
         resp = http_requests.post(
             self._endpoint_url,
             data=soap_xml.encode('utf-8'),
-            headers={'Content-Type': 'text/xml; charset=utf-8'},
+            headers={
+                'Content-Type': 'text/xml; charset=utf-8',
+                'SOAPAction': '""',
+            },
             timeout=self._timeout,
         )
-        resp.raise_for_status()
+        # Por qué: no usar raise_for_status() — el body del 500 tiene
+        # el detalle del SOAP Fault que necesitamos para diagnosticar.
+        if resp.status_code != 200:
+            # Intentar extraer faultstring del SOAP Fault
+            detail = resp.text[:500] if resp.text else 'Sin detalle'
+            try:
+                err_root = ET.fromstring(resp.content)
+                fault = self._find(err_root, 'faultstring', recursive=True)
+                if fault is not None:
+                    detail = fault.text
+            except Exception:
+                pass
+            raise RuntimeError(
+                'AFIP A13 HTTP %s: %s' % (resp.status_code, detail))
 
         # Parsear respuesta XML
         root = ET.fromstring(resp.content)
