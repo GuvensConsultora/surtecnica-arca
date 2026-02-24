@@ -16,10 +16,10 @@ class ResPartner(models.Model):
         self.ensure_one()
         cuit = self.ensure_vat()
 
-        # Por qué: get_key_and_certificate() ahora tiene fallback a campos Enterprise
-        # (l10n_ar_afip_ws_key/crt) via res_company.py, así que funciona directo.
+        # Por qué: _get_a13_ws() autentica directo con WSAA usando cert Enterprise
+        # sin depender de l10n_ar_afipws (afipws.connection)
         company = self.env.user.company_id
-        padron = company.get_connection('ws_sr_padron_a13').connect()
+        padron = company._get_a13_ws()
 
         error_msg = _(
             'No pudimos actualizar desde padron afip al partner %s (%s).\n'

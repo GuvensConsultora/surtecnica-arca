@@ -6,8 +6,10 @@
     'author': 'Guvens Consultora',
     'license': 'AGPL-3',
     'depends': [
-        'l10n_ar_afipws',
         'l10n_ar_padron',
+    ],
+    'data': [
+        'security/ir.model.access.csv',
     ],
     'installable': True,
     'application': False,
