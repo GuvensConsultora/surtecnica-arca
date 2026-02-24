@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- Tree view con colores por estado -->
+    <record id="view_mis_comprobantes_line_tree" model="ir.ui.view">
+        <field name="name">guvens.mis.comprobantes.line.tree</field>
+        <field name="model">guvens.mis.comprobantes.line</field>
+        <field name="arch" type="xml">
+            <tree decoration-success="state == 'match'"
+                  decoration-warning="state == 'mismatch'"
+                  decoration-danger="state == 'missing_in_odoo'"
+                  decoration-info="state == 'missing_in_afip'">
+                <field name="date"/>
+                <field name="partner_name"/>
+                <field name="partner_vat"/>
+                <field name="doc_type"/>
+                <field name="pos_number"/>
+                <field name="doc_number"/>
+                <field name="amount_total" string="Total AFIP" sum="Total AFIP"/>
+                <field name="move_id" string="Factura Odoo"/>
+                <field name="diff_amount" string="Diferencia" sum="Total Dif."/>
+                <field name="state" widget="badge"
+                       decoration-success="state == 'match'"
+                       decoration-warning="state == 'mismatch'"
+                       decoration-danger="state == 'missing_in_odoo'"
+                       decoration-info="state == 'missing_in_afip'"/>
+                <button name="action_open_move" type="object" string="Ver factura"
+                        icon="fa-external-link"
+                        attrs="{'invisible': [('move_id', '=', False)]}"/>
+            </tree>
+        </field>
+    </record>
+
+    <!-- Form view -->
+    <record id="view_mis_comprobantes_line_form" model="ir.ui.view">
+        <field name="name">guvens.mis.comprobantes.line.form</field>
+        <field name="model">guvens.mis.comprobantes.line</field>
+        <field name="arch" type="xml">
+            <form string="Comprobante AFIP" create="false">
+                <header>
+                    <field name="state" widget="statusbar"/>
+                </header>
+                <sheet>
+                    <group>
+                        <group string="Datos AFIP">
+                            <field name="date"/>
+                            <field name="doc_type"/>
+                            <field name="pos_number"/>
+                            <field name="doc_number"/>
+                            <field name="cae"/>
+                            <field name="partner_vat"/>
+                            <field name="partner_name"/>
+                        </group>
+                        <group string="Importes">
+                            <field name="amount_net"/>
+                            <field name="amount_untaxed"/>
+                            <field name="amount_exempt"/>
+                            <field name="amount_iva"/>
+                            <field name="amount_total"/>
+                        </group>
+                    </group>
+                    <group string="Cruce con Odoo">
+                        <field name="move_id"/>
+                        <field name="diff_amount"/>
+                        <field name="period"/>
+                        <field name="import_date"/>
+                    </group>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <!-- Search view -->
+    <record id="view_mis_comprobantes_line_search" model="ir.ui.view">
+        <field name="name">guvens.mis.comprobantes.line.search</field>
+        <field name="model">guvens.mis.comprobantes.line</field>
+        <field name="arch" type="xml">
+            <search string="Cruce Comprobantes">
+                <field name="partner_name"/>
+                <field name="partner_vat"/>
+                <field name="doc_number"/>
+                <field name="cae"/>
+                <filter name="filter_match" string="Coinciden" domain="[('state', '=', 'match')]"/>
+                <filter name="filter_mismatch" string="Diferencia" domain="[('state', '=', 'mismatch')]"/>
+                <filter name="filter_missing_odoo" string="Falta en Odoo" domain="[('state', '=', 'missing_in_odoo')]"/>
+                <filter name="filter_missing_afip" string="Falta en AFIP" domain="[('state', '=', 'missing_in_afip')]"/>
+                <separator/>
+                <filter name="group_state" string="Agrupar por estado" context="{'group_by': 'state'}"/>
+                <filter name="group_partner" string="Agrupar por proveedor" context="{'group_by': 'partner_name'}"/>
+                <filter name="group_period" string="Agrupar por período" context="{'group_by': 'period'}"/>
+            </search>
+        </field>
+    </record>
+
+    <!-- Action -->
+    <record id="action_mis_comprobantes_line" model="ir.actions.act_window">
+        <field name="name">Cruce Mis Comprobantes</field>
+        <field name="res_model">guvens.mis.comprobantes.line</field>
+        <field name="view_mode">tree,form</field>
+        <field name="search_view_id" ref="view_mis_comprobantes_line_search"/>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">
+                No hay comprobantes importados
+            </p>
+            <p>
+                Importe un CSV desde el portal "Mis Comprobantes" de AFIP
+                para cruzar contra las facturas de proveedores.
+            </p>
+        </field>
+    </record>
+
+</odoo>
