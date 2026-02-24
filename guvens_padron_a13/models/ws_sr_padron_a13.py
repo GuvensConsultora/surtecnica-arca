@@ -56,8 +56,10 @@ class WSSrPadronA13(WSSrPadronA5):
         ).format(
             token=self.Token,
             sign=self.Sign,
-            cuit=self.Cuit,
-            id_persona=id_persona,
+            # Por qué: el VAT de Odoo puede venir con guiones (30-71543497-7)
+            # o prefijo país (AR30715434977). AFIP espera solo dígitos.
+            cuit=str(self.Cuit).replace('-', '').replace('AR', ''),
+            id_persona=str(id_persona).replace('-', '').replace('AR', ''),
         )
 
         resp = http_requests.post(
