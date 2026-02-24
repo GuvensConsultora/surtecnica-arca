@@ -1,4 +1,4 @@
-# Libro IVA Digital — ARCA (surtecnica_arca)
+# Libro IVA Digital — ARCA (guvens_arca)
 
 ## 1. Introducción
 
@@ -135,7 +135,7 @@ Antes de generar, el módulo detecta comprobantes duplicados (mismo tipo + núme
 ### Arquitectura
 
 ```
-surtecnica_arca/
+guvens_arca/
 ├── __init__.py
 ├── __manifest__.py
 ├── security/ir.model.access.csv

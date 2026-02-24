@@ -14,7 +14,7 @@
         - LIBRO_IVA_DIGITAL_COMPRAS_CBTE (325 chars)
         - LIBRO_IVA_DIGITAL_COMPRAS_ALICUOTAS (84 chars)
     """,
-    'author': 'Surtecnica',
+    'author': 'Guvens Consultora',
     'website': '',
     # Por qué: l10n_ar provee CUIT, tipos de comprobante AFIP, códigos de moneda
     # y toda la estructura fiscal argentina necesaria para el Libro IVA Digital
