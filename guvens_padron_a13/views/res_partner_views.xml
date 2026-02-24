@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Agrega shortcut Alt+A al botón "Actualizar desde padron AFIP" -->
+    <record id="view_partner_padron_a13_shortcut" model="ir.ui.view">
+        <field name="name">res.partner.padron.a13.shortcut</field>
+        <field name="model">res.partner</field>
+        <field name="inherit_id" ref="l10n_ar_padron.view_partner_padron_form"/>
+        <field name="arch" type="xml">
+            <button name="check_padron" position="attributes">
+                <attribute name="accesskey">a</attribute>
+            </button>
+        </field>
+    </record>
+</odoo>
