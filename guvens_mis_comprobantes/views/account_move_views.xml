@@ -2,13 +2,15 @@
 <odoo>
 
     <!-- Indicador de cruce AFIP en la vista form de facturas de proveedor -->
+    <!-- Por qué: usamos xpath a invoice_date que es campo estándar seguro en Odoo 17 -->
     <record id="view_move_form_inherit_mis_comprobantes" model="ir.ui.view">
         <field name="name">account.move.form.mis.comprobantes</field>
         <field name="model">account.move</field>
         <field name="inherit_id" ref="account.view_move_form"/>
         <field name="arch" type="xml">
-            <xpath expr="//div[@name='journal_entry_title']" position="after">
+            <field name="invoice_date" position="after">
                 <field name="mis_comprobantes_line_ids" invisible="1"/>
+                <field name="mis_comprobantes_state" invisible="1"/>
                 <div invisible="not mis_comprobantes_line_ids"
                      class="ms-2">
                     <span invisible="mis_comprobantes_state != 'match'"
@@ -18,7 +20,7 @@
                     <span invisible="mis_comprobantes_state != 'missing_in_afip'"
                           class="badge rounded-pill text-bg-info">AFIP: No encontrado</span>
                 </div>
-            </xpath>
+            </field>
         </field>
     </record>
 
