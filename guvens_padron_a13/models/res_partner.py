@@ -16,23 +16,10 @@ class ResPartner(models.Model):
         self.ensure_one()
         cuit = self.ensure_vat()
 
-        # Buscar compañía con certificado válido
+        # Por qué: get_connection() ya maneja la búsqueda de certificado internamente
+        # via _create_connection → get_key_and_certificate. No necesitamos pre-chequear.
+        # El código original de l10n_ar_padron tenía un fallback con bug en el search.
         company = self.env.user.company_id
-        env_type = company._get_environment_type()
-        try:
-            company.get_key_and_certificate(env_type)
-        except Exception:
-            certificate = self.env['afipws.certificate'].search([
-                ('alias_id.type', '=', env_type),
-                ('state', '=', 'confirmed'),
-            ], limit=1)
-            if not certificate:
-                raise UserError(_(
-                    'Not confirmed certificate found on database'))
-            company = certificate.alias_id.company_id
-
-        # Por qué: usamos ws_sr_padron_a13 en vez de ws_sr_constancia_inscripcion
-        # A13 devuelve la misma estructura que A5, parce_census_vals() funciona sin cambios
         padron = company.get_connection('ws_sr_padron_a13').connect()
 
         error_msg = _(
