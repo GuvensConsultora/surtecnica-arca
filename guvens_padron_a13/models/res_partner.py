@@ -16,24 +16,9 @@ class ResPartner(models.Model):
         self.ensure_one()
         cuit = self.ensure_vat()
 
-        # Por qué: el certificado AFIP puede estar en otra compañía distinta a la del usuario.
-        # Facturación usa inv.company_id (compañía de la factura), no la del usuario.
-        # Buscamos la compañía que tiene diario con WS AFIP configurado — es la que
-        # tiene certificado funcionando.
+        # Por qué: get_key_and_certificate() ahora tiene fallback a campos Enterprise
+        # (l10n_ar_afip_ws_key/crt) via res_company.py, así que funciona directo.
         company = self.env.user.company_id
-        env_type = company._get_environment_type()
-        try:
-            company.get_key_and_certificate(env_type)
-        except Exception:
-            # Buscar diario de ventas con afip_ws configurado (si factura electrónica funciona, existe)
-            journal = self.env['account.journal'].sudo().search([
-                ('afip_ws', '!=', False),
-            ], limit=1)
-            if not journal:
-                raise UserError(_(
-                    'No se encontró diario con WS AFIP configurado. '
-                    'Verifique la configuración de facturación electrónica.'))
-            company = journal.company_id
         padron = company.get_connection('ws_sr_padron_a13').connect()
 
         error_msg = _(
