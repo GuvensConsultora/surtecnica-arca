@@ -16,7 +16,7 @@
     'depends': ['account', 'l10n_ar'],
     'data': [
         'security/ir.model.access.csv',
-        'wizard/wizard_views.xml',
+        'views/wizard_views.xml',
         'views/mis_comprobantes_views.xml',
         'views/account_move_views.xml',
         'data/menuitem.xml',
