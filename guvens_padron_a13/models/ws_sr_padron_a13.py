@@ -37,18 +37,20 @@ class WSSrPadronA13(WSSrPadronA5):
         # Reinicializar atributos
         self.inicializar()
 
-        # SOAP envelope — elementos sin namespace-prefix dentro de getPersona
+        # SOAP envelope — getPersona con prefijo para que los hijos
+        # NO hereden el namespace (A13 espera <{}token>, no <{ns}token>)
         soap_xml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<soapenv:Envelope xmlns:soapenv='
-            '"http://schemas.xmlsoap.org/soap/envelope/">'
+            '"http://schemas.xmlsoap.org/soap/envelope/"'
+            ' xmlns:per="http://a13.soap.ws.server.puc.sr/">'
             '<soapenv:Body>'
-            '<getPersona xmlns="http://a13.soap.ws.server.puc.sr/">'
+            '<per:getPersona>'
             '<token>{token}</token>'
             '<sign>{sign}</sign>'
             '<cuitRepresentada>{cuit}</cuitRepresentada>'
             '<idPersona>{id_persona}</idPersona>'
-            '</getPersona>'
+            '</per:getPersona>'
             '</soapenv:Body>'
             '</soapenv:Envelope>'
         ).format(
