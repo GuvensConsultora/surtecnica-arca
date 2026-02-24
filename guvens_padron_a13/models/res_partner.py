@@ -38,8 +38,9 @@ class ResPartner(models.Model):
         vals = self.parce_census_vals(padron)
         # Por qué: estos campos no se escriben en el partner desde check_padron()
         # (misma lógica que el módulo original)
-        del vals['imp_iva_padron']
-        del vals['last_update_census']
-        del vals['imp_ganancias_padron']
+        # Por qué: pop en vez de del — parce_census_vals no siempre agrega todas las keys
+        vals.pop('imp_iva_padron', None)
+        vals.pop('last_update_census', None)
+        vals.pop('imp_ganancias_padron', None)
         self.write(vals)
         return vals
