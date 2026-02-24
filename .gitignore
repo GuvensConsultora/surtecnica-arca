@@ -30,4 +30,5 @@ filestore/
 *.png
 *.pdf
 *.csv
+!**/security/*.csv
 .~lock.*
