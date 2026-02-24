@@ -26,7 +26,7 @@
                        decoration-info="state == 'missing_in_afip'"/>
                 <button name="action_open_move" type="object" string="Ver factura"
                         icon="fa-external-link"
-                        attrs="{'invisible': [('move_id', '=', False)]}"/>
+                        invisible="not move_id"/>
             </tree>
         </field>
     </record>
