@@ -97,14 +97,29 @@ class WSSrPadronA13(WSSrPadronA5):
             msg = fault.text if fault is not None else 'Respuesta inesperada de AFIP A13'
             raise RuntimeError(msg)
 
-        # Extraer secciones (misma estructura que A5)
+        # Log de la estructura XML para debug
+        _logger.info('A13 personaReturn children: %s', [
+            (c.tag.split('}')[-1] if '}' in c.tag else c.tag) for c in persona_return
+        ])
+
+        # Extraer secciones — A13 puede tener estructura distinta a A5
         datos_generales = self._find(persona_return, 'datosGenerales')
         datos_mt = self._find(persona_return, 'datosMonotributo')
         datos_rg = self._find(persona_return, 'datosRegimenGeneral')
 
+        # Fallback: A13 puede usar estructura tipo A4 con wrapper "persona"
+        if datos_generales is None:
+            persona = self._find(persona_return, 'persona')
+            if persona is not None:
+                _logger.info('A13 usando estructura tipo A4 (wrapper persona)')
+                datos_generales = persona
+                datos_mt = persona
+                datos_rg = persona
+
         # Guardar data serializada (para debug/compatibilidad)
         ret_dict = self._elem_to_dict(persona_return)
-        self.data = ret_dict.get('datosGenerales', {})
+        _logger.info('A13 ret_dict keys: %s', list(ret_dict.keys()))
+        self.data = ret_dict.get('datosGenerales', ret_dict.get('persona', {}))
         self.Persona = json.dumps(ret_dict, default=json_serializer)
 
         # Errores (mismo patrón que A5)
@@ -134,8 +149,16 @@ class WSSrPadronA13(WSSrPadronA5):
                 nombre = self._text(datos_generales, 'nombre')
                 self.denominacion = "%s, %s" % (apellido, nombre)
 
-            # Domicilio fiscal
+            # Domicilio fiscal — A5 usa 'domicilioFiscal', A4 usa 'domicilio' (lista)
             domicilio = self._find(datos_generales, 'domicilioFiscal')
+            if domicilio is None:
+                # Fallback A4-style: buscar primer domicilio FISCAL en lista
+                domicilios = self._findall(datos_generales, 'domicilio')
+                if not domicilios:
+                    domicilios = self._findall(persona_return, 'domicilio')
+                domicilios.sort(
+                    key=lambda d: self._text(d, 'tipoDomicilio') != 'FISCAL')
+                domicilio = domicilios[0] if domicilios else None
             if domicilio is not None:
                 self.direccion = self._text(domicilio, 'direccion')
                 self.localidad = self._text(domicilio, 'localidad')
