@@ -129,6 +129,9 @@ class ImportMisComprobantes(models.TransientModel):
         except Exception as e:
             raise UserError(_('Error al leer el archivo: %s') % str(e))
 
+        # Por qué: CSV de AFIP puede tener \r sueltos (Mac) o \r\n (Windows)
+        # splitlines() normaliza cualquier line ending → reconstruimos con \n
+        csv_text = '\n'.join(csv_text.splitlines())
         reader = csv.reader(io.StringIO(csv_text), delimiter=';')
 
         # Por qué: primera fila es header, la saltamos
