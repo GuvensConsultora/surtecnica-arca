@@ -119,6 +119,9 @@ class ImportMisComprobantes(models.TransientModel):
         try:
             csv_data = base64.b64decode(self.csv_file)
             # Tip: intentar utf-8-sig primero (tiene BOM), fallback a latin-1
+            # Por qué: archivos de AFIP a veces contienen bytes NUL (0x00)
+            # que rompen csv.reader — los eliminamos antes de decodificar
+            csv_data = csv_data.replace(b'\x00', b'')
             try:
                 csv_text = csv_data.decode('utf-8-sig')
             except UnicodeDecodeError:
