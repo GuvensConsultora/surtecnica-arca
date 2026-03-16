@@ -161,56 +161,163 @@ class ImportMisComprobantes(models.TransientModel):
         return csv_text
 
     # -------------------------------------------------------------------------
-    # Matching contra Odoo
+    # Matching por scoring contra Odoo
     # -------------------------------------------------------------------------
 
-    def _find_matching_move(self, doc_number, partner_vat, afip_tipo, date):
-        """Busca factura en Odoo que matchee con la línea del CSV (Mis Comprobantes).
-        Usa texto del tipo de comprobante para determinar internal_type.
+    def _score_move(self, move, partner_vat, doc_number, date, amount_total):
+        """Calcula score 0-100 de correspondencia entre línea AFIP y factura Odoo.
+
+        Criterios (100 pts total):
+        - CUIT proveedor coincide:        30 pts
+        - Nro comprobante (PV-Nro):       30 pts
+        - Fecha exacta: 20 pts / ±5 días: 10 pts
+        - Importe ±$0.01: 20 pts / ±1%: 15 pts / ±5%: 10 pts
+        """
+        score = 0
+        details = []
+
+        # -- CUIT (30 pts) --
+        move_vat = self._clean_cuit(move.partner_id.vat or '')
+        if partner_vat and move_vat and partner_vat == move_vat:
+            score += 30
+            details.append('CUIT OK')
+        elif partner_vat and move_vat:
+            details.append('CUIT dif')
+
+        # -- Nro comprobante (30 pts) --
+        odoo_doc_num = move.l10n_latam_document_number or ''
+        if doc_number and odoo_doc_num and doc_number == odoo_doc_num:
+            score += 30
+            details.append('Nro OK')
+        elif doc_number and odoo_doc_num:
+            details.append('Nro dif')
+
+        # -- Fecha (20 pts exacta, 10 pts ±5 días) --
+        if date and move.invoice_date:
+            delta = abs((move.invoice_date - date).days)
+            if delta == 0:
+                score += 20
+                details.append('Fecha OK')
+            elif delta <= 5:
+                score += 10
+                details.append('Fecha ±%dd' % delta)
+            else:
+                details.append('Fecha dif %dd' % delta)
+
+        # -- Importe (20 pts exacto, 15 pts ±1%, 10 pts ±5%) --
+        odoo_total = abs(move.amount_total)
+        afip_total = abs(amount_total)
+        if afip_total > 0:
+            diff_abs = abs(odoo_total - afip_total)
+            diff_pct = (diff_abs / afip_total) * 100
+            if diff_abs <= 0.01:
+                score += 20
+                details.append('Importe OK')
+            elif diff_pct <= 1.0:
+                score += 15
+                details.append('Importe ±%.1f%%' % diff_pct)
+            elif diff_pct <= 5.0:
+                score += 10
+                details.append('Importe ±%.1f%%' % diff_pct)
+            else:
+                details.append('Importe dif %.1f%%' % diff_pct)
+        elif odoo_total == 0 and afip_total == 0:
+            score += 20
+            details.append('Importe OK ($0)')
+
+        return score, ' | '.join(details)
+
+    def _find_best_match(self, partner_vat, doc_number, date, amount_total,
+                         move_type='in_invoice', afip_code=False,
+                         afip_tipo=False):
+        """Busca la mejor factura candidata en Odoo por scoring.
+
+        Estrategia en 3 fases:
+        1. Match exacto (nro + CUIT + tipo doc) → si score >= 80, usar directo
+        2. Match amplio por CUIT + rango de fecha ±30 días → scorear candidatos
+        3. Match por importe similar + fecha cercana → último recurso
         """
         Move = self.env['account.move']
-        normalized = self._normalize_doc_type(afip_tipo)
-        move_type = AFIP_MOVE_TYPE_MAP.get(normalized, 'in_invoice')
-        internal_type = AFIP_DOC_TYPE_MAP.get(normalized, 'invoice')
+        best_move = Move
+        best_score = 0
+        best_detail = ''
 
-        domain = [
-            ('move_type', '=', move_type),
-            ('state', '=', 'posted'),
-            ('l10n_latam_document_number', '=', doc_number),
-            ('l10n_latam_document_type_id.internal_type', '=', internal_type),
-        ]
+        # -- Fase 1: match exacto por nro comprobante --
+        if doc_number:
+            domain_exact = [
+                ('move_type', '=', move_type),
+                ('state', '=', 'posted'),
+                ('l10n_latam_document_number', '=', doc_number),
+            ]
+            # Filtrar por código AFIP (Portal IVA) o internal_type (Mis Comprobantes)
+            if afip_code:
+                domain_exact.append(
+                    ('l10n_latam_document_type_id.code', '=', afip_code))
+            elif afip_tipo:
+                normalized = self._normalize_doc_type(afip_tipo)
+                internal_type = AFIP_DOC_TYPE_MAP.get(normalized, 'invoice')
+                domain_exact.append(
+                    ('l10n_latam_document_type_id.internal_type', '=',
+                     internal_type))
 
-        if partner_vat:
-            domain.append(('partner_id.vat', '=', partner_vat))
+            for move in Move.search(domain_exact, limit=5):
+                sc, det = self._score_move(
+                    move, partner_vat, doc_number, date, amount_total)
+                if sc > best_score:
+                    best_score, best_detail, best_move = sc, det, move
 
-        return Move.search(domain, limit=1)
+        # Si encontró match fuerte, retornar
+        if best_score >= 80:
+            return best_move, best_score, best_detail
 
-    def _find_matching_move_by_code(self, doc_number, partner_vat, afip_code):
-        """Busca factura en Odoo por código numérico AFIP (Portal IVA).
-        Por qué: Portal IVA usa código numérico (1, 3, 6, 11, etc.)
-        que mapea directo a l10n_latam.document.type.code
-        """
-        Move = self.env['account.move']
-        move_type = 'in_refund' if afip_code in AFIP_CODE_REFUND else 'in_invoice'
+        # -- Fase 2: match amplio por CUIT + fecha cercana --
+        if partner_vat and date:
+            from datetime import timedelta
+            domain_broad = [
+                ('move_type', '=', move_type),
+                ('state', '=', 'posted'),
+                ('partner_id.vat', '=', partner_vat),
+                ('invoice_date', '>=', date - timedelta(days=30)),
+                ('invoice_date', '<=', date + timedelta(days=30)),
+            ]
+            for move in Move.search(domain_broad, limit=10):
+                sc, det = self._score_move(
+                    move, partner_vat, doc_number, date, amount_total)
+                if sc > best_score:
+                    best_score, best_detail, best_move = sc, det, move
 
-        domain = [
-            ('move_type', '=', move_type),
-            ('state', '=', 'posted'),
-            ('l10n_latam_document_number', '=', doc_number),
-            ('l10n_latam_document_type_id.code', '=', afip_code),
-        ]
+        if best_score >= 60:
+            return best_move, best_score, best_detail
 
-        if partner_vat:
-            domain.append(('partner_id.vat', '=', partner_vat))
+        # -- Fase 3: match por importe + fecha (sin CUIT) --
+        if date and amount_total:
+            from datetime import timedelta
+            afip_abs = abs(amount_total)
+            tolerance = max(afip_abs * 0.05, 1.0)
+            domain_amount = [
+                ('move_type', '=', move_type),
+                ('state', '=', 'posted'),
+                ('invoice_date', '>=', date - timedelta(days=15)),
+                ('invoice_date', '<=', date + timedelta(days=15)),
+            ]
+            for move in Move.search(domain_amount, limit=20):
+                if abs(abs(move.amount_total) - afip_abs) > tolerance:
+                    continue
+                sc, det = self._score_move(
+                    move, partner_vat, doc_number, date, amount_total)
+                if sc > best_score:
+                    best_score, best_detail, best_move = sc, det, move
 
-        return Move.search(domain, limit=1)
+        return best_move, best_score, best_detail
 
-    def _compare_amounts(self, move, amount_total):
-        """Compara importes con tolerancia de 1 centavo. Retorna state."""
+    def _score_to_state(self, score, move):
+        """Convierte score a estado del cruce."""
         if not move:
             return 'missing_in_odoo'
-        diff = abs(move.amount_total) - abs(amount_total)
-        return 'match' if abs(diff) <= 0.01 else 'mismatch'
+        if score >= 80:
+            return 'match'
+        # Por qué: score entre 40-79 = encontró algo pero con diferencias
+        return 'mismatch'
 
     # -------------------------------------------------------------------------
     # Parser Mis Comprobantes (formato original)
@@ -245,10 +352,14 @@ class ImportMisComprobantes(models.TransientModel):
                 self.period = date.strftime('%m/%Y')
                 period_detected = True
 
-            move = self._find_matching_move(
-                document_number, partner_vat, doc_type, date
+            # Matching por scoring
+            normalized = self._normalize_doc_type(doc_type)
+            move_type = AFIP_MOVE_TYPE_MAP.get(normalized, 'in_invoice')
+            move, score, detail = self._find_best_match(
+                partner_vat, document_number, date, amount_total,
+                move_type=move_type, afip_tipo=doc_type,
             )
-            state = self._compare_amounts(move, amount_total)
+            state = self._score_to_state(score, move)
 
             lines_data.append({
                 'import_date': fields.Date.context_today(self),
@@ -268,6 +379,8 @@ class ImportMisComprobantes(models.TransientModel):
                 'amount_untaxed': amount_untaxed,
                 'amount_iva': amount_iva,
                 'state': state,
+                'match_score': score,
+                'match_detail': detail,
                 'move_id': move.id if move else False,
             })
 
@@ -392,10 +505,14 @@ class ImportMisComprobantes(models.TransientModel):
                 self.period = date.strftime('%m/%Y')
                 period_detected = True
 
-            # Matching por código AFIP (más preciso que texto libre)
-            move = self._find_matching_move_by_code(
-                document_number, partner_vat, afip_code)
-            state = self._compare_amounts(move, amount_total)
+            # Matching por scoring con código AFIP
+            move_type = ('in_refund' if afip_code in AFIP_CODE_REFUND
+                         else 'in_invoice')
+            move, score, detail = self._find_best_match(
+                partner_vat, document_number, date, amount_total,
+                move_type=move_type, afip_code=afip_code,
+            )
+            state = self._score_to_state(score, move)
 
             lines_data.append({
                 'import_date': fields.Date.context_today(self),
@@ -438,6 +555,8 @@ class ImportMisComprobantes(models.TransientModel):
                 'iva_27': iva_27,
                 'amount_no_gravado': amount_untaxed,
                 'state': state,
+                'match_score': score,
+                'match_detail': detail,
                 'move_id': move.id if move else False,
             })
 

@@ -26,7 +26,12 @@
                 <field name="credito_fiscal" string="Créd. Fiscal" sum="Total CF" optional="hide"/>
                 <field name="amount_perc_iibb" string="Perc. IIBB" sum="Total IIBB" optional="hide"/>
                 <field name="move_id" string="Factura Odoo"/>
+                <field name="match_score" string="Confianza %"
+                       decoration-success="match_score &gt;= 80"
+                       decoration-warning="match_score &gt;= 40 and match_score &lt; 80"
+                       decoration-danger="match_score &gt; 0 and match_score &lt; 40"/>
                 <field name="diff_amount" string="Diferencia" sum="Total Dif."/>
+                <field name="match_detail" string="Detalle" optional="hide"/>
                 <field name="state" widget="badge"
                        decoration-success="state == 'match'"
                        decoration-warning="state == 'mismatch'"
@@ -152,9 +157,13 @@
                         <!-- Tab 5: Cruce con Odoo -->
                         <page string="Cruce Odoo" name="page_cruce">
                             <group>
-                                <group>
+                                <group string="Factura vinculada">
                                     <field name="move_id"/>
                                     <field name="diff_amount"/>
+                                </group>
+                                <group string="Scoring">
+                                    <field name="match_score" widget="progressbar"/>
+                                    <field name="match_detail"/>
                                 </group>
                             </group>
                         </page>

@@ -86,6 +86,17 @@ class MisComprobantesLine(models.Model):
         ondelete='set null',
     )
 
+    # Por qué: score 0-100 indica la confianza del cruce por aproximación
+    # 100 = match exacto (CUIT + nro + fecha + importe)
+    # <100 = match parcial, el usuario decide si corresponde
+    match_score = fields.Integer(
+        string='Confianza %',
+        help='0-100: indica qué tan probable es que el registro AFIP '
+             'corresponda a la factura Odoo vinculada',
+    )
+    # Por qué: detalle legible de qué criterios matchearon y cuáles no
+    match_detail = fields.Char(string='Detalle cruce')
+
     # Por qué: computed para mostrar la diferencia sin almacenarla
     # Patrón: campo computed no stored — se calcula on-the-fly
     diff_amount = fields.Float(
