@@ -97,20 +97,55 @@ class MisComprobantesLine(models.Model):
     # Por qué: detalle legible de qué criterios matchearon y cuáles no
     match_detail = fields.Char(string='Detalle cruce')
 
-    # Por qué: computed para mostrar la diferencia sin almacenarla
-    # Patrón: campo computed no stored — se calcula on-the-fly
+    # -- Campos computed para la vista comparativa --
+
+    # Por qué: unificar PV-Nro en un solo string legible para la lista
+    display_comprobante = fields.Char(
+        string='Comprobante',
+        compute='_compute_display_fields',
+    )
+    # Por qué: mostrar el total de Odoo al lado del total AFIP para comparar
+    odoo_amount_total = fields.Float(
+        string='Total Odoo',
+        compute='_compute_display_fields',
+        digits=(16, 2),
+    )
+    # Por qué: mostrar fecha Odoo al lado de fecha AFIP
+    odoo_date = fields.Date(
+        string='Fecha Odoo',
+        compute='_compute_display_fields',
+    )
+    # Por qué: mostrar nombre del proveedor en Odoo para comparar con AFIP
+    odoo_partner_name = fields.Char(
+        string='Proveedor Odoo',
+        compute='_compute_display_fields',
+    )
     diff_amount = fields.Float(
-        string='Diferencia',
-        compute='_compute_diff_amount',
+        string='Diferencia $',
+        compute='_compute_display_fields',
         digits=(16, 2),
     )
 
-    @api.depends('amount_total', 'move_id.amount_total', 'state')
-    def _compute_diff_amount(self):
+    @api.depends('pos_number', 'doc_number', 'doc_type',
+                 'amount_total', 'move_id', 'move_id.amount_total',
+                 'move_id.invoice_date', 'move_id.partner_id')
+    def _compute_display_fields(self):
         for rec in self:
+            # Comprobante: "FA-A 00001-00000123" o "1 00400-29594"
+            pos = (rec.pos_number or '').zfill(5)
+            num = (rec.doc_number or '').zfill(8)
+            label = rec.doc_type or rec.afip_code or ''
+            rec.display_comprobante = '%s %s-%s' % (label, pos, num)
+
             if rec.move_id:
+                rec.odoo_amount_total = abs(rec.move_id.amount_total)
+                rec.odoo_date = rec.move_id.invoice_date
+                rec.odoo_partner_name = rec.move_id.partner_id.name or ''
                 rec.diff_amount = abs(rec.move_id.amount_total) - rec.amount_total
             else:
+                rec.odoo_amount_total = 0.0
+                rec.odoo_date = False
+                rec.odoo_partner_name = ''
                 rec.diff_amount = 0.0
 
     def action_open_move(self):
