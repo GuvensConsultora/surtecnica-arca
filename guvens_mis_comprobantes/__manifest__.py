@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 {
     'name': 'Cruce Mis Comprobantes AFIP',
-    'version': '17.0.1.0.0',
+    'version': '17.0.2.0.0',
     'category': 'Accounting',
-    'summary': 'Importa CSV de Mis Comprobantes AFIP y cruza contra facturas de proveedores',
+    'summary': 'Importa CSV de Mis Comprobantes y Portal IVA (AFIP) y cruza contra facturas',
     'description': """
-        Permite importar el CSV descargado del portal "Mis Comprobantes" de AFIP
-        y cruzarlo automáticamente contra las facturas de proveedores cargadas en Odoo.
-        Detecta: coincidencias, diferencias de importe, faltantes en Odoo y faltantes en AFIP.
+        Importa CSV de "Mis Comprobantes" o "Portal IVA — Compras" de AFIP y cruza
+        automáticamente contra facturas de proveedores en Odoo.
+        Auto-detecta el formato del CSV. Portal IVA incluye desglose IVA por alícuota,
+        percepciones (IIBB, IVA, municipales, internos), multi-moneda y crédito fiscal.
     """,
     'author': 'Guvens Consultora',
     'website': '',

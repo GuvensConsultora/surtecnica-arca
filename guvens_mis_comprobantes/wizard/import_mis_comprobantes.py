@@ -9,8 +9,8 @@ from odoo import models, fields, _
 from odoo.exceptions import UserError
 
 
-# Por qué: mapeo entre el texto del CSV de AFIP y el internal_type de l10n_latam.document.type
-# AFIP usa texto libre ("Factura", "Nota de Crédito", etc.), Odoo usa internal_type
+# Por qué: mapeo entre el texto del CSV de "Mis Comprobantes" y el internal_type
+# de l10n_latam.document.type. AFIP usa texto libre, Odoo usa internal_type
 AFIP_DOC_TYPE_MAP = {
     'factura': 'invoice',
     'nota de débito': 'debit_note',
@@ -18,7 +18,7 @@ AFIP_DOC_TYPE_MAP = {
     'recibo': 'invoice',
 }
 
-# Por qué: AFIP usa texto, necesitamos el move_type de Odoo para filtrar
+# Por qué: AFIP texto → move_type de Odoo para filtrar en search
 AFIP_MOVE_TYPE_MAP = {
     'factura': 'in_invoice',
     'nota de débito': 'in_invoice',  # ND es invoice con doc_type debit_note
@@ -26,10 +26,14 @@ AFIP_MOVE_TYPE_MAP = {
     'recibo': 'in_invoice',
 }
 
+# Por qué: código numérico AFIP → move_type de Odoo
+# NC (códigos 3, 8, 13, 203, 208, 213) son refunds, el resto invoices
+AFIP_CODE_REFUND = {'3', '8', '13', '203', '208', '213'}
+
 
 class ImportMisComprobantes(models.TransientModel):
     _name = 'guvens.import.mis.comprobantes'
-    _description = 'Importar CSV de Mis Comprobantes AFIP'
+    _description = 'Importar CSV de Mis Comprobantes / Portal IVA AFIP'
 
     csv_file = fields.Binary(string='Archivo CSV', required=True)
     csv_filename = fields.Char(string='Nombre archivo')
@@ -37,15 +41,37 @@ class ImportMisComprobantes(models.TransientModel):
         string='Período (MM/YYYY)',
         help='Se auto-detecta de la primera línea del CSV',
     )
+    detected_format = fields.Char(
+        string='Formato detectado',
+        readonly=True,
+    )
+
+    # -------------------------------------------------------------------------
+    # Utilidades de parseo comunes
+    # -------------------------------------------------------------------------
 
     def _parse_afip_amount(self, value):
         """Convierte importe formato AFIP (punto=miles, coma=decimal) a float.
-        Ejemplo: '10.000,00' → 10000.00
+        Ejemplo: '10.000,00' → 10000.00 | '52900,00' → 52900.00
         """
         if not value or not value.strip():
             return 0.0
         # Por qué: AFIP usa punto como separador de miles y coma como decimal
         clean = value.strip().replace('.', '').replace(',', '.')
+        try:
+            return float(clean)
+        except (ValueError, TypeError):
+            return 0.0
+
+    def _parse_portal_iva_amount(self, value):
+        """Convierte importe Portal IVA (solo coma=decimal, sin sep miles).
+        Ejemplo: '52900,00' → 52900.00 | '-210439,68' → -210439.68
+        """
+        if not value or not value.strip():
+            return 0.0
+        # Por qué: Portal IVA no usa punto como separador de miles,
+        # solo coma como decimal → reemplazar coma por punto directo
+        clean = value.strip().replace(',', '.')
         try:
             return float(clean)
         except (ValueError, TypeError):
@@ -57,6 +83,15 @@ class ImportMisComprobantes(models.TransientModel):
             return False
         try:
             return datetime.strptime(value.strip(), '%d/%m/%Y').date()
+        except ValueError:
+            return False
+
+    def _parse_portal_iva_date(self, value):
+        """Convierte fecha Portal IVA yyyy-mm-dd a date object."""
+        if not value or not value.strip():
+            return False
+        try:
+            return datetime.strptime(value.strip(), '%Y-%m-%d').date()
         except ValueError:
             return False
 
@@ -78,49 +113,41 @@ class ImportMisComprobantes(models.TransientModel):
         """Extrae solo dígitos del CUIT."""
         return re.sub(r'[^0-9]', '', cuit or '')
 
-    def _find_matching_move(self, doc_number, partner_vat, afip_tipo, date):
-        """Busca factura en Odoo que matchee con la línea del CSV.
+    # -------------------------------------------------------------------------
+    # Auto-detección de formato
+    # -------------------------------------------------------------------------
 
-        Criterios de match:
-        1. document_number exacto (PV-Nro)
-        2. CUIT del proveedor
-        3. Tipo de comprobante (internal_type del document_type)
-        4. Solo facturas de proveedor posteadas
+    def _detect_csv_format(self, header_row):
+        """Detecta formato del CSV por la primera columna del header.
+        Por qué: Portal IVA empieza con 'Fecha de Emisión',
+        Mis Comprobantes empieza con 'Fecha'.
         """
-        Move = self.env['account.move']
-        normalized = self._normalize_doc_type(afip_tipo)
-        move_type = AFIP_MOVE_TYPE_MAP.get(normalized, 'in_invoice')
-        internal_type = AFIP_DOC_TYPE_MAP.get(normalized, 'invoice')
+        first_col = header_row[0].strip().strip('"').lower()
+        if 'fecha de emisi' in first_col:
+            return 'portal_iva'
+        elif 'fecha' == first_col:
+            return 'mis_comprobantes'
+        return 'mis_comprobantes'
 
-        # Por qué: buscamos por document_number que es PV-Nro normalizado
-        domain = [
-            ('move_type', '=', move_type),
-            ('state', '=', 'posted'),
-            ('l10n_latam_document_number', '=', doc_number),
-            ('l10n_latam_document_type_id.internal_type', '=', internal_type),
-        ]
+    def _detect_period_from_filename(self, filename):
+        """Intenta extraer período del nombre del archivo.
+        Ejemplo: 'comprobantes_periodo_202602_compras_...' → '02/2026'
+        """
+        if not filename:
+            return False
+        match = re.search(r'(\d{4})(\d{2})', filename)
+        if match:
+            return '%s/%s' % (match.group(2), match.group(1))
+        return False
 
-        # Por qué: filtramos por CUIT si está disponible, pero con ilike
-        # porque en Odoo puede estar con o sin guiones
-        if partner_vat:
-            domain.append(('partner_id.vat', '=', partner_vat))
+    # -------------------------------------------------------------------------
+    # Decodificación CSV
+    # -------------------------------------------------------------------------
 
-        moves = Move.search(domain, limit=1)
-        return moves
-
-    def action_import(self):
-        """Importa CSV de Mis Comprobantes y cruza contra facturas de proveedor."""
-        self.ensure_one()
-        if not self.csv_file:
-            raise UserError(_('Debe seleccionar un archivo CSV.'))
-
-        # -- Decodificar CSV --
-        # Por qué: AFIP exporta en latin-1 (ISO-8859-1), no UTF-8
+    def _decode_csv(self):
+        """Decodifica el archivo CSV subido. Retorna el texto limpio."""
         try:
             csv_data = base64.b64decode(self.csv_file)
-            # Tip: intentar utf-8-sig primero (tiene BOM), fallback a latin-1
-            # Por qué: archivos de AFIP a veces contienen bytes NUL (0x00)
-            # que rompen csv.reader — los eliminamos antes de decodificar
             csv_data = csv_data.replace(b'\x00', b'')
             try:
                 csv_text = csv_data.decode('utf-8-sig')
@@ -129,18 +156,68 @@ class ImportMisComprobantes(models.TransientModel):
         except Exception as e:
             raise UserError(_('Error al leer el archivo: %s') % str(e))
 
-        # Por qué: CSV de AFIP puede tener \r sueltos (Mac) o \r\n (Windows)
-        # splitlines() normaliza cualquier line ending → reconstruimos con \n
+        # Por qué: CSV de AFIP puede tener \r sueltos o \r\n
         csv_text = '\n'.join(csv_text.splitlines())
-        reader = csv.reader(io.StringIO(csv_text), delimiter=';')
+        return csv_text
 
-        # Por qué: primera fila es header, la saltamos
-        try:
-            header = next(reader)
-        except StopIteration:
-            raise UserError(_('El archivo CSV está vacío.'))
+    # -------------------------------------------------------------------------
+    # Matching contra Odoo
+    # -------------------------------------------------------------------------
 
-        Line = self.env['guvens.mis.comprobantes.line']
+    def _find_matching_move(self, doc_number, partner_vat, afip_tipo, date):
+        """Busca factura en Odoo que matchee con la línea del CSV (Mis Comprobantes).
+        Usa texto del tipo de comprobante para determinar internal_type.
+        """
+        Move = self.env['account.move']
+        normalized = self._normalize_doc_type(afip_tipo)
+        move_type = AFIP_MOVE_TYPE_MAP.get(normalized, 'in_invoice')
+        internal_type = AFIP_DOC_TYPE_MAP.get(normalized, 'invoice')
+
+        domain = [
+            ('move_type', '=', move_type),
+            ('state', '=', 'posted'),
+            ('l10n_latam_document_number', '=', doc_number),
+            ('l10n_latam_document_type_id.internal_type', '=', internal_type),
+        ]
+
+        if partner_vat:
+            domain.append(('partner_id.vat', '=', partner_vat))
+
+        return Move.search(domain, limit=1)
+
+    def _find_matching_move_by_code(self, doc_number, partner_vat, afip_code):
+        """Busca factura en Odoo por código numérico AFIP (Portal IVA).
+        Por qué: Portal IVA usa código numérico (1, 3, 6, 11, etc.)
+        que mapea directo a l10n_latam.document.type.code
+        """
+        Move = self.env['account.move']
+        move_type = 'in_refund' if afip_code in AFIP_CODE_REFUND else 'in_invoice'
+
+        domain = [
+            ('move_type', '=', move_type),
+            ('state', '=', 'posted'),
+            ('l10n_latam_document_number', '=', doc_number),
+            ('l10n_latam_document_type_id.code', '=', afip_code),
+        ]
+
+        if partner_vat:
+            domain.append(('partner_id.vat', '=', partner_vat))
+
+        return Move.search(domain, limit=1)
+
+    def _compare_amounts(self, move, amount_total):
+        """Compara importes con tolerancia de 1 centavo. Retorna state."""
+        if not move:
+            return 'missing_in_odoo'
+        diff = abs(move.amount_total) - abs(amount_total)
+        return 'match' if abs(diff) <= 0.01 else 'mismatch'
+
+    # -------------------------------------------------------------------------
+    # Parser Mis Comprobantes (formato original)
+    # -------------------------------------------------------------------------
+
+    def _parse_mis_comprobantes(self, reader):
+        """Parsea CSV de Mis Comprobantes (formato original, 16+ columnas)."""
         lines_data = []
         period_detected = False
 
@@ -148,13 +225,11 @@ class ImportMisComprobantes(models.TransientModel):
             if not row or len(row) < 15:
                 continue
 
-            # -- Parsear campos del CSV --
             date = self._parse_afip_date(row[0])
             doc_type = row[1].strip() if row[1] else ''
             pos_number = row[2].strip() if row[2] else ''
             doc_number_from = row[3].strip() if row[3] else ''
             cae = row[5].strip() if len(row) > 5 and row[5] else ''
-            # Columna 7: tipo doc emisor (no usado)
             partner_vat_raw = row[7].strip() if len(row) > 7 and row[7] else ''
             partner_name = row[8].strip() if len(row) > 8 and row[8] else ''
             amount_net = self._parse_afip_amount(row[11] if len(row) > 11 else '')
@@ -166,30 +241,20 @@ class ImportMisComprobantes(models.TransientModel):
             partner_vat = self._clean_cuit(partner_vat_raw)
             document_number = self._build_document_number(pos_number, doc_number_from)
 
-            # Por qué: auto-detectar período de la primera línea con fecha válida
             if date and not period_detected:
                 self.period = date.strftime('%m/%Y')
                 period_detected = True
 
-            # -- Buscar match en Odoo --
             move = self._find_matching_move(
                 document_number, partner_vat, doc_type, date
             )
-
-            if move:
-                # Comparar importes con tolerancia de 1 centavo
-                diff = abs(move.amount_total) - amount_total
-                if abs(diff) <= 0.01:
-                    state = 'match'
-                else:
-                    state = 'mismatch'
-            else:
-                state = 'missing_in_odoo'
+            state = self._compare_amounts(move, amount_total)
 
             lines_data.append({
                 'import_date': fields.Date.context_today(self),
                 'period': self.period or '',
                 'company_id': self.env.company.id,
+                'source': 'mis_comprobantes',
                 'date': date,
                 'doc_type': doc_type,
                 'pos_number': pos_number,
@@ -206,55 +271,282 @@ class ImportMisComprobantes(models.TransientModel):
                 'move_id': move.id if move else False,
             })
 
+        return lines_data
+
+    # -------------------------------------------------------------------------
+    # Parser Portal IVA (formato nuevo, 32 columnas)
+    # -------------------------------------------------------------------------
+
+    def _parse_portal_iva(self, reader):
+        """Parsea CSV de Portal IVA — Compras DDJJ (32 columnas).
+        Columnas:
+         0: Fecha Emisión (yyyy-mm-dd)
+         1: Tipo Comprobante (código numérico AFIP)
+         2: Punto de Venta
+         3: Número Comprobante
+         4: Tipo Doc. Vendedor (80=CUIT)
+         5: Nro. Doc. Vendedor
+         6: Denominación Vendedor
+         7: Importe Total
+         8: Moneda Original (PES, DOL)
+         9: Tipo de Cambio
+        10: Importe No Gravado
+        11: Importe Exento
+        12: Crédito Fiscal Computable
+        13: Perc/Pagos Otros Imp. Nac.
+        14: Perc. IIBB
+        15: Imp. Municipales
+        16: Perc/Pagos IVA
+        17: Imp. Internos
+        18: Otros Tributos
+        19: Neto 0%
+        20: Neto 2.5%    21: IVA 2.5%
+        22: Neto 5%      23: IVA 5%
+        24: Neto 10.5%   25: IVA 10.5%
+        26: Neto 21%     27: IVA 21%
+        28: Neto 27%     29: IVA 27%
+        30: Total Neto Gravado
+        31: Total IVA
+        """
+        lines_data = []
+        period_detected = False
+        # Por qué: buscamos l10n_latam.document.type por code para obtener el nombre
+        DocType = self.env['l10n_latam.document.type']
+
+        for row in reader:
+            if not row or len(row) < 20:
+                continue
+
+            date = self._parse_portal_iva_date(row[0])
+            afip_code = row[1].strip() if row[1] else ''
+            pos_number = row[2].strip() if row[2] else ''
+            doc_number_from = row[3].strip() if row[3] else ''
+            partner_vat_raw = row[5].strip() if len(row) > 5 and row[5] else ''
+            partner_name = (row[6].strip().strip('"')
+                           if len(row) > 6 and row[6] else '')
+            amount_total = self._parse_portal_iva_amount(
+                row[7] if len(row) > 7 else '')
+            currency_code = (row[8].strip().strip('"')
+                             if len(row) > 8 and row[8] else '')
+            exchange_rate = self._parse_portal_iva_amount(
+                row[9] if len(row) > 9 else '')
+            amount_untaxed = self._parse_portal_iva_amount(
+                row[10] if len(row) > 10 else '')
+            amount_exempt = self._parse_portal_iva_amount(
+                row[11] if len(row) > 11 else '')
+            credito_fiscal = self._parse_portal_iva_amount(
+                row[12] if len(row) > 12 else '')
+
+            # Percepciones
+            perc_otros_nac = self._parse_portal_iva_amount(
+                row[13] if len(row) > 13 else '')
+            perc_iibb = self._parse_portal_iva_amount(
+                row[14] if len(row) > 14 else '')
+            perc_municipal = self._parse_portal_iva_amount(
+                row[15] if len(row) > 15 else '')
+            perc_iva = self._parse_portal_iva_amount(
+                row[16] if len(row) > 16 else '')
+            perc_internos = self._parse_portal_iva_amount(
+                row[17] if len(row) > 17 else '')
+            otros_tributos = self._parse_portal_iva_amount(
+                row[18] if len(row) > 18 else '')
+
+            # Desglose IVA por alícuota
+            neto_iva_0 = self._parse_portal_iva_amount(
+                row[19] if len(row) > 19 else '')
+            neto_iva_25 = self._parse_portal_iva_amount(
+                row[20] if len(row) > 20 else '')
+            iva_25 = self._parse_portal_iva_amount(
+                row[21] if len(row) > 21 else '')
+            neto_iva_5 = self._parse_portal_iva_amount(
+                row[22] if len(row) > 22 else '')
+            iva_5 = self._parse_portal_iva_amount(
+                row[23] if len(row) > 23 else '')
+            neto_iva_105 = self._parse_portal_iva_amount(
+                row[24] if len(row) > 24 else '')
+            iva_105 = self._parse_portal_iva_amount(
+                row[25] if len(row) > 25 else '')
+            neto_iva_21 = self._parse_portal_iva_amount(
+                row[26] if len(row) > 26 else '')
+            iva_21 = self._parse_portal_iva_amount(
+                row[27] if len(row) > 27 else '')
+            neto_iva_27 = self._parse_portal_iva_amount(
+                row[28] if len(row) > 28 else '')
+            iva_27 = self._parse_portal_iva_amount(
+                row[29] if len(row) > 29 else '')
+            amount_net = self._parse_portal_iva_amount(
+                row[30] if len(row) > 30 else '')
+            amount_iva = self._parse_portal_iva_amount(
+                row[31] if len(row) > 31 else '')
+
+            partner_vat = self._clean_cuit(partner_vat_raw)
+            document_number = self._build_document_number(
+                pos_number, doc_number_from)
+
+            # Por qué: buscar nombre del tipo de comprobante por código AFIP
+            doc_type_rec = DocType.search(
+                [('code', '=', afip_code)], limit=1)
+            doc_type_name = doc_type_rec.name if doc_type_rec else afip_code
+
+            if date and not period_detected:
+                self.period = date.strftime('%m/%Y')
+                period_detected = True
+
+            # Matching por código AFIP (más preciso que texto libre)
+            move = self._find_matching_move_by_code(
+                document_number, partner_vat, afip_code)
+            state = self._compare_amounts(move, amount_total)
+
+            lines_data.append({
+                'import_date': fields.Date.context_today(self),
+                'period': self.period or '',
+                'company_id': self.env.company.id,
+                'source': 'portal_iva',
+                'date': date,
+                'doc_type': doc_type_name,
+                'afip_code': afip_code,
+                'pos_number': pos_number,
+                'doc_number': doc_number_from,
+                'partner_vat': partner_vat,
+                'partner_name': partner_name,
+                'amount_total': amount_total,
+                'amount_net': amount_net,
+                'amount_exempt': amount_exempt,
+                'amount_untaxed': amount_untaxed,
+                'amount_iva': amount_iva,
+                'currency_code': currency_code,
+                'exchange_rate': exchange_rate,
+                'credito_fiscal': credito_fiscal,
+                # Percepciones
+                'amount_perc_otros_nac': perc_otros_nac,
+                'amount_perc_iibb': perc_iibb,
+                'amount_perc_municipal': perc_municipal,
+                'amount_perc_iva': perc_iva,
+                'amount_perc_internos': perc_internos,
+                'amount_otros_tributos': otros_tributos,
+                # Desglose IVA
+                'neto_iva_0': neto_iva_0,
+                'neto_iva_25': neto_iva_25,
+                'iva_25': iva_25,
+                'neto_iva_5': neto_iva_5,
+                'iva_5': iva_5,
+                'neto_iva_105': neto_iva_105,
+                'iva_105': iva_105,
+                'neto_iva_21': neto_iva_21,
+                'iva_21': iva_21,
+                'neto_iva_27': neto_iva_27,
+                'iva_27': iva_27,
+                'amount_no_gravado': amount_untaxed,
+                'state': state,
+                'move_id': move.id if move else False,
+            })
+
+        return lines_data
+
+    # -------------------------------------------------------------------------
+    # Acción principal
+    # -------------------------------------------------------------------------
+
+    def action_import(self):
+        """Importa CSV de Mis Comprobantes o Portal IVA y cruza contra facturas."""
+        self.ensure_one()
+        if not self.csv_file:
+            raise UserError(_('Debe seleccionar un archivo CSV.'))
+
+        csv_text = self._decode_csv()
+        reader = csv.reader(io.StringIO(csv_text), delimiter=';')
+
+        try:
+            header = next(reader)
+        except StopIteration:
+            raise UserError(_('El archivo CSV está vacío.'))
+
+        # Auto-detectar formato por header
+        csv_format = self._detect_csv_format(header)
+        self.detected_format = (
+            'Portal IVA — Compras' if csv_format == 'portal_iva'
+            else 'Mis Comprobantes'
+        )
+
+        # Por qué: intentar extraer período del nombre del archivo
+        # antes de parsear (fallback: primera fecha del CSV)
+        period_from_filename = self._detect_period_from_filename(
+            self.csv_filename)
+        if period_from_filename:
+            self.period = period_from_filename
+
+        # Parsear según formato detectado
+        if csv_format == 'portal_iva':
+            lines_data = self._parse_portal_iva(reader)
+        else:
+            lines_data = self._parse_mis_comprobantes(reader)
+
         if not lines_data:
             raise UserError(_('No se encontraron líneas válidas en el CSV.'))
+
+        Line = self.env['guvens.mis.comprobantes.line']
 
         # -- Crear líneas importadas --
         created_lines = Line.create(lines_data)
 
-        # -- Detectar facturas en Odoo que no están en el CSV (missing_in_afip) --
+        # -- Detectar facturas en Odoo que no están en el CSV --
         if self.period:
-            self._detect_missing_in_afip(created_lines)
+            self._detect_missing_in_afip(created_lines, csv_format)
 
-        # -- Recargar líneas del período para incluir missing_in_afip --
+        # -- Recargar líneas del período --
         all_lines = Line.search([
             ('period', '=', self.period),
             ('import_date', '=', fields.Date.context_today(self)),
         ])
 
-        # Por qué: devolver action para abrir la vista tree con los resultados
+        # Resumen para notification
+        counts = {s: 0 for s in ['match', 'mismatch', 'missing_in_odoo', 'missing_in_afip']}
+        for line in all_lines:
+            if line.state in counts:
+                counts[line.state] += 1
+
         return {
             'type': 'ir.actions.act_window',
-            'name': _('Cruce Mis Comprobantes — %s') % (self.period or ''),
+            'name': _('Cruce %s — %s') % (self.detected_format, self.period or ''),
             'res_model': 'guvens.mis.comprobantes.line',
             'view_mode': 'tree,form',
             'domain': [('id', 'in', all_lines.ids)],
             'target': 'current',
-            'context': {'search_default_group_state': 1},
+            'context': {
+                'search_default_group_state': 1,
+                # Por qué: notification con resumen del cruce
+                'default_notification': _(
+                    'Importadas: %d | Coinciden: %d | Difieren: %d | '
+                    'Faltan en Odoo: %d | Faltan en AFIP: %d'
+                ) % (
+                    len(created_lines),
+                    counts['match'],
+                    counts['mismatch'],
+                    counts['missing_in_odoo'],
+                    counts['missing_in_afip'],
+                ),
+            },
         }
 
-    def _detect_missing_in_afip(self, imported_lines):
-        """Busca facturas de proveedor en Odoo del período que no están en el CSV.
-
-        Por qué: si una factura está cargada en Odoo pero no aparece en AFIP,
-        puede ser un comprobante apócrifo o un error de carga.
-        """
+    def _detect_missing_in_afip(self, imported_lines, csv_format='mis_comprobantes'):
+        """Busca facturas de proveedor en Odoo del período que no están en el CSV."""
         if not self.period:
             return
 
-        # Parsear período MM/YYYY → rango de fechas
         try:
             month, year = self.period.split('/')
-            date_from = datetime.strptime('01/%s/%s' % (month, year), '%d/%m/%Y').date()
-            # Último día del mes
+            date_from = datetime.strptime(
+                '01/%s/%s' % (month, year), '%d/%m/%Y').date()
             if int(month) == 12:
-                date_to = datetime.strptime('01/01/%s' % (int(year) + 1), '%d/%m/%Y').date()
+                date_to = datetime.strptime(
+                    '01/01/%s' % (int(year) + 1), '%d/%m/%Y').date()
             else:
-                date_to = datetime.strptime('01/%s/%s' % (str(int(month) + 1).zfill(2), year), '%d/%m/%Y').date()
+                date_to = datetime.strptime(
+                    '01/%s/%s' % (str(int(month) + 1).zfill(2), year),
+                    '%d/%m/%Y').date()
         except (ValueError, AttributeError):
             return
 
-        # Buscar todas las facturas de proveedor del período
         moves = self.env['account.move'].search([
             ('move_type', 'in', ['in_invoice', 'in_refund']),
             ('state', '=', 'posted'),
@@ -263,8 +555,8 @@ class ImportMisComprobantes(models.TransientModel):
             ('company_id', '=', self.env.company.id),
         ])
 
-        # Por qué: set de move_ids ya matcheados para no duplicar
-        matched_move_ids = set(imported_lines.filtered('move_id').mapped('move_id.id'))
+        matched_move_ids = set(
+            imported_lines.filtered('move_id').mapped('move_id.id'))
 
         Line = self.env['guvens.mis.comprobantes.line']
         missing_data = []
@@ -272,7 +564,6 @@ class ImportMisComprobantes(models.TransientModel):
             if move.id in matched_move_ids:
                 continue
 
-            # Extraer PV y número del document_number de Odoo
             doc_num = move.l10n_latam_document_number or ''
             parts = doc_num.split('-')
             pos = parts[0] if parts else ''
@@ -282,8 +573,11 @@ class ImportMisComprobantes(models.TransientModel):
                 'import_date': fields.Date.context_today(self),
                 'period': self.period,
                 'company_id': self.env.company.id,
+                'source': csv_format,
                 'date': move.invoice_date,
                 'doc_type': move.l10n_latam_document_type_id.name or '',
+                'afip_code': (move.l10n_latam_document_type_id.code or ''
+                              if csv_format == 'portal_iva' else ''),
                 'pos_number': pos,
                 'doc_number': number,
                 'cae': '',

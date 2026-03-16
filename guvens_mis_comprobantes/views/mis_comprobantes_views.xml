@@ -10,13 +10,21 @@
                   decoration-warning="state == 'mismatch'"
                   decoration-danger="state == 'missing_in_odoo'"
                   decoration-info="state == 'missing_in_afip'">
+                <field name="source" widget="badge"
+                       decoration-info="source == 'portal_iva'"
+                       decoration-muted="source == 'mis_comprobantes'"
+                       optional="show"/>
                 <field name="date"/>
                 <field name="partner_name"/>
                 <field name="partner_vat"/>
                 <field name="doc_type"/>
+                <field name="afip_code" optional="hide"/>
                 <field name="pos_number"/>
                 <field name="doc_number"/>
                 <field name="amount_total" string="Total AFIP" sum="Total AFIP"/>
+                <field name="currency_code" optional="hide"/>
+                <field name="credito_fiscal" string="Créd. Fiscal" sum="Total CF" optional="hide"/>
+                <field name="amount_perc_iibb" string="Perc. IIBB" sum="Total IIBB" optional="hide"/>
                 <field name="move_id" string="Factura Odoo"/>
                 <field name="diff_amount" string="Diferencia" sum="Total Dif."/>
                 <field name="state" widget="badge"
@@ -31,7 +39,7 @@
         </field>
     </record>
 
-    <!-- Form view -->
+    <!-- Form view con tabs -->
     <record id="view_mis_comprobantes_line_form" model="ir.ui.view">
         <field name="name">guvens.mis.comprobantes.line.form</field>
         <field name="model">guvens.mis.comprobantes.line</field>
@@ -41,30 +49,116 @@
                     <field name="state" widget="statusbar"/>
                 </header>
                 <sheet>
+                    <div class="oe_button_box" name="button_box">
+                        <button name="action_open_move" type="object"
+                                class="oe_stat_button" icon="fa-file-text-o"
+                                invisible="not move_id">
+                            <div class="o_stat_info">
+                                <span class="o_stat_text">Ver Factura</span>
+                            </div>
+                        </button>
+                    </div>
                     <group>
-                        <group string="Datos AFIP">
-                            <field name="date"/>
-                            <field name="doc_type"/>
-                            <field name="pos_number"/>
-                            <field name="doc_number"/>
-                            <field name="cae"/>
-                            <field name="partner_vat"/>
-                            <field name="partner_name"/>
-                        </group>
-                        <group string="Importes">
-                            <field name="amount_net"/>
-                            <field name="amount_untaxed"/>
-                            <field name="amount_exempt"/>
-                            <field name="amount_iva"/>
-                            <field name="amount_total"/>
+                        <group string="Origen">
+                            <field name="source" readonly="1"/>
+                            <field name="period"/>
+                            <field name="import_date"/>
                         </group>
                     </group>
-                    <group string="Cruce con Odoo">
-                        <field name="move_id"/>
-                        <field name="diff_amount"/>
-                        <field name="period"/>
-                        <field name="import_date"/>
-                    </group>
+                    <notebook>
+                        <!-- Tab 1: Datos del comprobante -->
+                        <page string="Comprobante" name="page_comprobante">
+                            <group>
+                                <group string="Datos AFIP">
+                                    <field name="date"/>
+                                    <field name="doc_type"/>
+                                    <field name="afip_code"
+                                           invisible="source != 'portal_iva'"/>
+                                    <field name="pos_number"/>
+                                    <field name="doc_number"/>
+                                    <field name="cae"/>
+                                </group>
+                                <group string="Proveedor">
+                                    <field name="partner_vat"/>
+                                    <field name="partner_name"/>
+                                    <field name="currency_code"
+                                           invisible="source != 'portal_iva'"/>
+                                    <field name="exchange_rate"
+                                           invisible="source != 'portal_iva'"/>
+                                </group>
+                            </group>
+                        </page>
+
+                        <!-- Tab 2: Importes principales -->
+                        <page string="Importes" name="page_importes">
+                            <group>
+                                <group>
+                                    <field name="amount_total"/>
+                                    <field name="amount_net"/>
+                                    <field name="amount_untaxed"/>
+                                    <field name="amount_exempt"/>
+                                    <field name="amount_iva"/>
+                                </group>
+                                <group>
+                                    <field name="credito_fiscal"
+                                           invisible="source != 'portal_iva'"/>
+                                    <field name="amount_no_gravado"
+                                           invisible="source != 'portal_iva'"/>
+                                </group>
+                            </group>
+                        </page>
+
+                        <!-- Tab 3: Desglose IVA (solo Portal IVA) -->
+                        <page string="Desglose IVA" name="page_iva"
+                              invisible="source != 'portal_iva'">
+                            <group>
+                                <group string="Neto por alícuota">
+                                    <field name="neto_iva_0"/>
+                                    <field name="neto_iva_25"/>
+                                    <field name="neto_iva_5"/>
+                                    <field name="neto_iva_105"/>
+                                    <field name="neto_iva_21"/>
+                                    <field name="neto_iva_27"/>
+                                </group>
+                                <group string="IVA por alícuota">
+                                    <label for="neto_iva_0" string="—"/>
+                                    <div/>
+                                    <field name="iva_25"/>
+                                    <field name="iva_5"/>
+                                    <field name="iva_105"/>
+                                    <field name="iva_21"/>
+                                    <field name="iva_27"/>
+                                </group>
+                            </group>
+                        </page>
+
+                        <!-- Tab 4: Percepciones (solo Portal IVA) -->
+                        <page string="Percepciones" name="page_percepciones"
+                              invisible="source != 'portal_iva'">
+                            <group>
+                                <group>
+                                    <field name="amount_perc_iibb"/>
+                                    <field name="amount_perc_iva"/>
+                                    <field name="amount_perc_municipal"/>
+                                </group>
+                                <group>
+                                    <field name="amount_perc_internos"/>
+                                    <field name="amount_perc_otros_nac"/>
+                                    <field name="amount_otros_tributos"/>
+                                </group>
+                            </group>
+                        </page>
+
+                        <!-- Tab 5: Cruce con Odoo -->
+                        <page string="Cruce Odoo" name="page_cruce">
+                            <group>
+                                <group>
+                                    <field name="move_id"/>
+                                    <field name="diff_amount"/>
+                                </group>
+                            </group>
+                        </page>
+                    </notebook>
                 </sheet>
             </form>
         </field>
@@ -80,12 +174,19 @@
                 <field name="partner_vat"/>
                 <field name="doc_number"/>
                 <field name="cae"/>
+                <separator/>
+                <filter name="filter_portal_iva" string="Portal IVA"
+                        domain="[('source', '=', 'portal_iva')]"/>
+                <filter name="filter_mis_comprobantes" string="Mis Comprobantes"
+                        domain="[('source', '=', 'mis_comprobantes')]"/>
+                <separator/>
                 <filter name="filter_match" string="Coinciden" domain="[('state', '=', 'match')]"/>
                 <filter name="filter_mismatch" string="Diferencia" domain="[('state', '=', 'mismatch')]"/>
                 <filter name="filter_missing_odoo" string="Falta en Odoo" domain="[('state', '=', 'missing_in_odoo')]"/>
                 <filter name="filter_missing_afip" string="Falta en AFIP" domain="[('state', '=', 'missing_in_afip')]"/>
                 <separator/>
                 <filter name="group_state" string="Agrupar por estado" context="{'group_by': 'state'}"/>
+                <filter name="group_source" string="Agrupar por origen" context="{'group_by': 'source'}"/>
                 <filter name="group_partner" string="Agrupar por proveedor" context="{'group_by': 'partner_name'}"/>
                 <filter name="group_period" string="Agrupar por período" context="{'group_by': 'period'}"/>
             </search>
@@ -94,7 +195,7 @@
 
     <!-- Action -->
     <record id="action_mis_comprobantes_line" model="ir.actions.act_window">
-        <field name="name">Cruce Mis Comprobantes</field>
+        <field name="name">Cruce Comprobantes AFIP</field>
         <field name="res_model">guvens.mis.comprobantes.line</field>
         <field name="view_mode">tree,form</field>
         <field name="search_view_id" ref="view_mis_comprobantes_line_search"/>
@@ -103,7 +204,7 @@
                 No hay comprobantes importados
             </p>
             <p>
-                Importe un CSV desde el portal "Mis Comprobantes" de AFIP
+                Importe un CSV desde "Mis Comprobantes" o "Portal IVA — Compras" de AFIP
                 para cruzar contra las facturas de proveedores.
             </p>
         </field>

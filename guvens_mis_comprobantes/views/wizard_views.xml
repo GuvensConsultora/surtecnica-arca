@@ -5,11 +5,23 @@
         <field name="name">guvens.import.mis.comprobantes.form</field>
         <field name="model">guvens.import.mis.comprobantes</field>
         <field name="arch" type="xml">
-            <form string="Importar CSV de Mis Comprobantes">
+            <form string="Importar CSV AFIP">
                 <group>
                     <field name="csv_file" filename="csv_filename"/>
                     <field name="csv_filename" invisible="1"/>
                     <field name="period" readonly="1"/>
+                    <field name="detected_format" readonly="1"
+                           invisible="not detected_format"/>
+                </group>
+                <group>
+                    <div class="alert alert-info" role="alert">
+                        <strong>Formatos aceptados:</strong>
+                        <ul class="mb-0">
+                            <li><b>Mis Comprobantes</b> — CSV descargado de AFIP &gt; Mis Comprobantes</li>
+                            <li><b>Portal IVA — Compras</b> — CSV descargado de AFIP &gt; Portal IVA &gt; DDJJ Compras</li>
+                        </ul>
+                        El formato se detecta automáticamente al importar.
+                    </div>
                 </group>
                 <footer>
                     <button name="action_import" type="object"
@@ -21,7 +33,7 @@
     </record>
 
     <record id="action_import_mis_comprobantes" model="ir.actions.act_window">
-        <field name="name">Importar CSV Mis Comprobantes</field>
+        <field name="name">Importar CSV AFIP</field>
         <field name="res_model">guvens.import.mis.comprobantes</field>
         <field name="view_mode">form</field>
         <field name="target">new</field>
