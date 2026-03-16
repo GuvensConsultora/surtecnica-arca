@@ -13,16 +13,20 @@
                     <field name="detected_format" readonly="1"
                            invisible="not detected_format"/>
                 </group>
-                <group>
-                    <div class="alert alert-info" role="alert">
-                        <strong>Formatos aceptados:</strong>
-                        <ul class="mb-0">
-                            <li><b>Mis Comprobantes</b> — CSV descargado de AFIP &gt; Mis Comprobantes</li>
-                            <li><b>Portal IVA — Compras</b> — CSV descargado de AFIP &gt; Portal IVA &gt; DDJJ Compras</li>
-                        </ul>
-                        El formato se detecta automáticamente al importar.
+                <div class="mx-3 mb-3 p-3 bg-light rounded border">
+                    <h6 class="mb-2 text-muted fw-bold" style="font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px;">Formatos aceptados</h6>
+                    <div class="d-flex gap-3">
+                        <div class="flex-fill p-2 bg-white rounded border">
+                            <div class="fw-bold text-primary" style="font-size: 0.85rem;">Mis Comprobantes</div>
+                            <div class="text-muted" style="font-size: 0.78rem;">AFIP &gt; Mis Comprobantes &gt; Recibidos</div>
+                        </div>
+                        <div class="flex-fill p-2 bg-white rounded border">
+                            <div class="fw-bold text-primary" style="font-size: 0.85rem;">Portal IVA — Compras</div>
+                            <div class="text-muted" style="font-size: 0.78rem;">AFIP &gt; Portal IVA &gt; DDJJ Compras</div>
+                        </div>
                     </div>
-                </group>
+                    <div class="mt-2 text-muted text-center" style="font-size: 0.75rem;">El formato se detecta automáticamente al importar.</div>
+                </div>
                 <footer>
                     <button name="action_import" type="object"
                             string="Importar y Cruzar" class="btn-primary"/>
