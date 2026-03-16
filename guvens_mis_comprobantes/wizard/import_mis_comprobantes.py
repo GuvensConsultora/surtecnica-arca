@@ -232,24 +232,30 @@ class ImportMisComprobantes(models.TransientModel):
                          afip_tipo=False):
         """Busca la mejor factura candidata en Odoo por scoring.
 
-        Estrategia en 3 fases:
-        1. Match exacto (nro + CUIT + tipo doc) → si score >= 80, usar directo
-        2. Match amplio por CUIT + rango de fecha ±30 días → scorear candidatos
-        3. Match por importe similar + fecha cercana → último recurso
+        Por qué: el CUIT del emisor es el dato más confiable del CSV — es único
+        por proveedor y no tiene ambigüedad. Las fases priorizan CUIT como eje
+        principal y sólo buscan sin CUIT como último recurso.
+
+        Estrategia en 3 fases (CUIT-first):
+        1. CUIT + nro comprobante exacto → si score >= 80, listo
+        2. CUIT + fecha ±30 días → scorear candidatos del mismo proveedor
+        3. Sin CUIT: importe similar + fecha cercana → último recurso
         """
         Move = self.env['account.move']
         best_move = Move
         best_score = 0
         best_detail = ''
+        from datetime import timedelta
 
-        # -- Fase 1: match exacto por nro comprobante --
-        if doc_number:
+        # -- Fase 1: CUIT + nro comprobante exacto --
+        # Por qué: arrancamos por CUIT para acotar el universo al proveedor
+        if partner_vat and doc_number:
             domain_exact = [
                 ('move_type', '=', move_type),
                 ('state', '=', 'posted'),
+                ('partner_id.vat', '=', partner_vat),
                 ('l10n_latam_document_number', '=', doc_number),
             ]
-            # Filtrar por código AFIP (Portal IVA) o internal_type (Mis Comprobantes)
             if afip_code:
                 domain_exact.append(
                     ('l10n_latam_document_type_id.code', '=', afip_code))
@@ -266,21 +272,25 @@ class ImportMisComprobantes(models.TransientModel):
                 if sc > best_score:
                     best_score, best_detail, best_move = sc, det, move
 
-        # Si encontró match fuerte, retornar
         if best_score >= 80:
             return best_move, best_score, best_detail
 
-        # -- Fase 2: match amplio por CUIT + fecha cercana --
-        if partner_vat and date:
-            from datetime import timedelta
-            domain_broad = [
+        # -- Fase 2: CUIT + fecha cercana (sin exigir nro exacto) --
+        # Por qué: mismo proveedor, puede haber diferencia en PV/nro
+        # por carga manual o prefijo distinto
+        if partner_vat:
+            domain_cuit = [
                 ('move_type', '=', move_type),
                 ('state', '=', 'posted'),
                 ('partner_id.vat', '=', partner_vat),
-                ('invoice_date', '>=', date - timedelta(days=30)),
-                ('invoice_date', '<=', date + timedelta(days=30)),
             ]
-            for move in Move.search(domain_broad, limit=10):
+            if date:
+                domain_cuit += [
+                    ('invoice_date', '>=', date - timedelta(days=30)),
+                    ('invoice_date', '<=', date + timedelta(days=30)),
+                ]
+
+            for move in Move.search(domain_cuit, limit=15):
                 sc, det = self._score_move(
                     move, partner_vat, doc_number, date, amount_total)
                 if sc > best_score:
@@ -289,9 +299,10 @@ class ImportMisComprobantes(models.TransientModel):
         if best_score >= 60:
             return best_move, best_score, best_detail
 
-        # -- Fase 3: match por importe + fecha (sin CUIT) --
+        # -- Fase 3: sin CUIT — importe + fecha (último recurso) --
+        # Por qué: si el CUIT no está o no matchea nada, buscar por
+        # importe cercano + fecha como indicador débil
         if date and amount_total:
-            from datetime import timedelta
             afip_abs = abs(amount_total)
             tolerance = max(afip_abs * 0.05, 1.0)
             domain_amount = [
