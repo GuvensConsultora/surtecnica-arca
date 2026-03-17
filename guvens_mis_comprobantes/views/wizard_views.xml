@@ -5,7 +5,7 @@
         <field name="name">guvens.import.mis.comprobantes.form</field>
         <field name="model">guvens.import.mis.comprobantes</field>
         <field name="arch" type="xml">
-            <form string="Importar CSV AFIP">
+            <form string="Importar CSV ARCA">
                 <group>
                     <field name="csv_file" filename="csv_filename"/>
                     <field name="csv_filename" invisible="1"/>
@@ -18,11 +18,11 @@
                     <div class="d-flex gap-3">
                         <div class="flex-fill p-2 bg-white rounded border">
                             <div class="fw-bold text-primary" style="font-size: 0.85rem;">Mis Comprobantes</div>
-                            <div class="text-muted" style="font-size: 0.78rem;">AFIP &gt; Mis Comprobantes &gt; Recibidos</div>
+                            <div class="text-muted" style="font-size: 0.78rem;">ARCA &gt; Mis Comprobantes &gt; Recibidos</div>
                         </div>
                         <div class="flex-fill p-2 bg-white rounded border">
                             <div class="fw-bold text-primary" style="font-size: 0.85rem;">Portal IVA — Compras</div>
-                            <div class="text-muted" style="font-size: 0.78rem;">AFIP &gt; Portal IVA &gt; DDJJ Compras</div>
+                            <div class="text-muted" style="font-size: 0.78rem;">ARCA &gt; Portal IVA &gt; DDJJ Compras</div>
                         </div>
                     </div>
                     <div class="mt-2 text-muted text-center" style="font-size: 0.75rem;">El formato se detecta automáticamente al importar.</div>
@@ -37,7 +37,7 @@
     </record>
 
     <record id="action_import_mis_comprobantes" model="ir.actions.act_window">
-        <field name="name">Importar CSV AFIP</field>
+        <field name="name">Importar CSV ARCA</field>
         <field name="res_model">guvens.import.mis.comprobantes</field>
         <field name="view_mode">form</field>
         <field name="target">new</field>

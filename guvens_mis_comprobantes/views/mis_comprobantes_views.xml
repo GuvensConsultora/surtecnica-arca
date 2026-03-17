@@ -3,7 +3,7 @@
 
     <!--
         Tree view — diseño comparativo lado a lado:
-        RESULTADO | PROVEEDOR | COMPROBANTE AFIP | $ AFIP vs $ ODOO | DETALLE
+        RESULTADO | PROVEEDOR | COMPROBANTE ARCA | $ ARCA vs $ ODOO | DETALLE
     -->
     <record id="view_mis_comprobantes_line_tree" model="ir.ui.view">
         <field name="name">guvens.mis.comprobantes.line.tree</field>
@@ -30,12 +30,12 @@
                 <field name="partner_name" string="Proveedor"/>
                 <field name="partner_vat" string="CUIT"/>
 
-                <!-- ═══ Comprobante AFIP ═══ -->
+                <!-- ═══ Comprobante ARCA ═══ -->
                 <field name="display_comprobante" string="Comprobante"/>
-                <field name="date" string="Fecha AFIP"/>
+                <field name="date" string="Fecha ARCA"/>
 
                 <!-- ═══ Comparación importes ═══ -->
-                <field name="amount_total" string="$ AFIP" sum="Total AFIP"/>
+                <field name="amount_total" string="$ ARCA" sum="Total ARCA"/>
                 <field name="odoo_amount_total" string="$ Odoo" sum="Total Odoo"/>
                 <field name="diff_amount" string="Dif. $" sum="Total Dif."
                        decoration-danger="diff_amount != 0"/>
@@ -67,7 +67,7 @@
         <field name="name">guvens.mis.comprobantes.line.form</field>
         <field name="model">guvens.mis.comprobantes.line</field>
         <field name="arch" type="xml">
-            <form string="Comprobante AFIP" create="false">
+            <form string="Comprobante ARCA" create="false">
                 <field name="company_id" invisible="1"/>
                 <header>
                     <field name="state" widget="statusbar"/>
@@ -101,7 +101,7 @@
                         <!-- Tab 1: Comparación lado a lado -->
                         <page string="Comparación" name="page_comparacion">
                             <group>
-                                <group string="Datos AFIP">
+                                <group string="Datos ARCA">
                                     <field name="partner_name" string="Proveedor"/>
                                     <field name="partner_vat" string="CUIT"/>
                                     <field name="display_comprobante"/>
@@ -117,8 +117,8 @@
                             </group>
                         </page>
 
-                        <!-- Tab 2: Detalle comprobante AFIP -->
-                        <page string="Detalle AFIP" name="page_detalle">
+                        <!-- Tab 2: Detalle comprobante ARCA -->
+                        <page string="Detalle ARCA" name="page_detalle">
                             <group>
                                 <group string="Comprobante">
                                     <field name="doc_type"/>
@@ -213,7 +213,7 @@
                         domain="[('state', '=', 'mismatch')]"/>
                 <filter name="filter_missing_odoo" string="Falta en Odoo"
                         domain="[('state', '=', 'missing_in_odoo')]"/>
-                <filter name="filter_missing_afip" string="Falta en AFIP"
+                <filter name="filter_missing_afip" string="Falta en ARCA"
                         domain="[('state', '=', 'missing_in_afip')]"/>
                 <separator/>
                 <filter name="filter_low_score" string="Confianza baja (&lt;80%)"
@@ -233,7 +233,7 @@
 
     <!-- Action -->
     <record id="action_mis_comprobantes_line" model="ir.actions.act_window">
-        <field name="name">Cruce Comprobantes AFIP</field>
+        <field name="name">Cruce Comprobantes ARCA</field>
         <field name="res_model">guvens.mis.comprobantes.line</field>
         <field name="view_mode">tree,form</field>
         <field name="search_view_id" ref="view_mis_comprobantes_line_search"/>
@@ -242,7 +242,7 @@
                 No hay comprobantes importados
             </p>
             <p>
-                Importe un CSV desde "Mis Comprobantes" o "Portal IVA — Compras" de AFIP
+                Importe un CSV desde "Mis Comprobantes" o "Portal IVA — Compras" de ARCA
                 para cruzar contra las facturas de proveedores.
             </p>
         </field>

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
 
-    <!-- Indicador de cruce AFIP en la vista form de facturas de proveedor -->
+    <!-- Indicador de cruce ARCA en la vista form de facturas de proveedor -->
     <!-- Por qué: usamos xpath a invoice_date que es campo estándar seguro en Odoo 17 -->
     <record id="view_move_form_inherit_mis_comprobantes" model="ir.ui.view">
         <field name="name">account.move.form.mis.comprobantes</field>
@@ -14,11 +14,11 @@
                 <div invisible="not mis_comprobantes_line_ids"
                      class="ms-2">
                     <span invisible="mis_comprobantes_state != 'match'"
-                          class="badge rounded-pill text-bg-success">AFIP: Coincide</span>
+                          class="badge rounded-pill text-bg-success">ARCA: Coincide</span>
                     <span invisible="mis_comprobantes_state != 'mismatch'"
-                          class="badge rounded-pill text-bg-warning">AFIP: Diferencia</span>
+                          class="badge rounded-pill text-bg-warning">ARCA: Diferencia</span>
                     <span invisible="mis_comprobantes_state != 'missing_in_afip'"
-                          class="badge rounded-pill text-bg-info">AFIP: No encontrado</span>
+                          class="badge rounded-pill text-bg-info">ARCA: No encontrado</span>
                 </div>
             </field>
         </field>

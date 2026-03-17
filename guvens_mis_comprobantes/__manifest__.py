@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 {
-    'name': 'Cruce Mis Comprobantes AFIP',
+    'name': 'Cruce Mis Comprobantes ARCA',
     'version': '17.0.2.0.0',
     'category': 'Accounting',
-    'summary': 'Importa CSV de Mis Comprobantes y Portal IVA (AFIP) y cruza contra facturas',
+    'summary': 'Importa CSV de Mis Comprobantes y Portal IVA (ARCA) y cruza contra facturas',
     'description': """
-        Importa CSV de "Mis Comprobantes" o "Portal IVA — Compras" de AFIP y cruza
+        Importa CSV de "Mis Comprobantes" o "Portal IVA — Compras" de ARCA y cruza
         automáticamente contra facturas de proveedores en Odoo.
         Auto-detecta el formato del CSV. Portal IVA incluye desglose IVA por alícuota,
         percepciones (IIBB, IVA, municipales, internos), multi-moneda y crédito fiscal.

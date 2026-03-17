@@ -3,14 +3,15 @@ import base64
 import csv
 import io
 import re
-from datetime import datetime
+from collections import Counter
+from datetime import datetime, timedelta
 
 from odoo import models, fields, _
 from odoo.exceptions import UserError
 
 
 # Por qué: mapeo entre el texto del CSV de "Mis Comprobantes" y el internal_type
-# de l10n_latam.document.type. AFIP usa texto libre, Odoo usa internal_type
+# de l10n_latam.document.type. ARCA usa texto libre, Odoo usa internal_type
 AFIP_DOC_TYPE_MAP = {
     'factura': 'invoice',
     'nota de débito': 'debit_note',
@@ -18,7 +19,7 @@ AFIP_DOC_TYPE_MAP = {
     'recibo': 'invoice',
 }
 
-# Por qué: AFIP texto → move_type de Odoo para filtrar en search
+# Por qué: ARCA texto → move_type de Odoo para filtrar en search
 AFIP_MOVE_TYPE_MAP = {
     'factura': 'in_invoice',
     'nota de débito': 'in_invoice',  # ND es invoice con doc_type debit_note
@@ -26,20 +27,20 @@ AFIP_MOVE_TYPE_MAP = {
     'recibo': 'in_invoice',
 }
 
-# Por qué: código numérico AFIP → move_type de Odoo
+# Por qué: código numérico ARCA → move_type de Odoo
 # NC (códigos 3, 8, 13, 203, 208, 213) son refunds, el resto invoices
 AFIP_CODE_REFUND = {'3', '8', '13', '203', '208', '213'}
 
 
 class ImportMisComprobantes(models.TransientModel):
     _name = 'guvens.import.mis.comprobantes'
-    _description = 'Importar CSV de Mis Comprobantes / Portal IVA AFIP'
+    _description = 'Importar CSV de Mis Comprobantes / Portal IVA ARCA'
 
     csv_file = fields.Binary(string='Archivo CSV', required=True)
     csv_filename = fields.Char(string='Nombre archivo')
     period = fields.Char(
         string='Período (MM/YYYY)',
-        help='Se auto-detecta de la primera línea del CSV',
+        help='Se auto-detecta del contenido del CSV',
     )
     detected_format = fields.Char(
         string='Formato detectado',
@@ -51,12 +52,12 @@ class ImportMisComprobantes(models.TransientModel):
     # -------------------------------------------------------------------------
 
     def _parse_afip_amount(self, value):
-        """Convierte importe formato AFIP (punto=miles, coma=decimal) a float.
+        """Convierte importe formato ARCA (punto=miles, coma=decimal) a float.
         Ejemplo: '10.000,00' → 10000.00 | '52900,00' → 52900.00
         """
         if not value or not value.strip():
             return 0.0
-        # Por qué: AFIP usa punto como separador de miles y coma como decimal
+        # Por qué: ARCA usa punto como separador de miles y coma como decimal
         clean = value.strip().replace('.', '').replace(',', '.')
         try:
             return float(clean)
@@ -78,7 +79,7 @@ class ImportMisComprobantes(models.TransientModel):
             return 0.0
 
     def _parse_afip_date(self, value):
-        """Convierte fecha AFIP dd/mm/yyyy a date object."""
+        """Convierte fecha ARCA dd/mm/yyyy a date object."""
         if not value or not value.strip():
             return False
         try:
@@ -114,7 +115,7 @@ class ImportMisComprobantes(models.TransientModel):
         return re.sub(r'[^0-9]', '', cuit or '')
 
     # -------------------------------------------------------------------------
-    # Auto-detección de formato
+    # Auto-detección de formato y período
     # -------------------------------------------------------------------------
 
     def _detect_csv_format(self, header_row):
@@ -129,16 +130,45 @@ class ImportMisComprobantes(models.TransientModel):
             return 'mis_comprobantes'
         return 'mis_comprobantes'
 
-    def _detect_period_from_filename(self, filename):
-        """Intenta extraer período del nombre del archivo.
-        Ejemplo: 'comprobantes_periodo_202602_compras_...' → '02/2026'
+    def _detect_period_from_data(self, lines_data):
+        """Analiza las fechas del CSV para determinar el período bajo análisis.
+        Por qué: usar el mes/año más frecuente en el CSV es más robusto que
+        tomar solo la primera línea o el nombre del archivo. Si el CSV tiene
+        una factura de otro mes por error, no corrompe el período.
         """
-        if not filename:
+        month_year_counts = Counter()
+        for line in lines_data:
+            d = line.get('date')
+            if d:
+                month_year_counts[(d.month, d.year)] += 1
+
+        if not month_year_counts:
             return False
-        match = re.search(r'(\d{4})(\d{2})', filename)
-        if match:
-            return '%s/%s' % (match.group(2), match.group(1))
-        return False
+
+        # Por qué: el mes/año con más comprobantes es el período del CSV
+        (month, year), _count = month_year_counts.most_common(1)[0]
+        return '%s/%s' % (str(month).zfill(2), year)
+
+    def _parse_period_range(self, period):
+        """Convierte string 'MM/YYYY' a (date_from, date_to).
+        Retorna (None, None) si el formato es inválido.
+        """
+        if not period:
+            return None, None
+        try:
+            month, year = period.split('/')
+            date_from = datetime.strptime(
+                '01/%s/%s' % (month, year), '%d/%m/%Y').date()
+            if int(month) == 12:
+                date_to = datetime.strptime(
+                    '01/01/%s' % (int(year) + 1), '%d/%m/%Y').date()
+            else:
+                date_to = datetime.strptime(
+                    '01/%s/%s' % (str(int(month) + 1).zfill(2), year),
+                    '%d/%m/%Y').date()
+            return date_from, date_to
+        except (ValueError, AttributeError):
+            return None, None
 
     # -------------------------------------------------------------------------
     # Decodificación CSV
@@ -156,16 +186,124 @@ class ImportMisComprobantes(models.TransientModel):
         except Exception as e:
             raise UserError(_('Error al leer el archivo: %s') % str(e))
 
-        # Por qué: CSV de AFIP puede tener \r sueltos o \r\n
+        # Por qué: CSV de ARCA puede tener \r sueltos o \r\n
         csv_text = '\n'.join(csv_text.splitlines())
         return csv_text
 
     # -------------------------------------------------------------------------
-    # Matching por scoring contra Odoo
+    # Matching determinístico + scoring
     # -------------------------------------------------------------------------
 
+    def _build_move_index(self, date_from, date_to):
+        """Construye índice de facturas Odoo del período por (CUIT, doc_number).
+        Por qué: la clave primaria de coincidencia es CUIT + PV + Nro comprobante.
+        Este índice permite matching O(1) en vez de queries N+1.
+        """
+        moves = self.env['account.move'].search([
+            ('move_type', 'in', ['in_invoice', 'in_refund']),
+            ('state', '=', 'posted'),
+            ('invoice_date', '>=', date_from),
+            ('invoice_date', '<', date_to),
+            ('company_id', '=', self.env.company.id),
+        ])
+
+        index = {}
+        for move in moves:
+            vat = self._clean_cuit(move.partner_id.vat or '')
+            doc_num = move.l10n_latam_document_number or ''
+            if vat and doc_num:
+                # Por qué: normalizamos el CUIT a solo dígitos para matching
+                index[(vat, doc_num)] = move
+        return index, moves
+
+    def _match_lines(self, lines_data):
+        """Matchea líneas importadas contra facturas de Odoo.
+
+        Estrategia:
+        1. Matching determinístico por CUIT + PV + Nro (clave primaria fiscal)
+        2. Si no encuentra, fallback a scoring por aproximación
+        3. Estado basado en coincidencia de importe cuando hay match por clave
+        """
+        if not self.period:
+            for line in lines_data:
+                line.update({
+                    'move_id': False,
+                    'match_score': 0,
+                    'match_detail': 'Sin período detectado',
+                    'state': 'missing_in_odoo',
+                })
+            return
+
+        date_from, date_to = self._parse_period_range(self.period)
+        if not date_from:
+            for line in lines_data:
+                line.update({
+                    'move_id': False,
+                    'match_score': 0,
+                    'match_detail': 'Período inválido',
+                    'state': 'missing_in_odoo',
+                })
+            return
+
+        # Construir índice de moves Odoo del período
+        move_index, _all_moves = self._build_move_index(date_from, date_to)
+
+        for line in lines_data:
+            vat = self._clean_cuit(line.get('partner_vat', ''))
+            pos = (line.get('pos_number') or '').strip()
+            num = (line.get('doc_number') or '').strip()
+            doc_number = self._build_document_number(pos, num)
+            amount = line.get('amount_total', 0.0)
+            date = line.get('date')
+
+            # -- Fase 1: matching determinístico por CUIT + PV + Nro --
+            # Por qué: es la clave primaria del comprobante fiscal argentino.
+            # Si CUIT + PV + Nro coinciden, es el mismo documento sin dudas.
+            move = move_index.get(
+                (vat, doc_number)) if vat and doc_number else None
+
+            if move:
+                score, detail = self._score_move(
+                    move, vat, doc_number, date, amount)
+                # Por qué: el estado depende de la diferencia de importe.
+                # Si CUIT+PV+Nro matchean pero el importe difiere → mismatch
+                odoo_amount = abs(move.amount_total)
+                arca_amount = abs(amount)
+                if abs(odoo_amount - arca_amount) <= 0.01:
+                    state = 'match'
+                else:
+                    state = 'mismatch'
+
+                line.update({
+                    'move_id': move.id,
+                    'match_score': score,
+                    'match_detail': detail,
+                    'state': state,
+                })
+                continue
+
+            # -- Fase 2: fallback a scoring por aproximación --
+            # Por qué: si la clave primaria no matchea (error de tipeo, PV
+            # distinto, CUIT mal cargado), buscar por criterios más flexibles
+            move_type = line.get('_move_type', 'in_invoice')
+            afip_code = line.get('afip_code', '')
+            afip_tipo = line.get('doc_type', '')
+
+            best_move, score, detail = self._find_best_match(
+                vat, doc_number, date, amount,
+                move_type=move_type, afip_code=afip_code, afip_tipo=afip_tipo,
+            )
+            state = self._score_to_state(score, best_move)
+
+            line.update({
+                'move_id': best_move.id if best_move else False,
+                'match_score': score,
+                'match_detail': detail,
+                'state': state,
+            })
+
     def _score_move(self, move, partner_vat, doc_number, date, amount_total):
-        """Calcula score 0-100 de correspondencia entre línea AFIP y factura Odoo.
+        """Calcula score 0-100 de correspondencia entre línea ARCA y factura Odoo.
 
         Criterios (100 pts total):
         - CUIT proveedor coincide:        30 pts
@@ -206,10 +344,10 @@ class ImportMisComprobantes(models.TransientModel):
 
         # -- Importe (20 pts exacto, 15 pts ±1%, 10 pts ±5%) --
         odoo_total = abs(move.amount_total)
-        afip_total = abs(amount_total)
-        if afip_total > 0:
-            diff_abs = abs(odoo_total - afip_total)
-            diff_pct = (diff_abs / afip_total) * 100
+        arca_total = abs(amount_total)
+        if arca_total > 0:
+            diff_abs = abs(odoo_total - arca_total)
+            diff_pct = (diff_abs / arca_total) * 100
             if diff_abs <= 0.01:
                 score += 20
                 details.append('Importe OK')
@@ -221,7 +359,7 @@ class ImportMisComprobantes(models.TransientModel):
                 details.append('Importe ±%.1f%%' % diff_pct)
             else:
                 details.append('Importe dif %.1f%%' % diff_pct)
-        elif odoo_total == 0 and afip_total == 0:
+        elif odoo_total == 0 and arca_total == 0:
             score += 20
             details.append('Importe OK ($0)')
 
@@ -230,27 +368,20 @@ class ImportMisComprobantes(models.TransientModel):
     def _find_best_match(self, partner_vat, doc_number, date, amount_total,
                          move_type='in_invoice', afip_code=False,
                          afip_tipo=False):
-        """Busca la mejor factura candidata en Odoo por scoring.
+        """Busca la mejor factura candidata en Odoo por scoring (fallback).
 
-        Por qué: el CUIT del emisor es el dato más confiable del CSV — es único
-        por proveedor y no tiene ambigüedad. Las fases priorizan CUIT como eje
-        principal y sólo buscan sin CUIT como último recurso.
-
-        Estrategia en 3 fases (CUIT-first):
-        1. CUIT + nro comprobante exacto → si score >= 80, listo
-        2. CUIT + fecha ±30 días → scorear candidatos del mismo proveedor
-        3. Sin CUIT: importe similar + fecha cercana → último recurso
+        Por qué: se usa solo cuando el matching determinístico por
+        CUIT + PV + Nro no encontró coincidencia en el período.
+        Busca sin restricción de período como último recurso.
         """
         Move = self.env['account.move']
         best_move = Move
         best_score = 0
         best_detail = ''
-        from datetime import timedelta
-        # Por qué: filtrar por company para no cruzar facturas entre empresas
         company_id = self.env.company.id
 
-        # -- Fase 1: CUIT + nro comprobante exacto --
-        # Por qué: arrancamos por CUIT para acotar el universo al proveedor
+        # -- Fase 1: CUIT + nro comprobante exacto (sin filtro de período) --
+        # Por qué: el comprobante puede estar en otro mes por fecha de carga
         if partner_vat and doc_number:
             domain_exact = [
                 ('move_type', '=', move_type),
@@ -259,15 +390,6 @@ class ImportMisComprobantes(models.TransientModel):
                 ('partner_id.vat', '=', partner_vat),
                 ('l10n_latam_document_number', '=', doc_number),
             ]
-            if afip_code:
-                domain_exact.append(
-                    ('l10n_latam_document_type_id.code', '=', afip_code))
-            elif afip_tipo:
-                normalized = self._normalize_doc_type(afip_tipo)
-                internal_type = AFIP_DOC_TYPE_MAP.get(normalized, 'invoice')
-                domain_exact.append(
-                    ('l10n_latam_document_type_id.internal_type', '=',
-                     internal_type))
 
             for move in Move.search(domain_exact, limit=5):
                 sc, det = self._score_move(
@@ -275,7 +397,7 @@ class ImportMisComprobantes(models.TransientModel):
                 if sc > best_score:
                     best_score, best_detail, best_move = sc, det, move
 
-        if best_score >= 80:
+        if best_score >= 60:
             return best_move, best_score, best_detail
 
         # -- Fase 2: CUIT + fecha cercana (sin exigir nro exacto) --
@@ -340,9 +462,10 @@ class ImportMisComprobantes(models.TransientModel):
     # -------------------------------------------------------------------------
 
     def _parse_mis_comprobantes(self, reader):
-        """Parsea CSV de Mis Comprobantes (formato original, 16+ columnas)."""
+        """Parsea CSV de Mis Comprobantes (formato original, 16+ columnas).
+        Retorna lista de dicts con datos crudos SIN matching.
+        """
         lines_data = []
-        period_detected = False
 
         for row in reader:
             if not row or len(row) < 15:
@@ -355,31 +478,30 @@ class ImportMisComprobantes(models.TransientModel):
             cae = row[5].strip() if len(row) > 5 and row[5] else ''
             partner_vat_raw = row[7].strip() if len(row) > 7 and row[7] else ''
             partner_name = row[8].strip() if len(row) > 8 and row[8] else ''
-            amount_net = self._parse_afip_amount(row[11] if len(row) > 11 else '')
-            amount_untaxed = self._parse_afip_amount(row[12] if len(row) > 12 else '')
-            amount_exempt = self._parse_afip_amount(row[13] if len(row) > 13 else '')
-            amount_iva = self._parse_afip_amount(row[14] if len(row) > 14 else '')
-            amount_total = self._parse_afip_amount(row[15] if len(row) > 15 else '')
+            amount_net = self._parse_afip_amount(
+                row[11] if len(row) > 11 else '')
+            amount_untaxed = self._parse_afip_amount(
+                row[12] if len(row) > 12 else '')
+            amount_exempt = self._parse_afip_amount(
+                row[13] if len(row) > 13 else '')
+            amount_iva = self._parse_afip_amount(
+                row[14] if len(row) > 14 else '')
+            amount_total = self._parse_afip_amount(
+                row[15] if len(row) > 15 else '')
+
+            # Por qué: las NC en ARCA vienen con monto negativo, normalizamos
+            # a positivo para comparar uniformemente contra Odoo (abs)
+            normalized_tipo = self._normalize_doc_type(doc_type)
+            if normalized_tipo == 'nota de crédito':
+                amount_total = abs(amount_total)
 
             partner_vat = self._clean_cuit(partner_vat_raw)
-            document_number = self._build_document_number(pos_number, doc_number_from)
 
-            if date and not period_detected:
-                self.period = date.strftime('%m/%Y')
-                period_detected = True
-
-            # Matching por scoring
-            normalized = self._normalize_doc_type(doc_type)
-            move_type = AFIP_MOVE_TYPE_MAP.get(normalized, 'in_invoice')
-            move, score, detail = self._find_best_match(
-                partner_vat, document_number, date, amount_total,
-                move_type=move_type, afip_tipo=doc_type,
-            )
-            state = self._score_to_state(score, move)
+            # Por qué: guardar move_type temporal para el fallback de scoring
+            move_type = AFIP_MOVE_TYPE_MAP.get(normalized_tipo, 'in_invoice')
 
             lines_data.append({
                 'import_date': fields.Date.context_today(self),
-                'period': self.period or '',
                 'company_id': self.env.company.id,
                 'source': 'mis_comprobantes',
                 'date': date,
@@ -394,10 +516,8 @@ class ImportMisComprobantes(models.TransientModel):
                 'amount_exempt': amount_exempt,
                 'amount_untaxed': amount_untaxed,
                 'amount_iva': amount_iva,
-                'state': state,
-                'match_score': score,
-                'match_detail': detail,
-                'move_id': move.id if move else False,
+                # Temporal — usado por _match_lines, no se persiste
+                '_move_type': move_type,
             })
 
         return lines_data
@@ -408,9 +528,10 @@ class ImportMisComprobantes(models.TransientModel):
 
     def _parse_portal_iva(self, reader):
         """Parsea CSV de Portal IVA — Compras DDJJ (32 columnas).
+        Retorna lista de dicts con datos crudos SIN matching.
         Columnas:
          0: Fecha Emisión (yyyy-mm-dd)
-         1: Tipo Comprobante (código numérico AFIP)
+         1: Tipo Comprobante (código numérico ARCA)
          2: Punto de Venta
          3: Número Comprobante
          4: Tipo Doc. Vendedor (80=CUIT)
@@ -438,8 +559,8 @@ class ImportMisComprobantes(models.TransientModel):
         31: Total IVA
         """
         lines_data = []
-        period_detected = False
-        # Por qué: buscamos l10n_latam.document.type por code para obtener el nombre
+        # Por qué: buscamos l10n_latam.document.type por code para obtener
+        # el nombre legible del tipo de comprobante
         DocType = self.env['l10n_latam.document.type']
 
         for row in reader:
@@ -450,11 +571,18 @@ class ImportMisComprobantes(models.TransientModel):
             afip_code = row[1].strip() if row[1] else ''
             pos_number = row[2].strip() if row[2] else ''
             doc_number_from = row[3].strip() if row[3] else ''
-            partner_vat_raw = row[5].strip() if len(row) > 5 and row[5] else ''
+            partner_vat_raw = (
+                row[5].strip() if len(row) > 5 and row[5] else '')
             partner_name = (row[6].strip().strip('"')
                            if len(row) > 6 and row[6] else '')
             amount_total = self._parse_portal_iva_amount(
                 row[7] if len(row) > 7 else '')
+
+            # Por qué: las NC en ARCA vienen con monto negativo, normalizamos
+            # a positivo para comparar uniformemente contra Odoo (abs)
+            if afip_code in AFIP_CODE_REFUND:
+                amount_total = abs(amount_total)
+
             currency_code = (row[8].strip().strip('"')
                              if len(row) > 8 and row[8] else '')
             exchange_rate = self._parse_portal_iva_amount(
@@ -509,30 +637,18 @@ class ImportMisComprobantes(models.TransientModel):
                 row[31] if len(row) > 31 else '')
 
             partner_vat = self._clean_cuit(partner_vat_raw)
-            document_number = self._build_document_number(
-                pos_number, doc_number_from)
 
-            # Por qué: buscar nombre del tipo de comprobante por código AFIP
+            # Por qué: buscar nombre del tipo de comprobante por código ARCA
             doc_type_rec = DocType.search(
                 [('code', '=', afip_code)], limit=1)
             doc_type_name = doc_type_rec.name if doc_type_rec else afip_code
 
-            if date and not period_detected:
-                self.period = date.strftime('%m/%Y')
-                period_detected = True
-
-            # Matching por scoring con código AFIP
+            # Por qué: guardar move_type temporal para el fallback de scoring
             move_type = ('in_refund' if afip_code in AFIP_CODE_REFUND
                          else 'in_invoice')
-            move, score, detail = self._find_best_match(
-                partner_vat, document_number, date, amount_total,
-                move_type=move_type, afip_code=afip_code,
-            )
-            state = self._score_to_state(score, move)
 
             lines_data.append({
                 'import_date': fields.Date.context_today(self),
-                'period': self.period or '',
                 'company_id': self.env.company.id,
                 'source': 'portal_iva',
                 'date': date,
@@ -570,10 +686,8 @@ class ImportMisComprobantes(models.TransientModel):
                 'neto_iva_27': neto_iva_27,
                 'iva_27': iva_27,
                 'amount_no_gravado': amount_untaxed,
-                'state': state,
-                'match_score': score,
-                'match_detail': detail,
-                'move_id': move.id if move else False,
+                # Temporal — usado por _match_lines, no se persiste
+                '_move_type': move_type,
             })
 
         return lines_data
@@ -583,7 +697,15 @@ class ImportMisComprobantes(models.TransientModel):
     # -------------------------------------------------------------------------
 
     def action_import(self):
-        """Importa CSV de Mis Comprobantes o Portal IVA y cruza contra facturas."""
+        """Importa CSV de Mis Comprobantes o Portal IVA y cruza contra facturas.
+
+        Flujo:
+        1. Decodificar y detectar formato del CSV
+        2. Parsear líneas (sin matching)
+        3. Detectar período desde las fechas del CSV
+        4. Matching determinístico CUIT+PV+Nro → scoring fallback
+        5. Detectar facturas Odoo que faltan en ARCA
+        """
         self.ensure_one()
         if not self.csv_file:
             raise UserError(_('Debe seleccionar un archivo CSV.'))
@@ -603,14 +725,7 @@ class ImportMisComprobantes(models.TransientModel):
             else 'Mis Comprobantes'
         )
 
-        # Por qué: intentar extraer período del nombre del archivo
-        # antes de parsear (fallback: primera fecha del CSV)
-        period_from_filename = self._detect_period_from_filename(
-            self.csv_filename)
-        if period_from_filename:
-            self.period = period_from_filename
-
-        # Parsear según formato detectado
+        # Parsear CSV (sin matching todavía)
         if csv_format == 'portal_iva':
             lines_data = self._parse_portal_iva(reader)
         else:
@@ -619,14 +734,30 @@ class ImportMisComprobantes(models.TransientModel):
         if not lines_data:
             raise UserError(_('No se encontraron líneas válidas en el CSV.'))
 
+        # Por qué: determinar el período desde las fechas del CSV.
+        # Analiza todas las fechas y usa el mes/año más frecuente — más robusto
+        # que tomar la primera fecha o el nombre del archivo
+        self.period = self._detect_period_from_data(lines_data)
+
+        # Setear período en cada línea
+        for line in lines_data:
+            line['period'] = self.period or ''
+
+        # Matching: CUIT + PV + Nro determinístico, luego scoring fallback
+        self._match_lines(lines_data)
+
+        # Limpiar campos temporales antes de crear en DB
+        for line in lines_data:
+            line.pop('_move_type', None)
+
         Line = self.env['guvens.mis.comprobantes.line']
 
         # -- Crear líneas importadas --
         created_lines = Line.create(lines_data)
 
-        # -- Detectar facturas en Odoo que no están en el CSV --
+        # -- Detectar facturas en Odoo que no están en ARCA --
         if self.period:
-            self._detect_missing_in_afip(created_lines, csv_format)
+            self._detect_missing_in_arca(created_lines, csv_format)
 
         # -- Recargar líneas del período --
         all_lines = Line.search([
@@ -636,24 +767,27 @@ class ImportMisComprobantes(models.TransientModel):
         ])
 
         # Resumen para notification
-        counts = {s: 0 for s in ['match', 'mismatch', 'missing_in_odoo', 'missing_in_afip']}
+        counts = {
+            s: 0 for s in
+            ['match', 'mismatch', 'missing_in_odoo', 'missing_in_afip']
+        }
         for line in all_lines:
             if line.state in counts:
                 counts[line.state] += 1
 
         return {
             'type': 'ir.actions.act_window',
-            'name': _('Cruce %s — %s') % (self.detected_format, self.period or ''),
+            'name': _('Cruce %s — %s') % (
+                self.detected_format, self.period or ''),
             'res_model': 'guvens.mis.comprobantes.line',
             'view_mode': 'tree,form',
             'domain': [('id', 'in', all_lines.ids)],
             'target': 'current',
             'context': {
                 'search_default_group_state': 1,
-                # Por qué: notification con resumen del cruce
                 'default_notification': _(
                     'Importadas: %d | Coinciden: %d | Difieren: %d | '
-                    'Faltan en Odoo: %d | Faltan en AFIP: %d'
+                    'Faltan en Odoo: %d | Faltan en ARCA: %d'
                 ) % (
                     len(created_lines),
                     counts['match'],
@@ -664,23 +798,20 @@ class ImportMisComprobantes(models.TransientModel):
             },
         }
 
-    def _detect_missing_in_afip(self, imported_lines, csv_format='mis_comprobantes'):
-        """Busca facturas de proveedor en Odoo del período que no están en el CSV."""
+    def _detect_missing_in_arca(self, imported_lines,
+                                csv_format='mis_comprobantes'):
+        """Busca facturas en Odoo del período que no están en el CSV de ARCA.
+
+        Por qué: la detección anterior usaba solo move_id linkage — si el matching
+        no vinculaba un move (por diferencias de formato en CUIT/nro), el move
+        aparecía como 'Falta en ARCA' aunque sí estuviese en el CSV.
+        Ahora cross-chequeamos por contenido: (CUIT, document_number).
+        """
         if not self.period:
             return
 
-        try:
-            month, year = self.period.split('/')
-            date_from = datetime.strptime(
-                '01/%s/%s' % (month, year), '%d/%m/%Y').date()
-            if int(month) == 12:
-                date_to = datetime.strptime(
-                    '01/01/%s' % (int(year) + 1), '%d/%m/%Y').date()
-            else:
-                date_to = datetime.strptime(
-                    '01/%s/%s' % (str(int(month) + 1).zfill(2), year),
-                    '%d/%m/%Y').date()
-        except (ValueError, AttributeError):
+        date_from, date_to = self._parse_period_range(self.period)
+        if not date_from:
             return
 
         moves = self.env['account.move'].search([
@@ -691,13 +822,35 @@ class ImportMisComprobantes(models.TransientModel):
             ('company_id', '=', self.env.company.id),
         ])
 
+        # -- Cross-check por contenido: CUIT + document_number --
+        # Por qué: no depender solo del move_id linkage para evitar
+        # falsos "falta en ARCA" cuando el matching no pudo vincular
+        arca_keys = set()
+        for line in imported_lines:
+            vat = self._clean_cuit(line.partner_vat or '')
+            doc_num = self._build_document_number(
+                line.pos_number or '', line.doc_number or '')
+            if vat and doc_num:
+                arca_keys.add((vat, doc_num))
+
+        # También considerar moves ya vinculados por scoring
         matched_move_ids = set(
             imported_lines.filtered('move_id').mapped('move_id.id'))
 
         Line = self.env['guvens.mis.comprobantes.line']
         missing_data = []
         for move in moves:
+            # Verificar por move_id linkage (scoring los encontró)
             if move.id in matched_move_ids:
+                continue
+
+            # Verificar por contenido (CUIT + doc_number)
+            # Por qué: si el comprobante existe en ARCA con el mismo
+            # CUIT y número, no es "falta en ARCA" aunque el ORM
+            # no los haya podido vincular
+            move_vat = self._clean_cuit(move.partner_id.vat or '')
+            move_doc_num = move.l10n_latam_document_number or ''
+            if (move_vat, move_doc_num) in arca_keys:
                 continue
 
             doc_num = move.l10n_latam_document_number or ''

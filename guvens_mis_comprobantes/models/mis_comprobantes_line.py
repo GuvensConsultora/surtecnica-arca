@@ -4,7 +4,7 @@ from odoo import models, fields, api
 
 class MisComprobantesLine(models.Model):
     _name = 'guvens.mis.comprobantes.line'
-    _description = 'Línea de comprobante importado de AFIP'
+    _description = 'Línea de comprobante importado de ARCA'
     _order = 'date desc, partner_name'
     # Por qué: valida que move_id pertenezca a la misma company que la línea
     _check_company_auto = True
@@ -28,18 +28,18 @@ class MisComprobantesLine(models.Model):
         ('portal_iva', 'Portal IVA'),
     ], string='Origen', default='mis_comprobantes')
 
-    # -- Datos del CSV de AFIP --
+    # -- Datos del CSV de ARCA --
     date = fields.Date(string='Fecha emisión')
     doc_type = fields.Char(string='Tipo comprobante')
-    # Por qué: código numérico AFIP (1=FA-A, 3=NC-A, 6=FA-B, 11=FA-C, etc.)
+    # Por qué: código numérico ARCA (1=FA-A, 3=NC-A, 6=FA-B, 11=FA-C, etc.)
     # Solo se llena desde Portal IVA; Mis Comprobantes usa texto libre en doc_type
-    afip_code = fields.Char(string='Cód. AFIP')
+    afip_code = fields.Char(string='Cód. ARCA')
     pos_number = fields.Char(string='Punto de venta')
     doc_number = fields.Char(string='Número')
     cae = fields.Char(string='CAE')
     partner_vat = fields.Char(string='CUIT emisor')
     partner_name = fields.Char(string='Denominación emisor')
-    amount_total = fields.Float(string='Total AFIP', digits=(16, 2))
+    amount_total = fields.Float(string='Total ARCA', digits=(16, 2))
     amount_net = fields.Float(string='Neto gravado', digits=(16, 2))
     amount_exempt = fields.Float(string='Exento', digits=(16, 2))
     amount_untaxed = fields.Float(string='No gravado', digits=(16, 2))
@@ -79,7 +79,7 @@ class MisComprobantesLine(models.Model):
         ('match', 'Coincide'),
         ('mismatch', 'Diferencia importe'),
         ('missing_in_odoo', 'Falta en Odoo'),
-        ('missing_in_afip', 'Falta en AFIP'),
+        ('missing_in_afip', 'Falta en ARCA'),
     ], string='Estado', default='missing_in_odoo')
 
     move_id = fields.Many2one(
@@ -90,11 +90,11 @@ class MisComprobantesLine(models.Model):
     )
 
     # Por qué: score 0-100 indica la confianza del cruce por aproximación
-    # 100 = match exacto (CUIT + nro + fecha + importe)
+    # 100 = match exacto (CUIT + PV + nro + fecha + importe)
     # <100 = match parcial, el usuario decide si corresponde
     match_score = fields.Integer(
         string='Confianza %',
-        help='0-100: indica qué tan probable es que el registro AFIP '
+        help='0-100: indica qué tan probable es que el registro ARCA '
              'corresponda a la factura Odoo vinculada',
     )
     # Por qué: detalle legible de qué criterios matchearon y cuáles no
@@ -107,18 +107,18 @@ class MisComprobantesLine(models.Model):
         string='Comprobante',
         compute='_compute_display_fields',
     )
-    # Por qué: mostrar el total de Odoo al lado del total AFIP para comparar
+    # Por qué: mostrar el total de Odoo al lado del total ARCA para comparar
     odoo_amount_total = fields.Float(
         string='Total Odoo',
         compute='_compute_display_fields',
         digits=(16, 2),
     )
-    # Por qué: mostrar fecha Odoo al lado de fecha AFIP
+    # Por qué: mostrar fecha Odoo al lado de fecha ARCA
     odoo_date = fields.Date(
         string='Fecha Odoo',
         compute='_compute_display_fields',
     )
-    # Por qué: mostrar nombre del proveedor en Odoo para comparar con AFIP
+    # Por qué: mostrar nombre del proveedor en Odoo para comparar con ARCA
     odoo_partner_name = fields.Char(
         string='Proveedor Odoo',
         compute='_compute_display_fields',
