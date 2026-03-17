@@ -110,6 +110,25 @@ class ImportMisComprobantes(models.TransientModel):
             return False
         return '%s-%s' % (pos_clean.zfill(5), num_clean.zfill(8))
 
+    def _normalize_document_number(self, doc_number):
+        """Normaliza l10n_latam_document_number a formato 00001-00000123.
+        Por qué: Odoo puede almacenar el PV con 4 o 5 dígitos según cómo
+        se cargó la factura (manual vs electrónica). Sin normalizar,
+        0001-00000020 ≠ 00001-00000020 y el matching falla en ambas
+        direcciones, causando que el mismo comprobante aparezca como
+        'falta en ARCA' y 'falta en Odoo' simultáneamente.
+        """
+        if not doc_number:
+            return False
+        parts = doc_number.strip().split('-')
+        if len(parts) != 2:
+            return doc_number
+        pos_clean = re.sub(r'[^0-9]', '', parts[0])
+        num_clean = re.sub(r'[^0-9]', '', parts[1])
+        if not pos_clean or not num_clean:
+            return doc_number
+        return '%s-%s' % (pos_clean.zfill(5), num_clean.zfill(8))
+
     def _clean_cuit(self, cuit):
         """Extrae solo dígitos del CUIT."""
         return re.sub(r'[^0-9]', '', cuit or '')
@@ -210,9 +229,11 @@ class ImportMisComprobantes(models.TransientModel):
         index = {}
         for move in moves:
             vat = self._clean_cuit(move.partner_id.vat or '')
-            doc_num = move.l10n_latam_document_number or ''
+            doc_num = self._normalize_document_number(
+                move.l10n_latam_document_number or '')
             if vat and doc_num:
-                # Por qué: normalizamos el CUIT a solo dígitos para matching
+                # Por qué: normalizamos CUIT a dígitos y doc_number a 5+8
+                # para que 0001-00000020 == 00001-00000020
                 index[(vat, doc_num)] = move
         return index, moves
 
@@ -323,7 +344,8 @@ class ImportMisComprobantes(models.TransientModel):
             details.append('CUIT dif')
 
         # -- Nro comprobante (30 pts) --
-        odoo_doc_num = move.l10n_latam_document_number or ''
+        odoo_doc_num = self._normalize_document_number(
+            move.l10n_latam_document_number or '')
         if doc_number and odoo_doc_num and doc_number == odoo_doc_num:
             score += 30
             details.append('Nro OK')
@@ -849,7 +871,8 @@ class ImportMisComprobantes(models.TransientModel):
             # CUIT y número, no es "falta en ARCA" aunque el ORM
             # no los haya podido vincular
             move_vat = self._clean_cuit(move.partner_id.vat or '')
-            move_doc_num = move.l10n_latam_document_number or ''
+            move_doc_num = self._normalize_document_number(
+                move.l10n_latam_document_number or '')
             if (move_vat, move_doc_num) in arca_keys:
                 continue
 
