@@ -423,18 +423,24 @@ class ImportMisComprobantes(models.TransientModel):
         # formatos con/sin guiones en partner.vat
         partner_ids = self._find_partners_by_vat(partner_vat).ids
 
-        # -- Fase 1: CUIT + nro comprobante exacto (sin filtro de período) --
-        # Por qué: el comprobante puede estar en otro mes por fecha de carga
+        # -- Fase 1: CUIT + nro comprobante (sin filtro de período) --
+        # Por qué: el comprobante puede estar en otro mes por fecha de carga.
+        # No usamos '=' en l10n_latam_document_number porque la DB puede
+        # tener formato distinto (0001-xxx vs 00001-xxx). Buscamos por
+        # partner y comparamos doc_number normalizado en Python.
         if partner_ids and doc_number:
             domain_exact = [
                 ('move_type', '=', move_type),
                 ('state', '=', 'posted'),
                 ('company_id', '=', company_id),
                 ('partner_id', 'in', partner_ids),
-                ('l10n_latam_document_number', '=', doc_number),
             ]
 
-            for move in Move.search(domain_exact, limit=5):
+            for move in Move.search(domain_exact, limit=20):
+                norm = self._normalize_document_number(
+                    move.l10n_latam_document_number or '')
+                if norm != doc_number:
+                    continue
                 sc, det = self._score_move(
                     move, partner_vat, doc_number, date, amount_total)
                 if sc > best_score:
