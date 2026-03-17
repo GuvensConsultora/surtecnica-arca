@@ -18,7 +18,7 @@
     'website': '',
     # Por qué: l10n_ar provee CUIT, tipos de comprobante AFIP, códigos de moneda
     # y toda la estructura fiscal argentina necesaria para el Libro IVA Digital
-    'depends': ['account', 'l10n_ar'],
+    'depends': ['account', 'l10n_ar', 'account_payment_group'],
     'data': [
         'security/ir.model.access.csv',
         'wizard/libro_iva_digital_wizard_views.xml',
