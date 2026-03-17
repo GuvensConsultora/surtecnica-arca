@@ -147,11 +147,18 @@ class MisComprobantesLine(models.Model):
             rec.display_comprobante = '%s %s-%s' % (label, pos, num)
 
             if rec.move_id:
-                rec.odoo_amount_total = abs(rec.move_id.amount_total)
-                rec.odoo_date = rec.move_id.invoice_date
-                rec.odoo_partner_name = rec.move_id.partner_id.name or ''
-                rec.odoo_partner_vat = rec.move_id.partner_id.vat or ''
-                rec.diff_amount = abs(rec.move_id.amount_total) - rec.amount_total
+                # Por qué: CSV de ARCA siempre en pesos → comparar en ARS
+                # amount_total_signed está en moneda compañía (ARS)
+                move = rec.move_id
+                if move.currency_id == move.company_currency_id:
+                    odoo_ars = abs(move.amount_total)
+                else:
+                    odoo_ars = abs(move.amount_total_signed)
+                rec.odoo_amount_total = odoo_ars
+                rec.odoo_date = move.invoice_date
+                rec.odoo_partner_name = move.partner_id.name or ''
+                rec.odoo_partner_vat = move.partner_id.vat or ''
+                rec.diff_amount = odoo_ars - rec.amount_total
             else:
                 rec.odoo_amount_total = 0.0
                 rec.odoo_date = False

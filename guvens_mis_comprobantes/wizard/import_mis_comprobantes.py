@@ -130,8 +130,18 @@ class ImportMisComprobantes(models.TransientModel):
         return '%s-%s' % (pos_clean.zfill(5), num_clean.zfill(8))
 
     def _clean_cuit(self, cuit):
-        """Extrae solo dígitos del CUIT."""
-        return re.sub(r'[^0-9]', '', cuit or '')
+        """Extrae solo dígitos del CUIT, removiendo prefijo país si existe.
+        Por qué: Odoo puede almacenar 'AR20123456789' (con prefijo país).
+        Sin limpiar, queda '2020123456789' (13 dígitos) vs '20123456789'
+        (11 dígitos) del CSV → nunca matchea.
+        """
+        digits = re.sub(r'[^0-9]', '', cuit or '')
+        # Por qué: CUIT argentino es siempre 11 dígitos.
+        # Si tiene más, probablemente tiene prefijo país (AR=2 letras removed,
+        # pero podrían quedar dígitos extra por otros prefijos)
+        if len(digits) > 11:
+            digits = digits[-11:]
+        return digits
 
     # -------------------------------------------------------------------------
     # Auto-detección de formato y período
@@ -213,17 +223,27 @@ class ImportMisComprobantes(models.TransientModel):
     # Matching determinístico + scoring
     # -------------------------------------------------------------------------
 
+    def _get_amount_in_ars(self, move):
+        """Obtiene el total del move en ARS (pesos).
+        Por qué: el CSV de ARCA siempre viene en pesos, pero move.amount_total
+        está en la moneda de la factura. Si es USD, hay que convertir a ARS
+        para que la comparación de importes sea correcta.
+        """
+        if move.currency_id == move.company_currency_id:
+            return abs(move.amount_total)
+        # Por qué: amount_total_signed está en moneda de la compañía (ARS)
+        return abs(move.amount_total_signed)
+
     def _build_move_indexes(self, date_from, date_to):
         """Construye índices de facturas Odoo del período para matching.
 
         Retorna 3 índices sobre el mismo set de moves:
-        - by_key: (CUIT, doc_number) → move  (match exacto)
+        - by_key: (move_type, CUIT, doc_number) → move  (match exacto)
         - by_cuit: CUIT → [moves]  (para buscar por CUIT primero)
         - by_doc: doc_number → [moves]  (para buscar por nro comprobante)
 
-        Por qué: separar en 3 índices permite matching escalonado:
-        1ro CUIT+doc, 2do solo CUIT, 3ro solo doc_number.
-        Todo dentro del período bajo análisis.
+        Por qué: incluir move_type en by_key evita que FA-A 00001-00000020
+        colisione con NC-A 00001-00000020 (son comprobantes distintos).
         """
         moves = self.env['account.move'].search([
             ('move_type', 'in', ['in_invoice', 'in_refund']),
@@ -241,7 +261,8 @@ class ImportMisComprobantes(models.TransientModel):
             doc_num = self._normalize_document_number(
                 move.l10n_latam_document_number or '')
             if vat and doc_num:
-                by_key[(vat, doc_num)] = move
+                # Por qué: clave incluye move_type para separar FA de NC
+                by_key[(move.move_type, vat, doc_num)] = move
             if vat:
                 by_cuit.setdefault(vat, []).append(move)
             if doc_num:
@@ -253,10 +274,15 @@ class ImportMisComprobantes(models.TransientModel):
         """Matchea líneas importadas contra facturas de Odoo.
 
         Estrategia escalonada, siempre dentro del período:
-        1. CUIT + doc_number exacto → match determinístico
-        2. Solo CUIT → buscar mejor doc_number por scoring
-        3. Solo doc_number → buscar mejor CUIT por scoring
+        1. CUIT + move_type + doc_number exacto → match determinístico
+        2. Solo CUIT → buscar mejor candidato por scoring
+        3. Solo doc_number → buscar por nro comprobante
         4. Sin match en período → missing_in_odoo
+
+        Por qué: se procesan en 2 pasadas — primero las que tienen match
+        determinístico (Fase 1), luego las que necesitan scoring.
+        Esto evita que un match débil "robe" un move a un match fuerte
+        que viene después en el CSV.
         """
         if not self.period:
             for line in lines_data:
@@ -282,21 +308,26 @@ class ImportMisComprobantes(models.TransientModel):
         # Construir índices del período
         by_key, by_cuit, by_doc, _all = self._build_move_indexes(
             date_from, date_to)
-        # Por qué: rastrear moves ya asignados para no duplicar matching
         used_move_ids = set()
 
+        # -- Pasada 1: matches determinísticos (CUIT + move_type + doc) --
+        # Por qué: procesar primero los seguros para que no los consuma
+        # el scoring en la pasada 2
+        pending = []
         for line in lines_data:
             vat = self._clean_cuit(line.get('partner_vat', ''))
             pos = (line.get('pos_number') or '').strip()
             num = (line.get('doc_number') or '').strip()
             doc_number = self._build_document_number(pos, num)
+            move_type = line.get('_move_type', 'in_invoice')
             amount = line.get('amount_total', 0.0)
             date = line.get('date')
 
-            # -- Fase 1: CUIT + doc_number exacto --
-            # Por qué: clave primaria fiscal argentina, match sin dudas
+            # Fase 1: clave completa (move_type, CUIT, doc_number)
             move = by_key.get(
-                (vat, doc_number)) if vat and doc_number else None
+                (move_type, vat, doc_number)
+            ) if vat and doc_number else None
+
             if move and move.id not in used_move_ids:
                 score, detail = self._score_move(
                     move, vat, doc_number, date, amount)
@@ -308,15 +339,19 @@ class ImportMisComprobantes(models.TransientModel):
                     'state': state,
                 })
                 used_move_ids.add(move.id)
-                continue
+            else:
+                # Guardar para pasada 2 con datos pre-calculados
+                pending.append(
+                    (line, vat, doc_number, move_type, amount, date))
 
-            # -- Fase 2: solo CUIT → buscar mejor doc_number por scoring --
-            # Por qué: mismo proveedor en el período, puede haber diferencia
-            # en PV/nro por carga manual o formato distinto
+        # -- Pasada 2: scoring para las que no matchearon en pasada 1 --
+        for line, vat, doc_number, move_type, amount, date in pending:
+
             best_move = None
             best_score = 0
             best_detail = ''
 
+            # Fase 2: solo CUIT → buscar mejor candidato del mismo proveedor
             if vat and vat in by_cuit:
                 for m in by_cuit[vat]:
                     if m.id in used_move_ids:
@@ -326,9 +361,7 @@ class ImportMisComprobantes(models.TransientModel):
                     if sc > best_score:
                         best_score, best_detail, best_move = sc, det, m
 
-            # -- Fase 3: solo doc_number → buscar por nro comprobante --
-            # Por qué: CUIT puede estar mal cargado en Odoo pero el nro
-            # de comprobante es correcto
+            # Fase 3: solo doc_number → CUIT puede estar mal en Odoo
             if best_score < 60 and doc_number and doc_number in by_doc:
                 for m in by_doc[doc_number]:
                     if m.id in used_move_ids:
@@ -338,7 +371,6 @@ class ImportMisComprobantes(models.TransientModel):
                     if sc > best_score:
                         best_score, best_detail, best_move = sc, det, m
 
-            # Asignar resultado
             if best_move and best_score >= 40:
                 state = self._score_to_state(best_score, best_move)
                 line.update({
@@ -357,9 +389,12 @@ class ImportMisComprobantes(models.TransientModel):
                 })
 
     def _amount_state(self, move, arca_amount):
-        """Determina estado por diferencia de importe."""
-        odoo_amount = abs(move.amount_total)
-        if abs(odoo_amount - abs(arca_amount)) <= 0.01:
+        """Determina estado por diferencia de importe (en ARS).
+        Por qué: el CSV siempre viene en pesos, hay que comparar en la
+        misma moneda para que facturas en USD no den mismatch falso.
+        """
+        odoo_ars = self._get_amount_in_ars(move)
+        if abs(odoo_ars - abs(arca_amount)) <= 0.01:
             return 'match'
         return 'mismatch'
 
@@ -404,8 +439,9 @@ class ImportMisComprobantes(models.TransientModel):
             else:
                 details.append('Fecha dif %dd' % delta)
 
-        # -- Importe (20 pts exacto, 15 pts ±1%, 10 pts ±5%) --
-        odoo_total = abs(move.amount_total)
+        # -- Importe en ARS (20 pts exacto, 15 pts ±1%, 10 pts ±5%) --
+        # Por qué: CSV siempre en pesos, move puede ser USD → convertir
+        odoo_total = self._get_amount_in_ars(move)
         arca_total = abs(amount_total)
         if arca_total > 0:
             diff_abs = abs(odoo_total - arca_total)
@@ -802,16 +838,25 @@ class ImportMisComprobantes(models.TransientModel):
             ('company_id', '=', self.env.company.id),
         ])
 
-        # -- Cross-check por contenido: CUIT + document_number --
-        # Por qué: no depender solo del move_id linkage para evitar
-        # falsos "falta en ARCA" cuando el matching no pudo vincular
+        # -- Cross-check por contenido: move_type + CUIT + doc_number --
+        # Por qué: incluir move_type evita que FA-A 00001-20 en ARCA
+        # oculte una NC-A 00001-20 de Odoo que realmente falta en ARCA
         arca_keys = set()
         for line in imported_lines:
             vat = self._clean_cuit(line.partner_vat or '')
             doc_num = self._build_document_number(
                 line.pos_number or '', line.doc_number or '')
+            # Por qué: determinar move_type desde el estado del line
+            # Si viene de CSV, usar afip_code/doc_type para inferirlo
+            afip_code = line.afip_code or ''
+            doc_type_norm = self._normalize_doc_type(line.doc_type or '')
+            if afip_code:
+                mt = ('in_refund' if afip_code in AFIP_CODE_REFUND
+                      else 'in_invoice')
+            else:
+                mt = AFIP_MOVE_TYPE_MAP.get(doc_type_norm, 'in_invoice')
             if vat and doc_num:
-                arca_keys.add((vat, doc_num))
+                arca_keys.add((mt, vat, doc_num))
 
         # También considerar moves ya vinculados por scoring
         matched_move_ids = set(
@@ -824,14 +869,11 @@ class ImportMisComprobantes(models.TransientModel):
             if move.id in matched_move_ids:
                 continue
 
-            # Verificar por contenido (CUIT + doc_number)
-            # Por qué: si el comprobante existe en ARCA con el mismo
-            # CUIT y número, no es "falta en ARCA" aunque el ORM
-            # no los haya podido vincular
+            # Verificar por contenido (move_type + CUIT + doc_number)
             move_vat = self._clean_cuit(move.partner_id.vat or '')
             move_doc_num = self._normalize_document_number(
                 move.l10n_latam_document_number or '')
-            if (move_vat, move_doc_num) in arca_keys:
+            if (move.move_type, move_vat, move_doc_num) in arca_keys:
                 continue
 
             doc_num = move.l10n_latam_document_number or ''
