@@ -786,6 +786,18 @@ class ImportMisComprobantes(models.TransientModel):
 
         Line = self.env['guvens.mis.comprobantes.line']
 
+        # -- Eliminar líneas previas del mismo período y empresa --
+        # Por qué: si el usuario reimporta el mismo período, las líneas
+        # anteriores quedan obsoletas. Sin esto, se duplican los registros
+        # y el cruce muestra resultados incorrectos.
+        if self.period:
+            old_lines = Line.search([
+                ('period', '=', self.period),
+                ('company_id', '=', self.env.company.id),
+            ])
+            if old_lines:
+                old_lines.unlink()
+
         # -- Crear líneas importadas --
         created_lines = Line.create(lines_data)
 
@@ -794,9 +806,10 @@ class ImportMisComprobantes(models.TransientModel):
             self._detect_missing_in_arca(created_lines, csv_format)
 
         # -- Recargar líneas del período --
+        # Por qué: tras borrar las previas y crear las nuevas + missing_in_arca,
+        # basta filtrar por período y empresa (no por import_date)
         all_lines = Line.search([
             ('period', '=', self.period),
-            ('import_date', '=', fields.Date.context_today(self)),
             ('company_id', '=', self.env.company.id),
         ])
 
