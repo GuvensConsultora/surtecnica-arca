@@ -4,7 +4,7 @@ import csv
 import io
 import re
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from odoo import models, fields, _
 from odoo.exceptions import UserError
@@ -213,10 +213,17 @@ class ImportMisComprobantes(models.TransientModel):
     # Matching determinístico + scoring
     # -------------------------------------------------------------------------
 
-    def _build_move_index(self, date_from, date_to):
-        """Construye índice de facturas Odoo del período por (CUIT, doc_number).
-        Por qué: la clave primaria de coincidencia es CUIT + PV + Nro comprobante.
-        Este índice permite matching O(1) en vez de queries N+1.
+    def _build_move_indexes(self, date_from, date_to):
+        """Construye índices de facturas Odoo del período para matching.
+
+        Retorna 3 índices sobre el mismo set de moves:
+        - by_key: (CUIT, doc_number) → move  (match exacto)
+        - by_cuit: CUIT → [moves]  (para buscar por CUIT primero)
+        - by_doc: doc_number → [moves]  (para buscar por nro comprobante)
+
+        Por qué: separar en 3 índices permite matching escalonado:
+        1ro CUIT+doc, 2do solo CUIT, 3ro solo doc_number.
+        Todo dentro del período bajo análisis.
         """
         moves = self.env['account.move'].search([
             ('move_type', 'in', ['in_invoice', 'in_refund']),
@@ -226,24 +233,30 @@ class ImportMisComprobantes(models.TransientModel):
             ('company_id', '=', self.env.company.id),
         ])
 
-        index = {}
+        by_key = {}
+        by_cuit = {}
+        by_doc = {}
         for move in moves:
             vat = self._clean_cuit(move.partner_id.vat or '')
             doc_num = self._normalize_document_number(
                 move.l10n_latam_document_number or '')
             if vat and doc_num:
-                # Por qué: normalizamos CUIT a dígitos y doc_number a 5+8
-                # para que 0001-00000020 == 00001-00000020
-                index[(vat, doc_num)] = move
-        return index, moves
+                by_key[(vat, doc_num)] = move
+            if vat:
+                by_cuit.setdefault(vat, []).append(move)
+            if doc_num:
+                by_doc.setdefault(doc_num, []).append(move)
+
+        return by_key, by_cuit, by_doc, moves
 
     def _match_lines(self, lines_data):
         """Matchea líneas importadas contra facturas de Odoo.
 
-        Estrategia:
-        1. Matching determinístico por CUIT + PV + Nro (clave primaria fiscal)
-        2. Si no encuentra, fallback a scoring por aproximación
-        3. Estado basado en coincidencia de importe cuando hay match por clave
+        Estrategia escalonada, siempre dentro del período:
+        1. CUIT + doc_number exacto → match determinístico
+        2. Solo CUIT → buscar mejor doc_number por scoring
+        3. Solo doc_number → buscar mejor CUIT por scoring
+        4. Sin match en período → missing_in_odoo
         """
         if not self.period:
             for line in lines_data:
@@ -266,8 +279,11 @@ class ImportMisComprobantes(models.TransientModel):
                 })
             return
 
-        # Construir índice de moves Odoo del período
-        move_index, _all_moves = self._build_move_index(date_from, date_to)
+        # Construir índices del período
+        by_key, by_cuit, by_doc, _all = self._build_move_indexes(
+            date_from, date_to)
+        # Por qué: rastrear moves ya asignados para no duplicar matching
+        used_move_ids = set()
 
         for line in lines_data:
             vat = self._clean_cuit(line.get('partner_vat', ''))
@@ -277,51 +293,75 @@ class ImportMisComprobantes(models.TransientModel):
             amount = line.get('amount_total', 0.0)
             date = line.get('date')
 
-            # -- Fase 1: matching determinístico por CUIT + PV + Nro --
-            # Por qué: es la clave primaria del comprobante fiscal argentino.
-            # Si CUIT + PV + Nro coinciden, es el mismo documento sin dudas.
-            move = move_index.get(
+            # -- Fase 1: CUIT + doc_number exacto --
+            # Por qué: clave primaria fiscal argentina, match sin dudas
+            move = by_key.get(
                 (vat, doc_number)) if vat and doc_number else None
-
-            if move:
+            if move and move.id not in used_move_ids:
                 score, detail = self._score_move(
                     move, vat, doc_number, date, amount)
-                # Por qué: el estado depende de la diferencia de importe.
-                # Si CUIT+PV+Nro matchean pero el importe difiere → mismatch
-                odoo_amount = abs(move.amount_total)
-                arca_amount = abs(amount)
-                if abs(odoo_amount - arca_amount) <= 0.01:
-                    state = 'match'
-                else:
-                    state = 'mismatch'
-
+                state = self._amount_state(move, amount)
                 line.update({
                     'move_id': move.id,
                     'match_score': score,
                     'match_detail': detail,
                     'state': state,
                 })
+                used_move_ids.add(move.id)
                 continue
 
-            # -- Fase 2: fallback a scoring por aproximación --
-            # Por qué: si la clave primaria no matchea (error de tipeo, PV
-            # distinto, CUIT mal cargado), buscar por criterios más flexibles
-            move_type = line.get('_move_type', 'in_invoice')
-            afip_code = line.get('afip_code', '')
-            afip_tipo = line.get('doc_type', '')
+            # -- Fase 2: solo CUIT → buscar mejor doc_number por scoring --
+            # Por qué: mismo proveedor en el período, puede haber diferencia
+            # en PV/nro por carga manual o formato distinto
+            best_move = None
+            best_score = 0
+            best_detail = ''
 
-            best_move, score, detail = self._find_best_match(
-                vat, doc_number, date, amount,
-                move_type=move_type, afip_code=afip_code, afip_tipo=afip_tipo,
-            )
-            state = self._score_to_state(score, best_move)
+            if vat and vat in by_cuit:
+                for m in by_cuit[vat]:
+                    if m.id in used_move_ids:
+                        continue
+                    sc, det = self._score_move(
+                        m, vat, doc_number, date, amount)
+                    if sc > best_score:
+                        best_score, best_detail, best_move = sc, det, m
 
-            line.update({
-                'move_id': best_move.id if best_move else False,
-                'match_score': score,
-                'match_detail': detail,
-                'state': state,
-            })
+            # -- Fase 3: solo doc_number → buscar por nro comprobante --
+            # Por qué: CUIT puede estar mal cargado en Odoo pero el nro
+            # de comprobante es correcto
+            if best_score < 60 and doc_number and doc_number in by_doc:
+                for m in by_doc[doc_number]:
+                    if m.id in used_move_ids:
+                        continue
+                    sc, det = self._score_move(
+                        m, vat, doc_number, date, amount)
+                    if sc > best_score:
+                        best_score, best_detail, best_move = sc, det, m
+
+            # Asignar resultado
+            if best_move and best_score >= 40:
+                state = self._score_to_state(best_score, best_move)
+                line.update({
+                    'move_id': best_move.id,
+                    'match_score': best_score,
+                    'match_detail': best_detail,
+                    'state': state,
+                })
+                used_move_ids.add(best_move.id)
+            else:
+                line.update({
+                    'move_id': False,
+                    'match_score': 0,
+                    'match_detail': 'Sin coincidencia en período',
+                    'state': 'missing_in_odoo',
+                })
+
+    def _amount_state(self, move, arca_amount):
+        """Determina estado por diferencia de importe."""
+        odoo_amount = abs(move.amount_total)
+        if abs(odoo_amount - abs(arca_amount)) <= 0.01:
+            return 'match'
+        return 'mismatch'
 
     def _score_move(self, move, partner_vat, doc_number, date, amount_total):
         """Calcula score 0-100 de correspondencia entre línea ARCA y factura Odoo.
@@ -387,115 +427,6 @@ class ImportMisComprobantes(models.TransientModel):
 
         return score, ' | '.join(details)
 
-    def _find_partners_by_vat(self, vat_digits):
-        """Busca partners cuyo CUIT (limpio de guiones) coincida.
-        Por qué: partner.vat puede almacenarse con guiones (20-12345678-9)
-        o sin ellos (20123456789). Buscar con '=' falla si el formato
-        no coincide. Usamos LIKE para encontrar ambos formatos.
-        """
-        if not vat_digits:
-            return self.env['res.partner']
-        # Por qué: construir patrón LIKE que matchee con o sin guiones
-        # 20123456789 → '%20%12345678%9%' matchea '20-12345678-9' y '20123456789'
-        if len(vat_digits) == 11:
-            pattern = '%{}%{}%{}%'.format(
-                vat_digits[:2], vat_digits[2:10], vat_digits[10:])
-        else:
-            pattern = '%{}%'.format(vat_digits)
-        return self.env['res.partner'].search([('vat', 'like', pattern)])
-
-    def _find_best_match(self, partner_vat, doc_number, date, amount_total,
-                         move_type='in_invoice', afip_code=False,
-                         afip_tipo=False):
-        """Busca la mejor factura candidata en Odoo por scoring (fallback).
-
-        Por qué: se usa solo cuando el matching determinístico por
-        CUIT + PV + Nro no encontró coincidencia en el período.
-        Busca sin restricción de período como último recurso.
-        """
-        Move = self.env['account.move']
-        best_move = Move
-        best_score = 0
-        best_detail = ''
-        company_id = self.env.company.id
-
-        # Por qué: buscar partners por CUIT normalizado para cubrir
-        # formatos con/sin guiones en partner.vat
-        partner_ids = self._find_partners_by_vat(partner_vat).ids
-
-        # -- Fase 1: CUIT + nro comprobante (sin filtro de período) --
-        # Por qué: el comprobante puede estar en otro mes por fecha de carga.
-        # No usamos '=' en l10n_latam_document_number porque la DB puede
-        # tener formato distinto (0001-xxx vs 00001-xxx). Buscamos por
-        # partner y comparamos doc_number normalizado en Python.
-        if partner_ids and doc_number:
-            domain_exact = [
-                ('move_type', '=', move_type),
-                ('state', '=', 'posted'),
-                ('company_id', '=', company_id),
-                ('partner_id', 'in', partner_ids),
-            ]
-
-            for move in Move.search(domain_exact, limit=20):
-                norm = self._normalize_document_number(
-                    move.l10n_latam_document_number or '')
-                if norm != doc_number:
-                    continue
-                sc, det = self._score_move(
-                    move, partner_vat, doc_number, date, amount_total)
-                if sc > best_score:
-                    best_score, best_detail, best_move = sc, det, move
-
-        if best_score >= 60:
-            return best_move, best_score, best_detail
-
-        # -- Fase 2: CUIT + fecha cercana (sin exigir nro exacto) --
-        # Por qué: mismo proveedor, puede haber diferencia en PV/nro
-        # por carga manual o prefijo distinto
-        if partner_ids:
-            domain_cuit = [
-                ('move_type', '=', move_type),
-                ('state', '=', 'posted'),
-                ('company_id', '=', company_id),
-                ('partner_id', 'in', partner_ids),
-            ]
-            if date:
-                domain_cuit += [
-                    ('invoice_date', '>=', date - timedelta(days=30)),
-                    ('invoice_date', '<=', date + timedelta(days=30)),
-                ]
-
-            for move in Move.search(domain_cuit, limit=15):
-                sc, det = self._score_move(
-                    move, partner_vat, doc_number, date, amount_total)
-                if sc > best_score:
-                    best_score, best_detail, best_move = sc, det, move
-
-        if best_score >= 60:
-            return best_move, best_score, best_detail
-
-        # -- Fase 3: sin CUIT — importe + fecha (último recurso) --
-        # Por qué: si el CUIT no está o no matchea nada, buscar por
-        # importe cercano + fecha como indicador débil
-        if date and amount_total:
-            afip_abs = abs(amount_total)
-            tolerance = max(afip_abs * 0.05, 1.0)
-            domain_amount = [
-                ('move_type', '=', move_type),
-                ('state', '=', 'posted'),
-                ('company_id', '=', company_id),
-                ('invoice_date', '>=', date - timedelta(days=15)),
-                ('invoice_date', '<=', date + timedelta(days=15)),
-            ]
-            for move in Move.search(domain_amount, limit=20):
-                if abs(abs(move.amount_total) - afip_abs) > tolerance:
-                    continue
-                sc, det = self._score_move(
-                    move, partner_vat, doc_number, date, amount_total)
-                if sc > best_score:
-                    best_score, best_detail, best_move = sc, det, move
-
-        return best_move, best_score, best_detail
 
     def _score_to_state(self, score, move):
         """Convierte score a estado del cruce."""
