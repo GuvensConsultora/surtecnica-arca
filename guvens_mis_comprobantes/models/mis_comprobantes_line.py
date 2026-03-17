@@ -123,6 +123,12 @@ class MisComprobantesLine(models.Model):
         string='Proveedor Odoo',
         compute='_compute_display_fields',
     )
+    # Por qué: mostrar CUIT de Odoo al lado del CUIT ARCA para detectar
+    # diferencias de formato o CUIT mal cargados
+    odoo_partner_vat = fields.Char(
+        string='CUIT Odoo',
+        compute='_compute_display_fields',
+    )
     diff_amount = fields.Float(
         string='Diferencia $',
         compute='_compute_display_fields',
@@ -144,11 +150,13 @@ class MisComprobantesLine(models.Model):
                 rec.odoo_amount_total = abs(rec.move_id.amount_total)
                 rec.odoo_date = rec.move_id.invoice_date
                 rec.odoo_partner_name = rec.move_id.partner_id.name or ''
+                rec.odoo_partner_vat = rec.move_id.partner_id.vat or ''
                 rec.diff_amount = abs(rec.move_id.amount_total) - rec.amount_total
             else:
                 rec.odoo_amount_total = 0.0
                 rec.odoo_date = False
                 rec.odoo_partner_name = ''
+                rec.odoo_partner_vat = ''
                 rec.diff_amount = 0.0
 
     def action_open_move(self):

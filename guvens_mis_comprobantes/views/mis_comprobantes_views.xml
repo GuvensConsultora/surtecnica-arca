@@ -44,6 +44,7 @@
                 <field name="move_id" string="Factura Odoo" optional="show"/>
                 <field name="odoo_date" string="Fecha Odoo" optional="hide"/>
                 <field name="odoo_partner_name" string="Proveedor Odoo" optional="hide"/>
+                <field name="odoo_partner_vat" string="CUIT Odoo" optional="show"/>
                 <field name="match_detail" string="Detalle scoring" optional="hide"/>
 
                 <!-- ═══ Campos secundarios ═══ -->
@@ -110,6 +111,7 @@
                                 </group>
                                 <group string="Datos Odoo">
                                     <field name="odoo_partner_name" string="Proveedor"/>
+                                    <field name="odoo_partner_vat" string="CUIT"/>
                                     <field name="move_id"/>
                                     <field name="odoo_date" string="Fecha"/>
                                     <field name="odoo_amount_total" string="Total"/>
