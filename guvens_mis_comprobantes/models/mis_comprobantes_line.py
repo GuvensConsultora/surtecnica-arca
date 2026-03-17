@@ -6,6 +6,8 @@ class MisComprobantesLine(models.Model):
     _name = 'guvens.mis.comprobantes.line'
     _description = 'Línea de comprobante importado de AFIP'
     _order = 'date desc, partner_name'
+    # Por qué: valida que move_id pertenezca a la misma company que la línea
+    _check_company_auto = True
 
     # -- Campos de importación --
     import_date = fields.Date(
@@ -84,6 +86,7 @@ class MisComprobantesLine(models.Model):
         'account.move',
         string='Factura Odoo',
         ondelete='set null',
+        check_company=True,
     )
 
     # Por qué: score 0-100 indica la confianza del cruce por aproximación

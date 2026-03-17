@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+    <!-- Por qué: record rule multicompañía estándar de Odoo.
+         Cada usuario solo ve las líneas de cruce de sus empresas permitidas.
+         Sin esta regla, un usuario de empresa A ve datos de empresa B. -->
+    <record id="rule_mis_comprobantes_line_company" model="ir.rule">
+        <field name="name">Mis Comprobantes Line: multi-company</field>
+        <field name="model_id" ref="model_guvens_mis_comprobantes_line"/>
+        <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+    </record>
+</odoo>

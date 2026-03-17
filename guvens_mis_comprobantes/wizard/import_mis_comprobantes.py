@@ -246,6 +246,8 @@ class ImportMisComprobantes(models.TransientModel):
         best_score = 0
         best_detail = ''
         from datetime import timedelta
+        # Por qué: filtrar por company para no cruzar facturas entre empresas
+        company_id = self.env.company.id
 
         # -- Fase 1: CUIT + nro comprobante exacto --
         # Por qué: arrancamos por CUIT para acotar el universo al proveedor
@@ -253,6 +255,7 @@ class ImportMisComprobantes(models.TransientModel):
             domain_exact = [
                 ('move_type', '=', move_type),
                 ('state', '=', 'posted'),
+                ('company_id', '=', company_id),
                 ('partner_id.vat', '=', partner_vat),
                 ('l10n_latam_document_number', '=', doc_number),
             ]
@@ -282,6 +285,7 @@ class ImportMisComprobantes(models.TransientModel):
             domain_cuit = [
                 ('move_type', '=', move_type),
                 ('state', '=', 'posted'),
+                ('company_id', '=', company_id),
                 ('partner_id.vat', '=', partner_vat),
             ]
             if date:
@@ -308,6 +312,7 @@ class ImportMisComprobantes(models.TransientModel):
             domain_amount = [
                 ('move_type', '=', move_type),
                 ('state', '=', 'posted'),
+                ('company_id', '=', company_id),
                 ('invoice_date', '>=', date - timedelta(days=15)),
                 ('invoice_date', '<=', date + timedelta(days=15)),
             ]
@@ -627,6 +632,7 @@ class ImportMisComprobantes(models.TransientModel):
         all_lines = Line.search([
             ('period', '=', self.period),
             ('import_date', '=', fields.Date.context_today(self)),
+            ('company_id', '=', self.env.company.id),
         ])
 
         # Resumen para notification

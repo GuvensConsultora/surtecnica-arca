@@ -291,6 +291,20 @@ NC (códigos 3, 8, 13, 203, 208, 213) → `in_refund`. El resto → `in_invoice`
 | Campos Portal IVA con `invisible` en vistas | No saturar la UI cuando se usa Mis Comprobantes |
 | Campo `source` en cada línea | Permite filtrar y agrupar por origen sin ambigüedad |
 
+### Multicompañía
+
+El módulo está preparado para despliegues multicompañía:
+
+| Mecanismo | Qué protege |
+|-----------|-------------|
+| `_check_company_auto = True` | Valida que `move_id` pertenezca a la misma empresa que la línea |
+| `check_company=True` en `move_id` | Constraint a nivel de campo |
+| `ir.rule` con `company_ids` | Cada usuario solo ve líneas de cruce de sus empresas permitidas |
+| Filtro `company_id` en matching | Las 3 fases de búsqueda solo buscan facturas de la empresa activa |
+| Filtro `company_id` en detección | `_detect_missing_in_afip()` solo busca facturas de la empresa activa |
+
+**Importante**: cada CSV de AFIP corresponde a un CUIT (empresa). Al importar, el módulo usa `self.env.company` como empresa activa. Si se opera con múltiples empresas, verificar que la empresa seleccionada en Odoo coincida con el CUIT del CSV.
+
 ### Dependencias
 
 - `account` — modelo account.move
@@ -305,3 +319,4 @@ NC (códigos 3, 8, 13, 203, 208, 213) → `in_refund`. El resto → `in_invoice`
 5. Verificar badge en factura de proveedor
 6. Verificar filtros por origen (Portal IVA / Mis Comprobantes) en vista search
 7. Verificar tabs Desglose IVA y Percepciones visibles solo en registros Portal IVA
+8. **Multicompañía**: importar CSV con empresa A seleccionada → verificar que no matchee facturas de empresa B

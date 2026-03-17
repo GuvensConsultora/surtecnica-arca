@@ -16,6 +16,7 @@
     # account provee account.move (facturas)
     'depends': ['account', 'l10n_ar'],
     'data': [
+        'security/mis_comprobantes_security.xml',
         'security/ir.model.access.csv',
         'views/wizard_views.xml',
         'views/mis_comprobantes_views.xml',
