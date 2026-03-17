@@ -157,7 +157,9 @@ class MisComprobantesLine(models.Model):
                 rec.odoo_amount_total = odoo_ars
                 rec.odoo_date = move.invoice_date
                 rec.odoo_partner_name = move.partner_id.name or ''
-                rec.odoo_partner_vat = move.partner_id.vat or ''
+                # Por qué: usar commercial_partner_id para obtener el CUIT
+                # del partner comercial, no del contacto hijo
+                rec.odoo_partner_vat = move.commercial_partner_id.vat or ''
                 rec.diff_amount = odoo_ars - rec.amount_total
             else:
                 rec.odoo_amount_total = 0.0

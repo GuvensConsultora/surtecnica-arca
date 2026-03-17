@@ -237,10 +237,11 @@ class ImportMisComprobantes(models.TransientModel):
     def _build_move_indexes(self, date_from, date_to):
         """Construye índices de facturas Odoo del período para matching.
 
-        Retorna 3 índices sobre el mismo set de moves:
+        Retorna:
         - by_key: (move_type, CUIT, doc_number) → move  (match exacto)
         - by_cuit: CUIT → [moves]  (para buscar por CUIT primero)
         - by_doc: doc_number → [moves]  (para buscar por nro comprobante)
+        - all_moves: recordset completo del período
 
         Por qué: incluir move_type en by_key evita que FA-A 00001-00000020
         colisione con NC-A 00001-00000020 (son comprobantes distintos).
@@ -257,11 +258,10 @@ class ImportMisComprobantes(models.TransientModel):
         by_cuit = {}
         by_doc = {}
         for move in moves:
-            vat = self._clean_cuit(move.partner_id.vat or '')
+            vat = self._clean_cuit(move.commercial_partner_id.vat or '')
             doc_num = self._normalize_document_number(
                 move.l10n_latam_document_number or '')
             if vat and doc_num:
-                # Por qué: clave incluye move_type para separar FA de NC
                 by_key[(move.move_type, vat, doc_num)] = move
             if vat:
                 by_cuit.setdefault(vat, []).append(move)
@@ -306,7 +306,7 @@ class ImportMisComprobantes(models.TransientModel):
             return
 
         # Construir índices del período
-        by_key, by_cuit, by_doc, _all = self._build_move_indexes(
+        by_key, by_cuit, by_doc, all_moves = self._build_move_indexes(
             date_from, date_to)
         used_move_ids = set()
 
@@ -371,6 +371,24 @@ class ImportMisComprobantes(models.TransientModel):
                     if sc > best_score:
                         best_score, best_detail, best_move = sc, det, m
 
+            # Fase 4: último recurso — buscar por importe + fecha en todos
+            # Por qué: partner sin CUIT y sin doc_number en Odoo queda
+            # invisible para fases 1-3. Buscar por proximidad de importe
+            # y fecha como indicador débil. Solo corre si nada matcheó.
+            if best_score < 40 and amount and date:
+                arca_abs = abs(amount)
+                tolerance = max(arca_abs * 0.05, 1.0)
+                for m in all_moves:
+                    if m.id in used_move_ids:
+                        continue
+                    odoo_ars = self._get_amount_in_ars(m)
+                    if abs(odoo_ars - arca_abs) > tolerance:
+                        continue
+                    sc, det = self._score_move(
+                        m, vat, doc_number, date, amount)
+                    if sc > best_score:
+                        best_score, best_detail, best_move = sc, det, m
+
             if best_move and best_score >= 40:
                 state = self._score_to_state(best_score, best_move)
                 line.update({
@@ -411,7 +429,7 @@ class ImportMisComprobantes(models.TransientModel):
         details = []
 
         # -- CUIT (30 pts) --
-        move_vat = self._clean_cuit(move.partner_id.vat or '')
+        move_vat = self._clean_cuit(move.commercial_partner_id.vat or '')
         if partner_vat and move_vat and partner_vat == move_vat:
             score += 30
             details.append('CUIT OK')
@@ -870,7 +888,7 @@ class ImportMisComprobantes(models.TransientModel):
                 continue
 
             # Verificar por contenido (move_type + CUIT + doc_number)
-            move_vat = self._clean_cuit(move.partner_id.vat or '')
+            move_vat = self._clean_cuit(move.commercial_partner_id.vat or '')
             move_doc_num = self._normalize_document_number(
                 move.l10n_latam_document_number or '')
             if (move.move_type, move_vat, move_doc_num) in arca_keys:
@@ -893,7 +911,7 @@ class ImportMisComprobantes(models.TransientModel):
                 'pos_number': pos,
                 'doc_number': number,
                 'cae': '',
-                'partner_vat': self._clean_cuit(move.partner_id.vat or ''),
+                'partner_vat': self._clean_cuit(move.commercial_partner_id.vat or ''),
                 'partner_name': move.partner_id.name or '',
                 'amount_total': abs(move.amount_total),
                 'amount_net': 0.0,
