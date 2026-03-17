@@ -387,6 +387,23 @@ class ImportMisComprobantes(models.TransientModel):
 
         return score, ' | '.join(details)
 
+    def _find_partners_by_vat(self, vat_digits):
+        """Busca partners cuyo CUIT (limpio de guiones) coincida.
+        Por qué: partner.vat puede almacenarse con guiones (20-12345678-9)
+        o sin ellos (20123456789). Buscar con '=' falla si el formato
+        no coincide. Usamos LIKE para encontrar ambos formatos.
+        """
+        if not vat_digits:
+            return self.env['res.partner']
+        # Por qué: construir patrón LIKE que matchee con o sin guiones
+        # 20123456789 → '%20%12345678%9%' matchea '20-12345678-9' y '20123456789'
+        if len(vat_digits) == 11:
+            pattern = '%{}%{}%{}%'.format(
+                vat_digits[:2], vat_digits[2:10], vat_digits[10:])
+        else:
+            pattern = '%{}%'.format(vat_digits)
+        return self.env['res.partner'].search([('vat', 'like', pattern)])
+
     def _find_best_match(self, partner_vat, doc_number, date, amount_total,
                          move_type='in_invoice', afip_code=False,
                          afip_tipo=False):
@@ -402,14 +419,18 @@ class ImportMisComprobantes(models.TransientModel):
         best_detail = ''
         company_id = self.env.company.id
 
+        # Por qué: buscar partners por CUIT normalizado para cubrir
+        # formatos con/sin guiones en partner.vat
+        partner_ids = self._find_partners_by_vat(partner_vat).ids
+
         # -- Fase 1: CUIT + nro comprobante exacto (sin filtro de período) --
         # Por qué: el comprobante puede estar en otro mes por fecha de carga
-        if partner_vat and doc_number:
+        if partner_ids and doc_number:
             domain_exact = [
                 ('move_type', '=', move_type),
                 ('state', '=', 'posted'),
                 ('company_id', '=', company_id),
-                ('partner_id.vat', '=', partner_vat),
+                ('partner_id', 'in', partner_ids),
                 ('l10n_latam_document_number', '=', doc_number),
             ]
 
@@ -425,12 +446,12 @@ class ImportMisComprobantes(models.TransientModel):
         # -- Fase 2: CUIT + fecha cercana (sin exigir nro exacto) --
         # Por qué: mismo proveedor, puede haber diferencia en PV/nro
         # por carga manual o prefijo distinto
-        if partner_vat:
+        if partner_ids:
             domain_cuit = [
                 ('move_type', '=', move_type),
                 ('state', '=', 'posted'),
                 ('company_id', '=', company_id),
-                ('partner_id.vat', '=', partner_vat),
+                ('partner_id', 'in', partner_ids),
             ]
             if date:
                 domain_cuit += [
@@ -893,7 +914,7 @@ class ImportMisComprobantes(models.TransientModel):
                 'pos_number': pos,
                 'doc_number': number,
                 'cae': '',
-                'partner_vat': move.partner_id.vat or '',
+                'partner_vat': self._clean_cuit(move.partner_id.vat or ''),
                 'partner_name': move.partner_id.name or '',
                 'amount_total': abs(move.amount_total),
                 'amount_net': 0.0,
