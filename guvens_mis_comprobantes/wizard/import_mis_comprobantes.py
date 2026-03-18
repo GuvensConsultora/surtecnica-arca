@@ -415,9 +415,9 @@ class ImportMisComprobantes(models.TransientModel):
         misma moneda para que facturas en USD no den mismatch falso.
         """
         odoo_ars = self._get_amount_in_ars(move)
-        # Por qué: round(,2) evita falsos mismatch por aritmética de punto
-        # flotante (ej: 0.010000000001 > 0.01 sin redondear)
-        if round(abs(odoo_ars - abs(arca_amount)), 2) <= 0.01:
+        # Por qué: ARCA admite ±$1 de diferencia por redondeo en Libro IVA
+        # Digital (vigente 2025-2026). round(,2) evita ruido de punto flotante.
+        if round(abs(odoo_ars - abs(arca_amount)), 2) <= 1.0:
             return 'match'
         return 'mismatch'
 
@@ -469,7 +469,7 @@ class ImportMisComprobantes(models.TransientModel):
         if arca_total > 0:
             diff_abs = round(abs(odoo_total - arca_total), 2)
             diff_pct = (diff_abs / arca_total) * 100
-            if diff_abs <= 0.01:
+            if diff_abs <= 1.0:
                 score += 20
                 details.append('Importe OK')
             elif diff_pct <= 1.0:
