@@ -390,7 +390,10 @@ class ImportMisComprobantes(models.TransientModel):
                         best_score, best_detail, best_move = sc, det, m
 
             if best_move and best_score >= 40:
-                state = self._score_to_state(best_score, best_move)
+                # Por qué: el estado debe reflejar la diferencia real de importe,
+                # no el score de confianza. Score 70 con diff $0 es 'match',
+                # no 'mismatch'. _amount_state compara importes en ARS.
+                state = self._amount_state(best_move, amount)
                 line.update({
                     'move_id': best_move.id,
                     'match_score': best_score,
@@ -483,15 +486,6 @@ class ImportMisComprobantes(models.TransientModel):
 
         return score, ' | '.join(details)
 
-
-    def _score_to_state(self, score, move):
-        """Convierte score a estado del cruce."""
-        if not move:
-            return 'missing_in_odoo'
-        if score >= 80:
-            return 'match'
-        # Por qué: score entre 40-79 = encontró algo pero con diferencias
-        return 'mismatch'
 
     # -------------------------------------------------------------------------
     # Parser Mis Comprobantes (formato original)
