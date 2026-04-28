@@ -2,3 +2,5 @@ id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
 access_mis_comprobantes_line_user,guvens.mis.comprobantes.line.user,model_guvens_mis_comprobantes_line,account.group_account_invoice,1,0,0,0
 access_mis_comprobantes_line_manager,guvens.mis.comprobantes.line.manager,model_guvens_mis_comprobantes_line,account.group_account_manager,1,1,1,1
 access_import_mis_comprobantes,guvens.import.mis.comprobantes,model_guvens_import_mis_comprobantes,account.group_account_invoice,1,1,1,1
+access_import_emitidos,guvens.import.comprobantes.emitidos,model_guvens_import_comprobantes_emitidos,account.group_account_invoice,1,1,1,1
+access_import_emitidos_line,guvens.import.emitidos.line,model_guvens_import_emitidos_line,account.group_account_invoice,1,1,1,1

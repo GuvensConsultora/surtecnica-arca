@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- =================================================================== -->
+    <!-- Form view del wizard - Comprobantes Emitidos (Ventas)               -->
+    <!-- Tres estados visibles: subir, previsualizar y resultado.            -->
+    <!-- =================================================================== -->
+    <record id="view_import_emitidos_form" model="ir.ui.view">
+        <field name="name">guvens.import.comprobantes.emitidos.form</field>
+        <field name="model">guvens.import.comprobantes.emitidos</field>
+        <field name="arch" type="xml">
+            <form string="Importar Comprobantes Emitidos ARCA">
+                <field name="state" invisible="1"/>
+                <field name="company_id" invisible="1"/>
+
+                <!-- ============ ESTADO 1: SUBIR ============ -->
+                <div invisible="state != 'upload'">
+                    <div class="alert alert-info" role="alert">
+                        <strong>Importación de comprobantes emitidos por portal ARCA.</strong>
+                        <br/>
+                        Este asistente carga en Odoo las facturas que se emitieron
+                        directamente desde ARCA (típicamente FCE MiPyME) y que por
+                        eso no figuran en el sistema. Usa el CAE que viene en el
+                        propio CSV; no vuelve a llamar a ARCA.
+                    </div>
+
+                    <group>
+                        <group string="Archivo">
+                            <field name="csv_file" filename="csv_filename"/>
+                            <field name="csv_filename" invisible="1"/>
+                        </group>
+                        <group string="Configuración">
+                            <field name="journal_id" options="{'no_create': True}"/>
+                            <field name="sale_account_id" options="{'no_create': True}"/>
+                        </group>
+                    </group>
+
+                    <div class="mx-3 mb-3 p-3 bg-light rounded border">
+                        <h6 class="mb-2 text-muted fw-bold"
+                            style="font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px;">
+                            Cómo descargar el CSV
+                        </h6>
+                        <ol class="mb-0" style="font-size: 0.85rem;">
+                            <li>Entrar al portal de ARCA → <strong>Mis Comprobantes</strong>.</li>
+                            <li>Pestaña <strong>Emitidos</strong>, filtrar por el mes deseado.</li>
+                            <li>Botón <strong>Descargar CSV</strong> (montos expresados en pesos).</li>
+                            <li>Subirlo arriba y apretar <strong>Cargar y previsualizar</strong>.</li>
+                        </ol>
+                    </div>
+
+                    <footer>
+                        <button name="action_load_csv" type="object"
+                                string="Cargar y previsualizar"
+                                class="btn-primary"
+                                invisible="not csv_file"/>
+                        <button string="Cancelar" class="btn-secondary" special="cancel"/>
+                    </footer>
+                </div>
+
+                <!-- ============ ESTADO 2: PREVISUALIZAR ============ -->
+                <div invisible="state != 'preview'">
+                    <div class="alert alert-warning" role="alert"
+                         invisible="count_review == 0 and count_invalid == 0">
+                        <strong>Hay filas que requieren atención antes de confirmar.</strong>
+                        Revisá las marcadas en amarillo (cliente nuevo o condición a confirmar).
+                        Las marcadas en rojo no se pueden procesar y se ignorarán.
+                    </div>
+
+                    <group>
+                        <group string="Período detectado">
+                            <field name="period" readonly="1"/>
+                            <field name="csv_filename" readonly="1"/>
+                        </group>
+                        <group string="Resumen">
+                            <label for="count_total" string="Total filas en CSV"/>
+                            <field name="count_total" nolabel="1"/>
+                            <label for="count_exists" string="Ya existen en Odoo"/>
+                            <field name="count_exists" nolabel="1"/>
+                            <label for="count_to_create" string="Se van a crear"/>
+                            <field name="count_to_create" nolabel="1"/>
+                            <label for="count_review" string="A revisar"/>
+                            <field name="count_review" nolabel="1"/>
+                            <label for="count_invalid" string="No procesables"/>
+                            <field name="count_invalid" nolabel="1"/>
+                        </group>
+                    </group>
+
+                    <separator string="Comprobantes"/>
+                    <field name="line_ids" nolabel="1">
+                        <list editable="bottom"
+                              decoration-success="state == 'exists'"
+                              decoration-warning="state == 'needs_review'"
+                              decoration-danger="state == 'invalid'"
+                              decoration-muted="state == 'invalid'">
+                            <field name="state" widget="badge"
+                                   decoration-success="state == 'exists'"
+                                   decoration-info="state == 'to_create'"
+                                   decoration-warning="state == 'needs_review'"
+                                   decoration-danger="state == 'invalid'"/>
+                            <field name="date" readonly="1"/>
+                            <field name="display_comprobante" readonly="1" optional="show"/>
+                            <field name="afip_code" optional="hide"/>
+                            <field name="doc_type_label" readonly="1" optional="show"/>
+                            <field name="receiver_vat" readonly="1"/>
+                            <field name="receiver_name" readonly="1"/>
+                            <field name="partner_id" readonly="1" optional="show"/>
+                            <field name="partner_will_be_created" optional="show"/>
+                            <field name="amount_total" readonly="1" sum="Total"/>
+                            <field name="cae" readonly="1" optional="hide"/>
+                            <field name="sale_account_id" optional="hide"
+                                   options="{'no_create': True}"/>
+                            <field name="review_note" readonly="1" optional="show"/>
+                            <field name="existing_move_id" readonly="1" optional="hide"/>
+                        </list>
+                    </field>
+
+                    <footer>
+                        <button name="action_confirm_import" type="object"
+                                string="Confirmar e importar"
+                                class="btn-primary"
+                                confirm="Vas a crear los comprobantes marcados como 'Se va a crear'. ¿Confirmás?"
+                                invisible="count_to_create == 0"/>
+                        <button name="action_back_to_upload" type="object"
+                                string="Subir otro archivo"
+                                class="btn-secondary"/>
+                        <button string="Cancelar" class="btn-secondary" special="cancel"/>
+                    </footer>
+                </div>
+
+                <!-- ============ ESTADO 3: HECHO ============ -->
+                <div invisible="state != 'done'">
+                    <div class="alert alert-success" role="alert">
+                        <strong>Importación completada.</strong>
+                        Se crearon
+                        <field name="count_exists" readonly="1" nolabel="1" class="oe_inline"/>
+                        comprobantes en Odoo. Verificá el libro IVA Ventas para
+                        confirmar que la diferencia contra el libro oficial de ARCA
+                        quedó en cero.
+                    </div>
+
+                    <separator string="Comprobantes procesados"/>
+                    <field name="line_ids" nolabel="1" readonly="1">
+                        <list>
+                            <field name="date"/>
+                            <field name="display_comprobante"/>
+                            <field name="receiver_name"/>
+                            <field name="amount_total" sum="Total"/>
+                            <field name="created_move_id"/>
+                            <field name="state" widget="badge"
+                                   decoration-success="state == 'exists'"
+                                   decoration-danger="state == 'invalid'"/>
+                        </list>
+                    </field>
+
+                    <footer>
+                        <button name="action_back_to_upload" type="object"
+                                string="Subir otro mes"
+                                class="btn-primary"/>
+                        <button string="Cerrar" class="btn-secondary" special="cancel"/>
+                    </footer>
+                </div>
+            </form>
+        </field>
+    </record>
+
+    <!-- Action: abre el wizard en modal (target=new) -->
+    <record id="action_import_emitidos" model="ir.actions.act_window">
+        <field name="name">Importar Comprobantes Emitidos ARCA</field>
+        <field name="res_model">guvens.import.comprobantes.emitidos</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+    </record>
+
+</odoo>

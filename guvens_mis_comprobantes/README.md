@@ -1,5 +1,10 @@
 # Cruce Mis Comprobantes AFIP (guvens_mis_comprobantes)
 
+> **Versión 17.0.3.0.0** — el módulo cubre dos flujos:
+>
+> - **Compras** (sección clásica de este README): cruza CSV de "Mis Comprobantes — Recibidos" o "Portal IVA — Compras" contra facturas de proveedores en Odoo.
+> - **Ventas** (nuevo, ver §6 *Importación de comprobantes emitidos*): toma el CSV de "Mis Comprobantes — Emitidos" y crea en Odoo los comprobantes que se autorizaron por portal de ARCA y faltan en el sistema (típicamente FCE MiPyME). Usa el CAE del propio CSV; no vuelve a llamar a WSFE.
+
 ## 1. Introducción
 
 ### Qué hace Odoo nativamente
@@ -320,3 +325,52 @@ El módulo está preparado para despliegues multicompañía:
 6. Verificar filtros por origen (Portal IVA / Mis Comprobantes) en vista search
 7. Verificar tabs Desglose IVA y Percepciones visibles solo en registros Portal IVA
 8. **Multicompañía**: importar CSV con empresa A seleccionada → verificar que no matchee facturas de empresa B
+
+---
+
+## 6. Importación de comprobantes emitidos (Ventas)
+
+### Qué resuelve
+
+Cuando una empresa emite parte de sus comprobantes desde el portal de ARCA — caso típico de **FCE MiPyME**, que no siempre se puede emitir desde Odoo — esos comprobantes quedan autorizados con CAE en ARCA pero no se registran en Odoo. El libro IVA Ventas exportado desde el sistema queda incompleto y no coincide con el oficial.
+
+Este flujo toma el CSV de **Mis Comprobantes → Emitidos** y crea en Odoo los comprobantes que faltan, con el CAE precargado. **No llama a WSFE**: los CAE ya existen, solo se replica la información para que el libro de Ventas cierre.
+
+### Cómo se usa
+
+1. Bajar el CSV desde ARCA → **Mis Comprobantes → Emitidos** del mes deseado.
+2. En Odoo: **Contabilidad → Clientes → Importar Emitidos ARCA**.
+3. Subir el archivo y apretar **Cargar y previsualizar**. El asistente lee el CSV y muestra una grilla con todos los comprobantes del mes.
+4. Cada fila se identifica por color:
+
+   | Color | Estado | Significado |
+   |-------|--------|-------------|
+   | Verde | Ya en Odoo | El comprobante ya está cargado (match por PV + Nº + CAE) |
+   | Blanco | Se va a crear | Falta en Odoo, se va a generar |
+   | Amarillo | A revisar | Cliente nuevo o condición frente a IVA ambigua, requiere confirmación |
+   | Rojo | No procesable | Falta dato esencial (fecha, número o CAE), o es comprobante en lote |
+
+5. Revisar las filas amarillas (cliente nuevo a crear, letra de comprobante con condición no unívoca) y ajustar la cuenta de ventas por defecto si una factura puntual lo requiere.
+6. Apretar **Confirmar e importar**. Recién en este momento se crean los comprobantes y los partners nuevos. Si se cierra el wizard antes, no se modifica nada.
+
+### Decisiones de diseño
+
+- **Match por PV + Nº + CAE**: combinación irrepetible que ARCA garantiza única, da idempotencia automática (re-subir el mismo CSV no duplica nada).
+- **Líneas por alícuota de IVA**: el CSV de ARCA trae totales por alícuota (0/2,5/5/10,5/21/27%) pero no detalle de productos. Se crea una línea por alícuota imputada a la cuenta de ventas por defecto (editable por fila).
+- **Partners nuevos auto-creados**: si el CUIT no existe en Odoo, se crea con la denominación del CSV. La condición frente a IVA se infiere de la letra del comprobante:
+  - **A** y **M** → Responsable Inscripto (inferencia segura)
+  - **E** → Cliente del Exterior
+  - **B**, **C** → ambiguo, fila marcada en amarillo para revisión
+- **CAE persistido**: campo `l10n_ar_afip_auth_code`. Vencimiento del CAE estimado a +10 días (ARCA no lo trae en el CSV; el cliente puede ajustarlo si lo necesita exacto).
+- **Comprobantes en lote** (Número Desde ≠ Número Hasta) se marcan como no procesables para evitar interpretaciones erróneas; se cargan a mano si aparecen.
+
+### Integración server-to-server
+
+El wizard expone `action_import_from_attachment(attachment_id)`: tomá un `ir.attachment` ya subido al servidor (vía multipart) y dispara upload + load + confirm en una sola llamada. Cumple la regla del estudio de no inflar XML-RPC con base64 para archivos de tamaño potencialmente grande.
+
+### Verificación
+
+1. Bajar el CSV de Emitidos del mes en cuestión, subirlo, confirmar la cantidad de filas verdes contra el listado de Clientes → Facturas filtrado por ese mes.
+2. Confirmar la importación, exportar libro IVA Ventas de Odoo e importarlo en el aplicativo de ARCA: la diferencia debe ser cero.
+3. Re-subir el mismo CSV: la grilla debe quedar 100 % en verde y el contador "a crear" en cero.
+4. Abrir cualquier comprobante creado: pestaña Otra información → CAE y vencimiento del CAE deben coincidir con el CSV.
