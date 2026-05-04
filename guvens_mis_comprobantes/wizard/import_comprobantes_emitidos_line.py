@@ -5,7 +5,7 @@ from odoo import models, fields
 class ImportEmitidosLine(models.TransientModel):
     _name = 'guvens.import.emitidos.line'
     _description = 'Línea de previsualización — Comprobantes Emitidos ARCA'
-    _order = 'date, doc_type, pos_number, doc_number'
+    _order = 'date, afip_code, pos_number, doc_number'
 
     wizard_id = fields.Many2one(
         'guvens.import.comprobantes.emitidos',

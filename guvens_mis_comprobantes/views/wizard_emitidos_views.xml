@@ -87,7 +87,7 @@
 
                     <separator string="Comprobantes"/>
                     <field name="line_ids" nolabel="1">
-                        <list editable="bottom"
+                        <tree editable="bottom"
                               decoration-success="state == 'exists'"
                               decoration-warning="state == 'needs_review'"
                               decoration-danger="state == 'invalid'"
@@ -111,7 +111,7 @@
                                    options="{'no_create': True}"/>
                             <field name="review_note" readonly="1" optional="show"/>
                             <field name="existing_move_id" readonly="1" optional="hide"/>
-                        </list>
+                        </tree>
                     </field>
 
                     <footer>
@@ -140,7 +140,7 @@
 
                     <separator string="Comprobantes procesados"/>
                     <field name="line_ids" nolabel="1" readonly="1">
-                        <list>
+                        <tree>
                             <field name="date"/>
                             <field name="display_comprobante"/>
                             <field name="receiver_name"/>
@@ -149,7 +149,7 @@
                             <field name="state" widget="badge"
                                    decoration-success="state == 'exists'"
                                    decoration-danger="state == 'invalid'"/>
-                        </list>
+                        </tree>
                     </field>
 
                     <footer>
