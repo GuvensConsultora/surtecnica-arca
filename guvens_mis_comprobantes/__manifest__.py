@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 {
     'name': 'Cruce Mis Comprobantes ARCA',
-    'version': '17.0.3.0.0',
+    'version': '17.0.3.0.1',
     'category': 'Accounting',
     'summary': 'Importa CSV de ARCA: cruza compras y crea ventas faltantes (FCE MiPyME)',
     'description': """

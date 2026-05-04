@@ -339,9 +339,13 @@ class ImportComprobantesEmitidos(models.TransientModel):
             return None, None
 
     def _build_moves_index(self, date_from, date_to):
-        """Indexa account.move de venta del período por (move_type, CUIT, doc_number).
+        """Indexa account.move de venta del período por (afip_code, CUIT, doc_number).
         Por qué: con una sola búsqueda y un dict en memoria, el match por fila
         es O(1) en lugar de hacer un search por cada línea del CSV.
+        El código ARCA (l10n_latam_document_type_id.code) es necesario en la clave
+        porque cada letra de comprobante (A/B/C) y cada subtipo (FA/ND/NC/FCE)
+        tiene numeración independiente y arranca en 00000001 — sin la letra,
+        Fact A 0001 cruzaría con Fact B 0001 generando falsos "ya existe".
         """
         domain = [
             ('move_type', 'in', ['out_invoice', 'out_refund']),
@@ -354,12 +358,15 @@ class ImportComprobantesEmitidos(models.TransientModel):
         moves = self.env['account.move'].search(domain)
         index = {}
         for move in moves:
+            doc_code = move.l10n_latam_document_type_id.code or ''
+            if not doc_code:
+                continue
             vat = self._clean_cuit(move.commercial_partner_id.vat or '')
             doc_num = self._normalize_doc_number(move.l10n_latam_document_number or '')
             if doc_num:
-                index[(move.move_type, vat, doc_num)] = move
+                index[(doc_code, vat, doc_num)] = move
                 # También indexar sin CUIT, por si la factura quedó cargada sin partner válido
-                index.setdefault((move.move_type, '', doc_num), move)
+                index.setdefault((doc_code, '', doc_num), move)
         return index
 
     def _normalize_doc_number(self, doc_num):
@@ -460,9 +467,10 @@ class ImportComprobantesEmitidos(models.TransientModel):
             vals['review_note'] = _('Comprobante en lote (%s-%s). Cargar manualmente.') % (num_from, num_to)
             return vals
 
-        # ¿Ya existe en Odoo?
-        existing = moves_index.get((move_type, receiver_vat, doc_number)) \
-            or moves_index.get((move_type, '', doc_number))
+        # ¿Ya existe en Odoo? (clave con afip_code para no cruzar Fact A 0001
+        # con Fact B 0001 — cada letra tiene numeración independiente)
+        existing = moves_index.get((afip_code, receiver_vat, doc_number)) \
+            or moves_index.get((afip_code, '', doc_number))
         if existing:
             vals['state'] = 'exists'
             vals['existing_move_id'] = existing.id
