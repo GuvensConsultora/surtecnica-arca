@@ -663,65 +663,108 @@ class ImportComprobantesEmitidos(models.TransientModel):
         from datetime import timedelta
         return invoice_date + timedelta(days=10)
 
+    # Códigos AFIP de alícuota IVA (account.tax.group.l10n_ar_vat_afip_code):
+    # 0=No Corresponde, 1=No Gravado, 2=Exento, 3=IVA 0%, 4=IVA 10,5%,
+    # 5=IVA 21%, 6=IVA 27%, 8=IVA 5%, 9=IVA 2,5%.
+    AFIP_VAT_CODE_NO_CORRESPONDE = '0'
+    AFIP_VAT_CODE_NO_GRAVADO = '1'
+    AFIP_VAT_CODE_EXENTO = '2'
+
+    def _find_vat_tax(self, afip_vat_code):
+        """Devuelve el account.tax de ventas cuyo tax_group tiene ese código AFIP.
+
+        Por qué: en l10n_ar el campo `l10n_ar_vat_afip_code` vive en
+        `account.tax.group`, no en el tax directo. Es la única forma de
+        distinguir IVA 0% / No Gravado / Exento / No Corresponde, que tienen
+        todos `amount=0` — buscar por `amount` levanta cualquiera de ellos.
+        """
+        return self.env['account.tax'].search([
+            ('type_tax_use', '=', 'sale'),
+            ('tax_group_id.l10n_ar_vat_afip_code', '=', str(afip_vat_code)),
+            ('company_id', '=', self.company_id.id),
+        ], limit=1)
+
+    def _make_line_vals(self, name, neto, account, tax, afip_vat_code):
+        """Arma vals de una línea de factura validando que la tax exista.
+        Argentina exige exactamente un impuesto del grupo VAT por línea; sin él
+        `action_post` rompe con 'There should be a single tax from the VAT
+        tax group'. Falla temprano y claro si la tax no está configurada.
+        """
+        if not tax:
+            raise UserError(_(
+                'No encuentro el impuesto IVA con código AFIP "%s" para ventas '
+                'en la compañía %s. Verificá que la localización argentina '
+                '(l10n_ar) esté correctamente instalada y que el tax_group '
+                'del impuesto tenga seteado `l10n_ar_vat_afip_code`.'
+            ) % (afip_vat_code, self.company_id.display_name))
+        return (0, 0, {
+            'name': name,
+            'quantity': 1.0,
+            'price_unit': neto,
+            'account_id': account.id,
+            'tax_ids': [(6, 0, [tax.id])],
+        })
+
     def _build_invoice_lines(self, line):
-        """Arma una línea por alícuota de IVA presente en el CSV.
-        Para la cuenta de venta usa la del registro o la default del wizard.
+        """Arma una línea por alícuota presente en el CSV.
+
+        Lógica por responsabilidad del receptor (inferida de la letra del
+        comprobante):
+
+        - Letra E (cliente del exterior, responsabilidad código 9): todas las
+          líneas llevan "IVA No Corresponde" (código AFIP 0), independientemente
+          de la columna del CSV donde venga el importe. Las facturas E no
+          discriminan IVA porque son operaciones de exportación.
+        - Letras A/B/C/M: una línea por cada alícuota presente en el CSV, más
+          una línea adicional por "No Gravado" y "Exento" cuando esas columnas
+          traen importe. Cada línea con su tax del grupo VAT correspondiente.
         """
         account = line.sale_account_id or self.sale_account_id
         if not account:
             return []
 
-        Tax = self.env['account.tax']
-        company = self.company_id
+        letter = ARCA_CODE_LETTER.get(line.afip_code)
         lines = []
 
-        # Tramos: cada tupla = (neto, %iva, label, código de impuesto a buscar)
-        tramos = [
-            (line.amount_neto_0, 0, 'IVA 0%', None),
-            (line.amount_neto_25, 2.5, 'IVA 2,5%', '2.5'),
-            (line.amount_neto_5, 5, 'IVA 5%', '5'),
-            (line.amount_neto_105, 10.5, 'IVA 10,5%', '10.5'),
-            (line.amount_neto_21, 21, 'IVA 21%', '21'),
-            (line.amount_neto_27, 27, 'IVA 27%', '27'),
-        ]
+        if letter == 'E':
+            tax = self._find_vat_tax(self.AFIP_VAT_CODE_NO_CORRESPONDE)
+            neto = (line.amount_neto_total
+                    or line.amount_no_gravado
+                    or line.amount_exento
+                    or line.amount_total)
+            if neto:
+                lines.append(self._make_line_vals(
+                    _('Operación de exportación'), neto, account, tax,
+                    self.AFIP_VAT_CODE_NO_CORRESPONDE))
+            return lines
 
-        for neto, rate, label, tax_code in tramos:
+        # Tramos por alícuota: (neto en CSV, código AFIP, label visible)
+        tramos = [
+            (line.amount_neto_0, '3', 'IVA 0%'),
+            (line.amount_neto_25, '9', 'IVA 2,5%'),
+            (line.amount_neto_5, '8', 'IVA 5%'),
+            (line.amount_neto_105, '4', 'IVA 10,5%'),
+            (line.amount_neto_21, '5', 'IVA 21%'),
+            (line.amount_neto_27, '6', 'IVA 27%'),
+        ]
+        for neto, afip_vat_code, label in tramos:
             if not neto:
                 continue
-            tax_ids = []
-            if tax_code:
-                tax = Tax.search([
-                    ('type_tax_use', '=', 'sale'),
-                    ('amount', '=', float(tax_code)),
-                    ('company_id', '=', company.id),
-                ], limit=1)
-                if tax:
-                    tax_ids = [(6, 0, [tax.id])]
-            lines.append((0, 0, {
-                'name': label,
-                'quantity': 1.0,
-                'price_unit': neto,
-                'account_id': account.id,
-                'tax_ids': tax_ids,
-            }))
+            tax = self._find_vat_tax(afip_vat_code)
+            lines.append(self._make_line_vals(
+                label, neto, account, tax, afip_vat_code))
 
-        # No gravado / exento (sin IVA, una línea cada uno si hay importe)
         if line.amount_no_gravado:
-            lines.append((0, 0, {
-                'name': _('No gravado'),
-                'quantity': 1.0,
-                'price_unit': line.amount_no_gravado,
-                'account_id': account.id,
-                'tax_ids': [(6, 0, [])],
-            }))
+            tax = self._find_vat_tax(self.AFIP_VAT_CODE_NO_GRAVADO)
+            lines.append(self._make_line_vals(
+                _('No gravado'), line.amount_no_gravado, account, tax,
+                self.AFIP_VAT_CODE_NO_GRAVADO))
+
         if line.amount_exento:
-            lines.append((0, 0, {
-                'name': _('Operaciones exentas'),
-                'quantity': 1.0,
-                'price_unit': line.amount_exento,
-                'account_id': account.id,
-                'tax_ids': [(6, 0, [])],
-            }))
+            tax = self._find_vat_tax(self.AFIP_VAT_CODE_EXENTO)
+            lines.append(self._make_line_vals(
+                _('Operaciones exentas'), line.amount_exento, account, tax,
+                self.AFIP_VAT_CODE_EXENTO))
 
         return lines
 
