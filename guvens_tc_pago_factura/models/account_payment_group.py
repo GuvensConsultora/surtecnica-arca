@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import math
 from odoo import api, fields, models
 
 
@@ -9,9 +10,10 @@ class AccountPaymentGroup(models.Model):
         string='Usar TC de la factura',
         default=lambda self: self.company_id.usar_tc_factura_cobros,
         help=(
-            'Activo: al confirmar el cobro en ARS sobre una factura en USD, '
-            'el sistema usa el TC de la factura para convertir, de forma que '
-            'la deuda en USD cierra exactamente a cero sin diferencia de cambio.\n'
+            'Activo: el cobro entra en pesos (la caja/banco registra ARS) pero '
+            'la línea de cuenta por cobrar se valúa en USD al TC de la factura, '
+            'de modo que la factura en dólares cierra exactamente sin generar '
+            'diferencia de cambio ni crédito flotante en el cliente.\n'
             'Inactivo: comportamiento estándar de Odoo (TC del día del cobro).'
         ),
     )
@@ -20,108 +22,92 @@ class AccountPaymentGroup(models.Model):
     def _onchange_company_usar_tc(self):
         self.usar_tc_factura = self.company_id.usar_tc_factura_cobros
 
-    def _reconcile_payments(self, writeoff_account_id=False, writeoff_journal_id=False):
+    def post(self):
         """
-        Intercepta la reconciliación para aplicar el TC de la factura.
+        Hook sobre el post() de ADHOC (account_payment_group).
 
-        El problema: Odoo convierte el pago en ARS a USD usando el TC del día
-        del cobro. Si ese TC difiere del TC de la factura, genera un CAMBI que
-        deja un crédito flotante en la cuenta del cliente.
+        ADHOC postea los pagos y reconcilia inline dentro de post():
+            counterpart_aml = payment_ids.invoice_line_ids (líneas CxC del cobro)
+            (counterpart_aml + to_pay_move_line_ids).reconcile()
 
-        La solución: antes de reconciliar, anotar en la línea de CxC del cobro
-        el monto exacto en USD que corresponde a la deuda (a TC de la factura).
-        Así Odoo ve coincidencia exacta en USD → no genera CAMBI → cliente $0.
+        Cuando usar_tc_factura está activo, posteamos los pagos nosotros ANTES
+        de llamar a super() y ajustamos la línea de cuenta por cobrar del cobro
+        para que quede valuada en USD al TC de la factura. Así, cuando super()
+        reconcilia, las dos líneas coinciden en pesos Y en dólares → sin CAMBI.
+
+        super() saltea el re-post porque filtra solo pagos en 'draft'.
+
+        Por qué este enfoque (y no forzar el pago a USD): la caja/banco debe
+        quedar en pesos (es lo que físicamente se cobró). Solo la contrapartida
+        de cuenta por cobrar lleva la info en dólares para cerrar la factura.
         """
-        for pg in self:
-            if pg.usar_tc_factura:
-                pg._aplicar_tc_factura_en_cobros()
-        return super()._reconcile_payments(
-            writeoff_account_id=writeoff_account_id,
-            writeoff_journal_id=writeoff_journal_id,
-        )
+        for rec in self:
+            if rec.usar_tc_factura:
+                rec._ajustar_cobro_a_tc_factura()
+        return super().post()
 
-    def _aplicar_tc_factura_en_cobros(self):
-        """
-        Busca el TC de cada factura en to_pay_move_line_ids y lo usa para
-        convertir el ARS del cobro a USD antes de reconciliar.
-
-        Fórmula: USD_cobro = ARS_cobro / TC_factura
-
-        Así Odoo ve USD_cobro = USD_deuda → cierre exacto sin diferencia de cambio.
-
-        Para múltiples facturas con distintos TC: se usa el TC ponderado por
-        el monto ARS de cada factura (TC promedio del conjunto a cancelar).
-        """
+    def _ajustar_cobro_a_tc_factura(self):
         self.ensure_one()
         usd = self.env.ref('base.USD')
 
-        # Líneas de facturas en USD que este cobro cancela
-        lineas_usd = self.to_pay_move_line_ids.filtered(
+        # Facturas en USD que este grupo cancela
+        lineas_factura = self.to_pay_move_line_ids.filtered(
             lambda l: l.currency_id == usd
         )
-        if not lineas_usd:
+        if not lineas_factura:
+            return  # No hay facturas USD: nada que ajustar
+
+        # USD residual total y TC ponderado de las facturas a cancelar.
+        # TC factura = ARS residual / USD residual (rate implícito de la factura)
+        usd_residual = abs(sum(l.amount_residual_currency for l in lineas_factura))
+        ars_residual = abs(sum(l.amount_residual for l in lineas_factura))
+        if not usd_residual or not ars_residual:
             return
-
-        # TC de la factura: campo l10n_ar_currency_rate en el account.move.
-        # Si hay varias facturas con distintos TC, se pondera por monto ARS.
-        # Ejemplo: FAC A $100.000 ARS @ TC 1.480 + FAC B $50.000 ARS @ TC 1.500
-        #   → TC ponderado = (100.000 × 1.480 + 50.000 × 1.500) / 150.000 = 1.487
-        total_ars = 0.0
-        suma_ponderada = 0.0
-        for linea in lineas_usd:
-            factura = linea.move_id
-            tc = factura.l10n_ar_currency_rate or 0.0
-            if not tc:
-                # Fallback: calcular TC implícito desde la propia línea
-                # TC = monto_ars / monto_usd (solo si ambos disponibles)
-                if linea.amount_currency:
-                    tc = abs(linea.balance) / abs(linea.amount_currency)
-            monto_ars = abs(linea.amount_residual)
-            total_ars += monto_ars
-            suma_ponderada += monto_ars * tc
-
-        if not total_ars or not suma_ponderada:
-            return
-
-        tc_factura = suma_ponderada / total_ars
+        tc_factura = ars_residual / usd_residual
         if tc_factura <= 0:
-            return  # TC inválido: no intervenir
+            return
 
-        # Para cada cobro: USD = ARS_cobro / TC_factura
+        # Postear los pagos ahora para poder ajustar sus líneas antes de que
+        # super().post() reconcilie (super saltea el re-post: filtra solo draft).
+        self.payment_ids.filtered(lambda x: x.state == 'draft').action_post()
+
+        # Cantidad de líneas de CxC a ajustar en el conjunto de cobros
+        lineas_cxc_total = self.payment_ids.move_id.line_ids.filtered(
+            lambda l: l.account_id.account_type == 'asset_receivable'
+            and l.currency_id != usd
+        )
+        linea_unica = len(lineas_cxc_total) == 1
+
         for payment in self.payment_ids:
             lineas_cxc = payment.move_id.line_ids.filtered(
                 lambda l: l.account_id.account_type == 'asset_receivable'
                 and l.currency_id != usd
             )
-            if not lineas_cxc:
-                continue
+            for linea in lineas_cxc:
+                ars = abs(linea.balance)
+                if not ars:
+                    continue
+                usd_linea = ars / tc_factura
 
-            # ARS total de este cobro sobre cuentas por cobrar
-            ars_cobro = abs(sum(l.balance for l in lineas_cxc))
-            if not ars_cobro:
-                continue
+                # Snap de redondeo: si es la única línea y el USD calculado
+                # difiere del residual exacto de la factura en menos de 0,01 USD,
+                # usamos el residual exacto para cerrar sin fracción de centavo.
+                if linea_unica and abs(usd_linea - usd_residual) < 0.01:
+                    usd_linea = usd_residual
 
-            usd_calculado = ars_cobro / tc_factura
+                # El signo del amount_currency debe coincidir con el del balance
+                # (en un cobro la línea de CxC va al crédito → balance negativo).
+                amount_currency = math.copysign(usd_linea, linea.balance)
 
-            # Snap de redondeo: si el USD calculado difiere del residual
-            # exacto en la factura en menos de 0,01 USD, usamos el residual
-            # exacto para evitar que quede cualquier fracción de centavo
-            # generando un CAMBI mínimo.
-            usd_residual_exacto = abs(sum(
-                l.amount_residual_currency for l in lineas_usd
-            ))
-            if usd_residual_exacto and abs(usd_calculado - usd_residual_exacto) < 0.01:
-                usd_calculado = usd_residual_exacto
-
-            # Anotar el USD calculado en la línea del cobro para que
-            # la reconciliación use el TC de la factura y no el TC del día.
-            # no_lock_date_check=True: necesario en Odoo 17 cuando el período
-            # tiene fecha de bloqueo seteada.
-            lineas_cxc.with_context(
-                check_move_validity=False,
-                skip_account_move_synchronization=True,
-                no_lock_date_check=True,
-            ).write({
-                'currency_id': usd.id,
-                'amount_currency': -usd_calculado,
-            })
+                # skip_account_move_synchronization: evita que la sincronización
+                # de account.payment revierta el cambio.
+                # check_move_validity / no_lock_date_check: permiten el write
+                # sobre la línea ya posteada.
+                linea.with_context(
+                    check_move_validity=False,
+                    skip_account_move_synchronization=True,
+                    no_lock_date_check=True,
+                ).write({
+                    'currency_id': usd.id,
+                    'amount_currency': amount_currency,
+                })
