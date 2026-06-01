@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Checkbox en Configuración → Contabilidad de la empresa -->
+    <record id="res_company_form_tc_pago" model="ir.ui.view">
+        <field name="name">res.company.form.tc.pago</field>
+        <field name="model">res.company</field>
+        <field name="inherit_id" ref="account.res_company_form_view_accounting"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='currency_id']" position="after">
+                <field name="usar_tc_factura_cobros"
+                       string="Usar TC de la factura al cobrar en ARS facturas USD"
+                       widget="boolean_toggle"/>
+            </xpath>
+        </field>
+    </record>
+</odoo>

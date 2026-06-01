@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Checkbox visible en el payment group (Recibos de Clientes) -->
+    <record id="account_payment_group_form_tc" model="ir.ui.view">
+        <field name="name">account.payment.group.form.tc</field>
+        <field name="model">account.payment.group</field>
+        <field name="inherit_id" ref="account_payment_group.view_account_payment_group_form"/>
+        <field name="arch" type="xml">
+            <!-- Agregar junto al campo de fecha de pago -->
+            <xpath expr="//field[@name='payment_date']" position="after">
+                <field name="usar_tc_factura"
+                       string="Usar TC de la factura"
+                       widget="boolean_toggle"
+                       invisible="not currency_id"
+                       help="Activo: el sistema usa el TC de la factura al cobrar en ARS, de forma que la deuda en USD cierra exactamente a cero. Aplica cuando el acuerdo es cobrar al TC de la factura original."/>
+            </xpath>
+        </field>
+    </record>
+</odoo>
