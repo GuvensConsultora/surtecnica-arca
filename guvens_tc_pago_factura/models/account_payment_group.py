@@ -83,14 +83,20 @@ class AccountPaymentGroup(models.Model):
             if abs(usd_pago - usd_residual) < 0.01:
                 usd_pago = usd_residual
 
+            # El write CON force_tc_factura en contexto dispara la sincronización
+            # del move mientras _prepare_move_line_default_vals ya tiene el TC
+            # correcto → las líneas del asiento se construyen en USD al TC factura.
             payment.with_context(
-                skip_account_move_synchronization=True,
+                force_tc_factura=tc_factura,
                 check_move_validity=False,
+                no_lock_date_check=True,
             ).write({
                 'currency_id': usd.id,
                 'amount': usd_pago,
             })
 
-        # Postear con el TC factura en contexto → _prepare_move_line_default_vals
-        # lo usará para construir el asiento con los ARS correctos.
-        pagos_draft.with_context(force_tc_factura=tc_factura).action_post()
+        # Postear (el move ya tiene las líneas correctas desde el write anterior).
+        pagos_draft.with_context(
+            force_tc_factura=tc_factura,
+            no_lock_date_check=True,
+        ).action_post()
