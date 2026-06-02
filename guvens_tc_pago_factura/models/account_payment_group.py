@@ -26,93 +26,71 @@ class AccountPaymentGroup(models.Model):
         """
         Hook sobre el post() de ADHOC (account_payment_group).
 
-        ADHOC postea los pagos y reconcilia inline dentro de post():
-            counterpart_aml = payment_ids.invoice_line_ids (líneas CxC del cobro)
-            (counterpart_aml + to_pay_move_line_ids).reconcile()
+        Cuando usar_tc_factura está activo, antes de llamar a super():
+          1. Calcula el TC ponderado de las facturas a cancelar.
+          2. Convierte cada pago ARS a USD al TC factura.
+          3. Postea los pagos con force_tc_factura en el contexto.
 
-        Cuando usar_tc_factura está activo, posteamos los pagos nosotros ANTES
-        de llamar a super() y ajustamos la línea de cuenta por cobrar del cobro
-        para que quede valuada en USD al TC de la factura. Así, cuando super()
-        reconcilia, las dos líneas coinciden en pesos Y en dólares → sin CAMBI.
+        _prepare_move_line_default_vals (en account_payment.py) intercepta ese
+        contexto y construye el asiento usando el TC factura en lugar del TC del
+        día. El resultado es un asiento multi-moneda nativo de Odoo:
+          - Efectivo: ARS (lo que físicamente se cobró)
+          - CxC:     USD al TC factura (cierra la factura exacto, sin CAMBI)
 
-        super() saltea el re-post porque filtra solo pagos en 'draft'.
+        super().post() saltea el re-post (filtra solo draft) y reconcilia
+        directamente las CxC del cobro con las de la factura → match exacto en
+        USD y ARS, sin diferencia de cambio ni crédito flotante.
 
-        Por qué este enfoque (y no forzar el pago a USD): la caja/banco debe
-        quedar en pesos (es lo que físicamente se cobró). Solo la contrapartida
-        de cuenta por cobrar lleva la info en dólares para cerrar la factura.
+        Ventaja sobre el enfoque anterior (parchear líneas post-posted): el
+        asiento es válido para Odoo desde el origen, por lo que puede reversarse
+        con el botón estándar de la UI.
         """
         for rec in self:
             if rec.usar_tc_factura:
-                rec._ajustar_cobro_a_tc_factura()
+                rec._preparar_pagos_a_tc_factura()
         return super().post()
 
-    def _ajustar_cobro_a_tc_factura(self):
+    def _preparar_pagos_a_tc_factura(self):
         self.ensure_one()
         usd = self.env.ref('base.USD')
+        company_currency = self.env.company.currency_id
 
-        # Facturas en USD que este grupo cancela
+        # Facturas USD que este grupo cancela
         lineas_factura = self.to_pay_move_line_ids.filtered(
             lambda l: l.currency_id == usd
         )
         if not lineas_factura:
-            return  # No hay facturas USD: nada que ajustar
+            return
 
-        # USD residual total y TC ponderado de las facturas a cancelar.
-        # TC factura = ARS residual / USD residual (rate implícito de la factura)
         usd_residual = abs(sum(l.amount_residual_currency for l in lineas_factura))
         ars_residual = abs(sum(l.amount_residual for l in lineas_factura))
         if not usd_residual or not ars_residual:
             return
         tc_factura = ars_residual / usd_residual
-        if tc_factura <= 0:
+
+        pagos_draft = self.payment_ids.filtered(
+            lambda x: x.state == 'draft' and x.currency_id == company_currency
+        )
+        if not pagos_draft:
             return
 
-        # Postear los pagos ahora para poder ajustar sus líneas antes de que
-        # super().post() reconcilie (super saltea el re-post: filtra solo draft).
-        self.payment_ids.filtered(lambda x: x.state == 'draft').action_post()
+        for payment in pagos_draft:
+            ars_pago = payment.amount
+            usd_pago = round(ars_pago / tc_factura, 2)
 
-        # Cantidad de líneas de CxC a ajustar en el conjunto de cobros
-        lineas_cxc_total = self.payment_ids.move_id.line_ids.filtered(
-            lambda l: l.account_id.account_type == 'asset_receivable'
-            and l.currency_id != usd
-        )
-        linea_unica = len(lineas_cxc_total) == 1
+            # Snap: si la diferencia es menor a 0,01 USD usamos el residual exacto
+            # para que la factura cierre sin fracción de centavo.
+            if abs(usd_pago - usd_residual) < 0.01:
+                usd_pago = usd_residual
 
-        for payment in self.payment_ids:
-            lineas_cxc = payment.move_id.line_ids.filtered(
-                lambda l: l.account_id.account_type == 'asset_receivable'
-                and l.currency_id != usd
-            )
-            for linea in lineas_cxc:
-                ars = abs(linea.balance)
-                if not ars:
-                    continue
-                usd_linea = ars / tc_factura
+            payment.with_context(
+                skip_account_move_synchronization=True,
+                check_move_validity=False,
+            ).write({
+                'currency_id': usd.id,
+                'amount': usd_pago,
+            })
 
-                # Snap de redondeo: si es la única línea y el USD calculado
-                # difiere del residual exacto de la factura en menos de 0,01 USD,
-                # usamos el residual exacto para cerrar sin fracción de centavo.
-                if linea_unica and abs(usd_linea - usd_residual) < 0.01:
-                    usd_linea = usd_residual
-
-                # El signo del amount_currency debe coincidir con el del balance
-                # (en un cobro la línea de CxC va al crédito → balance negativo).
-                amount_currency = math.copysign(usd_linea, linea.balance)
-
-                # CLAVE: fijar también débito/crédito (importe en pesos) en el
-                # mismo write. Si solo se escribe amount_currency, Odoo recalcula
-                # el balance usando el TC del DÍA (no el de la factura) y el
-                # asiento queda desbalanceado. Al pinear debit/credit con los
-                # pesos originales, el TC implícito queda en el de la factura.
-                # skip_account_move_synchronization: evita que la sync de
-                # account.payment revierta el cambio.
-                linea.with_context(
-                    check_move_validity=False,
-                    skip_account_move_synchronization=True,
-                    no_lock_date_check=True,
-                ).write({
-                    'currency_id': usd.id,
-                    'amount_currency': amount_currency,
-                    'debit': linea.debit,
-                    'credit': linea.credit,
-                })
+        # Postear con el TC factura en contexto → _prepare_move_line_default_vals
+        # lo usará para construir el asiento con los ARS correctos.
+        pagos_draft.with_context(force_tc_factura=tc_factura).action_post()
