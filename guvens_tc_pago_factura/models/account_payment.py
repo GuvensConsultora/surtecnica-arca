@@ -5,7 +5,7 @@ from odoo import models
 class AccountPayment(models.Model):
     _inherit = 'account.payment'
 
-    def _prepare_move_line_default_vals(self, write_off_line_vals=None):
+    def _prepare_move_line_default_vals(self, write_off_line_vals=None, **kwargs):
         """
         Intercepta la construcción del asiento del cobro cuando force_tc_factura
         está en el contexto.
@@ -20,7 +20,7 @@ class AccountPayment(models.Model):
         consistentes → Odoo lo acepta como multi-moneda nativo, sin restricción
         de reversión.
         """
-        vals_list = super()._prepare_move_line_default_vals(write_off_line_vals)
+        vals_list = super()._prepare_move_line_default_vals(write_off_line_vals, **kwargs)
 
         tc_factura = self._context.get('force_tc_factura')
         if not tc_factura:
