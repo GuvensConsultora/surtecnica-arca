@@ -8,7 +8,7 @@ class AccountPaymentGroup(models.Model):
 
     usar_tc_factura = fields.Boolean(
         string='Usar TC de la factura',
-        default=lambda self: self.company_id.usar_tc_factura_cobros,
+        default=lambda self: self.env.company.usar_tc_factura_cobros,
         help=(
             'Activo: el cobro entra en pesos (la caja/banco registra ARS) pero '
             'la línea de cuenta por cobrar se valúa en USD al TC de la factura, '
@@ -99,10 +99,13 @@ class AccountPaymentGroup(models.Model):
                 # (en un cobro la línea de CxC va al crédito → balance negativo).
                 amount_currency = math.copysign(usd_linea, linea.balance)
 
-                # skip_account_move_synchronization: evita que la sincronización
-                # de account.payment revierta el cambio.
-                # check_move_validity / no_lock_date_check: permiten el write
-                # sobre la línea ya posteada.
+                # CLAVE: fijar también débito/crédito (importe en pesos) en el
+                # mismo write. Si solo se escribe amount_currency, Odoo recalcula
+                # el balance usando el TC del DÍA (no el de la factura) y el
+                # asiento queda desbalanceado. Al pinear debit/credit con los
+                # pesos originales, el TC implícito queda en el de la factura.
+                # skip_account_move_synchronization: evita que la sync de
+                # account.payment revierta el cambio.
                 linea.with_context(
                     check_move_validity=False,
                     skip_account_move_synchronization=True,
@@ -110,4 +113,6 @@ class AccountPaymentGroup(models.Model):
                 ).write({
                     'currency_id': usd.id,
                     'amount_currency': amount_currency,
+                    'debit': linea.debit,
+                    'credit': linea.credit,
                 })
