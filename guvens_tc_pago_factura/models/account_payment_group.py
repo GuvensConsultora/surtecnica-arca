@@ -68,8 +68,24 @@ class AccountPaymentGroup(models.Model):
             return
         tc_factura = ars_residual / usd_residual
 
+        # Los cheques (propios y de terceros) son instrumentos en pesos a valor
+        # nominal: NO se reexpresan a USD. Si se convirtieran, el cheque quedaría
+        # valuado en dólares en la cartera y al usarlo para un pago mostraría un
+        # importe erróneo (dividido por el TC). Por eso se excluyen de la
+        # conversión aunque el booleano 'Usar TC de la factura' esté activo.
+        # Solo el efectivo/banco se valúa al TC de la factura.
+        CODIGOS_CHEQUE = (
+            'check_printing',          # cheque propio
+            'new_third_party_checks',  # nuevo cheque de tercero (recibido)
+            'in_third_party_checks',   # cheque de tercero en stock (ingreso)
+            'out_third_party_checks',  # cheque de tercero entregado
+        )
         pagos_draft = self.payment_ids.filtered(
-            lambda x: x.state == 'draft' and x.currency_id == company_currency
+            lambda x: (
+                x.state == 'draft'
+                and x.currency_id == company_currency
+                and x.payment_method_line_id.code not in CODIGOS_CHEQUE
+            )
         )
         if not pagos_draft:
             return

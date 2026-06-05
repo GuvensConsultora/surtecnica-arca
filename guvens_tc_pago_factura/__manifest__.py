@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 {
     'name': 'TC de Factura en Cobros USD',
-    'version': '17.0.1.1.0',
+    'version': '17.0.1.2.0',
     'category': 'Accounting',
     'summary': 'Usa el TC de la factura al conciliar cobros en ARS contra facturas en USD',
     'description': """
