@@ -138,6 +138,12 @@ class LibroIvaDigitalWizard(models.TransientModel):
     # Por qué: l10n_ar_vat_afip_code en Odoo 17 usa códigos sin zero-pad ('5', no '0005')
     IVA_GRAVADO_CODES = ('3', '4', '5', '6', '8', '9')
 
+    # Tipos B y C: no discriminan IVA → cant=0 SIN alícuota (regla AFIP bidireccional)
+    BC_TIPOS = ('006', '007', '008', '011', '012', '013')
+
+    # Tipos de importación: se declaran por Despacho de Importación, no por compras común
+    IMPORT_TIPOS = ('019', '020', '021')
+
     # Códigos moneda AFIP - fallback si no existe l10n_ar_afip_code en currency
     MONEDA_MAP = {
         'ARS': 'PES', 'USD': 'DOL', 'EUR': '060', 'BRL': '012',
@@ -683,6 +689,12 @@ class LibroIvaDigitalWizard(models.TransientModel):
         for move in moves:
             try:
                 data = extracted_data[move.id] if extracted_data else self._extract_move_data(move)
+                # Importaciones del exterior (019/020/021) van por Despacho de Importación,
+                # no por el libro de compras común → excluir.
+                if tipo == 'compras':
+                    doc_code = move.l10n_latam_document_type_id.code or ''
+                    if doc_code in self.IMPORT_TIPOS:
+                        continue
                 # TXT: importes en ARS (moneda compañía).
                 # Se importa con opción "en pesos" en portal ARCA.
                 partner = move.commercial_partner_id
@@ -893,6 +905,13 @@ class LibroIvaDigitalWizard(models.TransientModel):
         result['iva_alicuotas'] = list(iva_by_code.values())
         result['iva_by_concepto'] = iva_by_concepto
 
+        # Paso 3b: alícuota sintética 0% para comprobantes no-B/C sin IVA real.
+        # AFIP exige cant_alic >= 1 para todos los tipos que discriminan IVA (A, E).
+        # B/C no deben tener alícuota (AFIP rechaza en ambas direcciones).
+        tipo_code = doc_type.code or ''
+        if not result['iva_alicuotas'] and tipo_code not in self.BC_TIPOS:
+            result['iva_alicuotas'] = [{'code': '3', 'base': 0.0, 'amount': 0.0}]
+
         # Paso 4: Computar total como suma de partes
         # Por qué: ARCA valida que Total = suma de todos los campos de importe.
         # Usar move.amount_total genera diferencias cuando algún importe no se
@@ -1013,11 +1032,17 @@ class LibroIvaDigitalWizard(models.TransientModel):
             cur_code, cur_rate = 'PES', 1.0
         op_code = self._get_operation_code(data)
         n_alic = len(data['iva_alicuotas'])
-        fecha_vto = move.invoice_date_due or move.invoice_date
+        # Campo 22: fecha de vencimiento SOLO para cuotas/débitos (017, 018, 201).
+        # Para todos los demás tipos (incluidos 021 NC-E y 203 NC-FCE) va en ceros.
+        tipo_cbte = move.l10n_latam_document_type_id.code or ''
+        if tipo_cbte in ('017', '018', '201'):
+            fecha_vto = move.invoice_date_due or move.invoice_date
+        else:
+            fecha_vto = None  # _fmt_date devuelve '00000000' para None
 
         line = (
             self._fmt_date(move.invoice_date)                    #  1: Fecha cbte (8)
-            + self._fmt_num(move.l10n_latam_document_type_id.code, 3)  #  2: Tipo cbte (3)
+            + self._fmt_num(tipo_cbte, 3)                        #  2: Tipo cbte (3)
             + self._fmt_num(pv, 5)                               #  3: Pto venta (5)
             + self._fmt_num(num, 20)                             #  4: Nro cbte desde (20)
             + self._fmt_num(num, 20)                             #  5: Nro cbte hasta (20)
@@ -1187,6 +1212,14 @@ class LibroIvaDigitalWizard(models.TransientModel):
         # Por qué: l10n_ar_afip_code tiene el código AFIP del tipo de documento
         doc_code = getattr(doc_type, 'l10n_ar_afip_code', '99') or '99'
         doc_num = (partner.vat or '0').replace('-', '').replace(' ', '')
+        # Fallback para contactos del exterior sin identificación AFIP válida:
+        # código 80 + CUIT País (50000000016 jurídica). Aplica cuando no tienen
+        # código de documento AFIP o el VAT no está cargado.
+        if doc_code == '99' or not doc_num or doc_num == '0':
+            resp = partner.l10n_ar_afip_responsibility_type_id
+            resp_id = resp.id if resp else False
+            if resp_id in (8, 15):  # 8=Cliente del Exterior, 15=Proveedor del Exterior
+                return '80', '50000000016'
         return str(doc_code), doc_num
 
     def _get_currency_info(self, move):
@@ -1219,18 +1252,16 @@ class LibroIvaDigitalWizard(models.TransientModel):
     def _get_operation_code(self, data):
         """Determina el código de operación AFIP.
 
-        ' ' = gravado, 'E' = exento, 'N' = no gravado, 'X' = exportación.
+        ' ' = gravado (o con alícuota sintética), 'E' = exento, 'N' = no gravado.
+        Cuando hay alícuotas (reales o sintéticas) el código siempre es ' ': AFIP
+        no acepta 'X'/'E'/'N' combinados con cant_alic >= 1.
         """
-        # Por qué: exportaciones tienen código propio independiente del IVA
-        if data.get('is_export'):
-            return 'X'
-        tiene_gravado = bool(data['iva_alicuotas'])
+        if data['iva_alicuotas']:
+            return ' '
+        # Solo B/C llegan aquí (sin alícuota por regla AFIP)
         tiene_exento = abs(data['exento']) > 0.01
         tiene_no_gravado = abs(data['no_gravado']) > 0.01
-
-        if tiene_gravado:
-            return ' '
-        elif tiene_exento:
+        if tiene_exento:
             return 'E'
         elif tiene_no_gravado:
             return 'N'
