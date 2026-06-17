@@ -138,11 +138,17 @@ class LibroIvaDigitalWizard(models.TransientModel):
     # Por qué: l10n_ar_vat_afip_code en Odoo 17 usa códigos sin zero-pad ('5', no '0005')
     IVA_GRAVADO_CODES = ('3', '4', '5', '6', '8', '9')
 
-    # Tipos B y C: no discriminan IVA → cant=0 SIN alícuota (regla AFIP bidireccional)
+    # Tipos B y C: no discriminan IVA → en compras quedan cant=0 SIN alícuota.
+    # OJO: l10n_latam_document_type.code viene SIN zero-pad ('6','11','13'),
+    # por eso TODAS las comparaciones padean el code con .zfill(3) antes.
     BC_TIPOS = ('006', '007', '008', '011', '012', '013')
 
     # Tipos de importación: se declaran por Despacho de Importación, no por compras común
     IMPORT_TIPOS = ('019', '020', '021')
+
+    # Campo 22 ventas (fecha de vto): ARCA la rechaza en NC export (021) y NC FCE (203).
+    # Para el resto se informa. Derivado de los archivos que ARCA aceptó en abril 2026.
+    NO_FECHA_VTO_TIPOS = ('021', '203')
 
     # Códigos moneda AFIP - fallback si no existe l10n_ar_afip_code en currency
     MONEDA_MAP = {
@@ -692,7 +698,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 # Importaciones del exterior (019/020/021) van por Despacho de Importación,
                 # no por el libro de compras común → excluir.
                 if tipo == 'compras':
-                    doc_code = move.l10n_latam_document_type_id.code or ''
+                    doc_code = (move.l10n_latam_document_type_id.code or '').zfill(3)
                     if doc_code in self.IMPORT_TIPOS:
                         continue
                 # TXT: importes en ARS (moneda compañía).
@@ -907,8 +913,8 @@ class LibroIvaDigitalWizard(models.TransientModel):
 
         # Paso 3b: alícuota sintética 0% para comprobantes no-B/C sin IVA real.
         # AFIP exige cant_alic >= 1 para todos los tipos que discriminan IVA (A, E).
-        # B/C no deben tener alícuota (AFIP rechaza en ambas direcciones).
-        tipo_code = doc_type.code or ''
+        # B/C en compras quedan cant=0 sin alícuota. code viene sin zero-pad → zfill(3).
+        tipo_code = (doc_type.code or '').zfill(3)
         if not result['iva_alicuotas'] and tipo_code not in self.BC_TIPOS:
             result['iva_alicuotas'] = [{'code': '3', 'base': 0.0, 'amount': 0.0}]
 
@@ -1032,13 +1038,14 @@ class LibroIvaDigitalWizard(models.TransientModel):
             cur_code, cur_rate = 'PES', 1.0
         op_code = self._get_operation_code(data)
         n_alic = len(data['iva_alicuotas'])
-        # Campo 22: fecha de vencimiento SOLO para cuotas/débitos (017, 018, 201).
-        # Para todos los demás tipos (incluidos 021 NC-E y 203 NC-FCE) va en ceros.
-        tipo_cbte = move.l10n_latam_document_type_id.code or ''
-        if tipo_cbte in ('017', '018', '201'):
-            fecha_vto = move.invoice_date_due or move.invoice_date
-        else:
+        # Campo 22: ARCA rechaza fecha de vto SOLO en NC export (021) y NC FCE (203).
+        # Para el resto (FA-A/NC-A/FA-B/FA-E/FCE) se informa invoice_date_due.
+        # code viene sin zero-pad → zfill(3) antes de comparar.
+        tipo_cbte = (move.l10n_latam_document_type_id.code or '').zfill(3)
+        if tipo_cbte in self.NO_FECHA_VTO_TIPOS:
             fecha_vto = None  # _fmt_date devuelve '00000000' para None
+        else:
+            fecha_vto = move.invoice_date_due or move.invoice_date
 
         line = (
             self._fmt_date(move.invoice_date)                    #  1: Fecha cbte (8)
