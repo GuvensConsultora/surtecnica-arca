@@ -12,6 +12,11 @@
                 <field name="duplicados_html" nolabel="1"
                        invisible="not duplicados_html or state != 'draft'"/>
 
+                <!-- Alerta de tipos de documento sin código AFIP: se muestra
+                     en draft con link al comprobante para corregirlo -->
+                <field name="tipos_sin_codigo_html" nolabel="1"
+                       invisible="not tipos_sin_codigo_html or state != 'draft'"/>
+
                 <!-- Estado draft: selección de período -->
                 <group invisible="state != 'draft'">
                     <group string="Período">

@@ -120,6 +120,13 @@ class LibroIvaDigitalWizard(models.TransientModel):
     duplicados_html = fields.Html(
         string='Duplicados', readonly=True, sanitize=False,
     )
+    # Por qué: Comprobantes cuyo tipo de documento no tiene código AFIP
+    # (l10n_latam_document_type_id.code vacío, ej. "INVOICES AND RECEIPTS
+    # FROM ABROAD") rompen la generación de la DDJJ. Se informan en el
+    # wizard con link al registro para corregir antes de generar.
+    tipos_sin_codigo_html = fields.Html(
+        string='Tipos sin código AFIP', readonly=True, sanitize=False,
+    )
 
     # -------------------------------------------------------------------------
     # CONSTANTES AFIP
@@ -197,6 +204,23 @@ class LibroIvaDigitalWizard(models.TransientModel):
         # Buscar facturas de venta y compra en el período
         ventas = self._get_moves('out')
         compras = self._get_moves('in')
+
+        # Validar tipos de documento sin código AFIP antes de procesar —
+        # rompen el armado de la DDJJ (no se pueden ordenar/clasificar).
+        sin_codigo_html = self._validar_tipos_sin_codigo(ventas + compras)
+        if sin_codigo_html:
+            self.write({
+                'tipos_sin_codigo_html': sin_codigo_html,
+            })
+            return {
+                'type': 'ir.actions.act_window',
+                'res_model': self._name,
+                'res_id': self.id,
+                'view_mode': 'form',
+                'target': 'new',
+            }
+        # Limpiar aviso previo si ya no hay
+        self.tipos_sin_codigo_html = False
 
         # Validar duplicados antes de procesar — ARCA deduplica líneas
         # idénticas del TXT causando diferencias con el CSV.
@@ -577,6 +601,77 @@ class LibroIvaDigitalWizard(models.TransientModel):
     # -------------------------------------------------------------------------
     # VALIDACIÓN DE DUPLICADOS
     # -------------------------------------------------------------------------
+
+    def _validar_tipos_sin_codigo(self, moves):
+        """Detecta comprobantes cuyo tipo de documento no tiene código AFIP.
+
+        Por qué: l10n_latam_document_type_id.code vacío/False (ej. tipo 118
+        "INVOICES AND RECEIPTS FROM ABROAD", comprobantes del exterior) hace
+        fallar el armado de la DDJJ al ordenar/clasificar por código
+        (TypeError: '<' not supported between 'bool' and 'str'). Se informan
+        con link al registro para que el usuario corrija el tipo de documento
+        o excluya el comprobante (importación → Despacho) antes de generar.
+        Returns:
+            str | False: HTML con tabla de comprobantes, o False si no hay.
+        """
+        problemas = [
+            m for m in moves
+            if not (m.l10n_latam_document_type_id
+                    and m.l10n_latam_document_type_id.code)
+        ]
+        if not problemas:
+            return False
+
+        base_url = self.env['ir.config_parameter'].sudo().get_param(
+            'web.base.url', '')
+        fmt = self._fmt_money
+        h = [
+            '<div style="font-family:Arial,sans-serif;padding:10px">',
+            '<h2 style="color:#c0392b;margin-bottom:5px">'
+            'Comprobantes con tipo de documento SIN código AFIP</h2>',
+            '<p style="color:#555;font-size:13px">'
+            'Estos comprobantes tienen un tipo de documento sin codigo AFIP '
+            '(p. ej. "del exterior") y no pueden incluirse en el Libro IVA.'
+            '<br/><strong>Corregi el tipo de documento o exclui el '
+            'comprobante (importacion &rarr; Despacho) y volve a generar.'
+            '</strong></p>',
+            '<table style="border-collapse:collapse;width:100%;'
+            'font-size:13px;margin-top:10px">',
+            '<tr style="background:#875A7B;color:white">',
+            '<th style="padding:8px;text-align:left">Comprobante</th>',
+            '<th style="padding:8px;text-align:left">Tipo de documento</th>',
+            '<th style="padding:8px;text-align:left">CUIT</th>',
+            '<th style="padding:8px;text-align:right">Importe</th>',
+            '<th style="padding:8px;text-align:left">Proveedor / Cliente</th>',
+            '</tr>',
+        ]
+        for i, m in enumerate(problemas):
+            doc_name = html_escape(
+                m.l10n_latam_document_type_id.name or '(sin tipo)')
+            doc_num = html_escape(m.l10n_latam_document_number or m.name or '')
+            cuit = html_escape(m.commercial_partner_id.vat or '')
+            importe = abs(m.amount_total)
+            partner = html_escape(
+                (m.commercial_partner_id.name or '')[:50])
+            url = (f'{base_url}/web#id={m.id}'
+                   f'&model=account.move&view_type=form')
+            bg = '#fff' if i % 2 == 0 else '#f9f9f9'
+            h.append(
+                f'<tr style="background:{bg};'
+                f'border-bottom:1px solid #e0e0e0">'
+                f'<td style="padding:8px">'
+                f'<a href="{url}" target="_blank" '
+                f'style="color:#017e84;font-weight:bold;'
+                f'text-decoration:none">{doc_num}</a></td>'
+                f'<td style="padding:8px">{doc_name}</td>'
+                f'<td style="padding:8px">{cuit}</td>'
+                f'<td style="padding:8px;text-align:right;'
+                f'font-weight:bold">{fmt(importe)}</td>'
+                f'<td style="padding:8px">{partner}</td>'
+                f'</tr>'
+            )
+        h.append('</table></div>')
+        return ''.join(h)
 
     def _validar_duplicados(self, moves):
         """Detecta comprobantes duplicados por (tipo+nro, CUIT, importe).
@@ -1487,7 +1582,8 @@ class LibroIvaDigitalWizard(models.TransientModel):
             detalle_moves.append(move_row)
 
         return {
-            'por_tipo': sorted(por_tipo.values(), key=lambda x: x['code']),
+            'por_tipo': sorted(
+                por_tipo.values(), key=lambda x: str(x['code'] or '')),
             'alicuotas': alicuotas,
             'alicuotas_fac': alicuotas_fac,
             'alicuotas_nd': alicuotas_nd,
