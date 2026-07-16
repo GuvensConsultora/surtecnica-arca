@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="report_invoice_document_clearfix" model="ir.ui.view">
+        <field name="name">account.report_invoice_document.clearfix.guvens</field>
+        <field name="inherit_id" ref="account.report_invoice_document"/>
+        <field name="arch" type="xml">
+            <xpath expr="//div[@id='right-elements']" position="after">
+                <div class="clearfix"/>
+            </xpath>
+        </field>
+    </record>
+</odoo>
