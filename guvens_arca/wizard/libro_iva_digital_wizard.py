@@ -153,9 +153,10 @@ class LibroIvaDigitalWizard(models.TransientModel):
     # Tipos de importación: se declaran por Despacho de Importación, no por compras común
     IMPORT_TIPOS = ('019', '020', '021')
 
-    # Campo 22 ventas (fecha de vto): ARCA la rechaza en NC export (021) y NC FCE (203).
-    # Para el resto se informa. Derivado de los archivos que ARCA aceptó en abril 2026.
-    NO_FECHA_VTO_TIPOS = ('021', '203')
+    # Campo 22 ventas (fecha de vto): ARCA la rechaza en NC export (021), ND FCE (202)
+    # y NC FCE (203). Para el resto se informa. Derivado de los archivos que ARCA
+    # aceptó en abril 2026; 202 agregado por rechazo en agosto 2026 (ND FCE a Drean).
+    NO_FECHA_VTO_TIPOS = ('021', '202', '203')
 
     # Códigos moneda AFIP - fallback si no existe l10n_ar_afip_code en currency
     MONEDA_MAP = {
@@ -1133,7 +1134,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
             cur_code, cur_rate = 'PES', 1.0
         op_code = self._get_operation_code(data)
         n_alic = len(data['iva_alicuotas'])
-        # Campo 22: ARCA rechaza fecha de vto SOLO en NC export (021) y NC FCE (203).
+        # Campo 22: ARCA rechaza fecha de vto SOLO en NC export (021), ND FCE (202) y NC FCE (203).
         # Para el resto (FA-A/NC-A/FA-B/FA-E/FCE) se informa invoice_date_due.
         # code viene sin zero-pad → zfill(3) antes de comparar.
         tipo_cbte = (move.l10n_latam_document_type_id.code or '').zfill(3)
