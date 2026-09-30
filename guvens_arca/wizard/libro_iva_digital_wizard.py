@@ -91,10 +91,21 @@ class LibroIvaDigitalWizard(models.TransientModel):
 
     # Configuración IVA Simple (F.2051)
     # Por qué: Código de actividad AFIP principal para agrupar ventas en CSV
+    # Por qué: la actividad es propia de cada empresa (B.23), no va fija en
+    # el código. Arranca con la última usada por la compañía activa.
     actividad_afip = fields.Char(
-        'Actividad AFIP', size=6, default='465320',
-        help='Código actividad principal AFIP (6 dígitos)',
+        'Actividad AFIP', size=6,
+        default=lambda self: self._default_actividad_afip(),
+        help='Código actividad principal AFIP (6 dígitos). Se recuerda '
+             'por empresa.',
     )
+
+    def _actividad_param_key(self):
+        return 'guvens_arca.actividad_afip.%s' % self.env.company.id
+
+    def _default_actividad_afip(self):
+        return self.env['ir.config_parameter'].sudo().get_param(
+            self._actividad_param_key(), default='')
 
     # CSV IVA Simple — Apertura de otros conceptos (estado done)
     # Por qué: Desde nov 2025, ARCA F.2051 importa apertura vía CSV
@@ -201,6 +212,14 @@ class LibroIvaDigitalWizard(models.TransientModel):
         self.ensure_one()
         if self.date_from > self.date_to:
             raise UserError('La fecha "Desde" no puede ser posterior a "Hasta".')
+        act = (self.actividad_afip or '').strip()
+        if not (act.isdigit() and len(act) == 6):
+            raise UserError(
+                'Cargá la Actividad AFIP de la empresa (6 dígitos, la que '
+                'figura en la constancia de inscripción). Queda guardada '
+                'para los meses siguientes.')
+        self.env['ir.config_parameter'].sudo().set_param(
+            self._actividad_param_key(), act)
 
         # Buscar facturas de venta y compra en el período
         ventas = self._get_moves('out')
@@ -3240,7 +3259,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
         Exento (8 valores, cols 3-7 vacías):
             act;3;;;;;;;monto
         """
-        act = self.actividad_afip or '465320'
+        act = self.actividad_afip
         acum = {}
         exento_ng = 0.0
 
@@ -3294,7 +3313,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
         Gravado: act;1;sujeto;code_afip;neto;debito
         Exento:  act;3;;;;;monto
         """
-        act = self.actividad_afip or '465320'
+        act = self.actividad_afip
         acum = {}
         exento_ng = 0.0
 
