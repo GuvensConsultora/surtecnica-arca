@@ -31,7 +31,7 @@
         'views/account_move_views.xml',
         'data/menuitem.xml',
     ],
-    'installable': True,
+    'installable': False,
     'application': False,
     'auto_install': False,
     'license': 'LGPL-3',

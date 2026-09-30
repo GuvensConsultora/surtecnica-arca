@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 {
     'name': 'Libro IVA Digital - ARCA',
-    'version': '17.0.1.3.1',
+    'version': '19.0.2.0.0',
     'category': 'Accounting',
     'summary': 'Generación de archivos TXT del Libro IVA Digital para ARCA (ex AFIP)',
     'description': """
@@ -18,7 +18,7 @@
     'website': '',
     # Por qué: l10n_ar provee CUIT, tipos de comprobante AFIP, códigos de moneda
     # y toda la estructura fiscal argentina necesaria para el Libro IVA Digital
-    'depends': ['account', 'l10n_ar', 'account_payment_group'],
+    'depends': ['account', 'l10n_ar'],
     'data': [
         'security/ir.model.access.csv',
         'wizard/libro_iva_digital_wizard_views.xml',

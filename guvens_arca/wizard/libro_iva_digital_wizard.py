@@ -926,7 +926,9 @@ class LibroIvaDigitalWizard(models.TransientModel):
         iva_by_code = {}
         iva_by_concepto = {}
         for line in move.invoice_line_ids.filtered(
-            lambda l: l.display_type not in ('line_section', 'line_note')
+            # Por qué: Odoo 19 suma 'line_subsection' a secciones y notas; se
+            # toman sólo las líneas de producto para no contar subtítulos.
+            lambda l: l.display_type == 'product'
         ):
             amt = getattr(line, amt_field) * inv_sign * sign
             line_class = self._classify_line_iva(line)
@@ -1325,6 +1327,16 @@ class LibroIvaDigitalWizard(models.TransientModel):
                 return '80', '50000000016'
         return str(doc_code), doc_num
 
+    def _get_invoice_rate(self, move):
+        """Tipo de cambio de la factura, en pesos por unidad de moneda.
+
+        Por qué: en Odoo 19 no existe l10n_ar_currency_rate; el TC vive en
+        invoice_currency_rate con la escala invertida (unidades de moneda
+        extranjera por cada peso), así que se devuelve su inversa.
+        """
+        rate = move.invoice_currency_rate
+        return 1.0 / rate if rate else 0.0
+
     def _get_currency_info(self, move):
         """Obtiene código de moneda y tipo de cambio AFIP.
 
@@ -1343,8 +1355,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
         if currency == company_currency:
             rate = 1.0
         else:
-            # Por qué: l10n_ar_currency_rate es el TC usado en la factura
-            rate = getattr(move, 'l10n_ar_currency_rate', False)
+            rate = self._get_invoice_rate(move)
             if not rate:
                 rate = currency._convert(
                     1.0, company_currency, move.company_id,
@@ -1568,8 +1579,7 @@ class LibroIvaDigitalWizard(models.TransientModel):
             move_row['moneda'] = move.currency_id.name
             move_row['es_moneda_ext'] = (
                 move.currency_id != move.company_currency_id)
-            move_row['tipo_cambio'] = (
-                getattr(move, 'l10n_ar_currency_rate', 0) or 0)
+            move_row['tipo_cambio'] = self._get_invoice_rate(move)
             move_row['iva_odoo'] = round(
                 data.get('iva_odoo_original', 0), 2)
             move_row['iva_arca'] = round(
