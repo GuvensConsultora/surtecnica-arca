@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 {
     'name': 'TC de Factura en Cobros USD',
-    'version': '17.0.1.2.0',
+    'version': '17.0.1.3.0',
     'category': 'Accounting',
     'summary': 'Usa el TC de la factura al conciliar cobros en ARS contra facturas en USD',
     'description': """
@@ -19,6 +19,13 @@
         son al TC de la factura original, no al TC del día del cobro. Odoo no
         conoce ese acuerdo y genera diferencias de cambio que confunden a los
         operadores (Rayen, junio 2026).
+
+        Órdenes de pago a proveedores (v1.3.0): los cheques entregados se
+        concilian al TC de cada factura, sin asiento de diferencia de cambio.
+        Sur Técnica cancela la deuda en USD al TC de la factura y el proveedor
+        reclama la diferencia con nota de débito (Candela, 08/10/2026). El pago
+        con cheque no se modifica: el core exige que tenga la moneda y el
+        importe del cheque. Cobros de clientes con cheque: sin cambios.
     """,
     'author': 'Guvens Consultora',
     'depends': ['account', 'l10n_ar', 'account_payment_group'],
